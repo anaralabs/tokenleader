@@ -153,6 +153,33 @@ describe("renderInstallScript", () => {
     expect(r.status).toBe(0);
   });
 
+  test("--link flag is parsed and forwarded into the plist as TOKENLEADER_LINK", () => {
+    const body = renderInstallScript(SERVER_URL);
+    // Flag (both --link=X and --link X forms) + env fallback parsing.
+    expect(body).toContain("--link=*)");
+    expect(body).toContain('--link)       ARG_LINK="${2:-}"; shift ;;');
+    expect(body).toContain('LINK_CODE="${ARG_LINK:-${TOKENLEADER_LINK:-}}"');
+    // Conditional plist entry, same shape as join/company.
+    expect(body).toContain('if [ -n "$LINK_CODE" ]; then');
+    expect(body).toContain("<key>TOKENLEADER_LINK</key>");
+    expect(body).toContain("<string>$LINK_CODE</string>");
+    // Advertised in --help.
+    expect(body).toContain("--link=CODE");
+    // Still valid bash.
+    const r = spawnSync("bash", ["-n"], { input: body, encoding: "utf8" });
+    expect(r.stderr).toBe("");
+    expect(r.status).toBe(0);
+  });
+
+  test("installs the documented `tokenleader` CLI name as a guarded symlink", () => {
+    const body = renderInstallScript(SERVER_URL);
+    expect(body).toContain('ln -sfn "$BIN_DST" "$HOME/.local/bin/tokenleader"');
+    // Never clobbers a real (non-symlink) file that owns the name.
+    expect(body).toContain(
+      'if [ ! -e "$HOME/.local/bin/tokenleader" ] || [ -L "$HOME/.local/bin/tokenleader" ]; then',
+    );
+  });
+
   test("joinRequired advertises --join=<code> in the one-liner and warns when missing", () => {
     const gated = renderInstallScript(SERVER_URL, { joinRequired: true });
     expect(gated).toContain("| bash -s -- --join=<code>");
@@ -193,6 +220,12 @@ describe("renderUninstallScript", () => {
     const r = spawnSync("bash", ["-n", tmpScript], { encoding: "utf8" });
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
+  });
+
+  test("removes the tokenleader symlink (and only a symlink)", () => {
+    const body = renderUninstallScript(SERVER_URL);
+    expect(body).toContain('if [ -L "$HOME/.local/bin/tokenleader" ]; then');
+    expect(body).toContain('rm -f "$HOME/.local/bin/tokenleader"');
   });
 
   test("POSTs to /events/uninstall before cleanup", () => {

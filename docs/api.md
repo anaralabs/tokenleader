@@ -115,7 +115,11 @@ Daemons and the rendered scripts are the only intended clients:
 | Route | What |
 |---|---|
 | `POST /ingest` | daemon posts event batches (max 1000/request); auth = per-user TOFU secret header, plus the join token on first claim of a new name; an optional `X-Tokenleader-Company` header (from `TOKENLEADER_COMPANY`) upserts the user's company domain |
-| `POST /events/uninstall` | uninstall script marks the name re-claimable (same secret auth) |
+| `POST /events/uninstall` | uninstall script revokes this machine's device; the name becomes re-claimable only when the last device goes (same secret auth) |
+| `POST /devices/link` | mint a one-time pairing code (10-min TTL) for adding another machine to your handle; auth = any of your devices' secrets |
+| `GET /devices?user=` | list your active devices (same secret auth); `current` marks the calling machine |
+| `POST /devices/revoke` | revoke one device by id (same secret auth); revoking the last device marks the user uninstalled |
+| `POST /admin/link` | mint a pairing code with the admin bearer instead of a device secret — for when a user's only machine is gone |
 | `GET /manifest.json` | current daemon release manifest (503 until the server's mirror has synced) |
 | `GET /bin/*` | daemon binaries, streamed from the server's local mirror cache |
 | `GET /install`, `GET /uninstall` | rendered bash scripts, parameterized by the server's URL and join posture |

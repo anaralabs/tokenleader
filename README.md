@@ -119,6 +119,11 @@ curl -fsSL https://leaderboard.example.com/install | bash -s -- --name=alice --j
 That's it. The installer registers a LaunchAgent, posts every 5 minutes, and the daemon
 auto-updates itself from your server. The dashboard fills up within minutes.
 
+Got two Macs? Run `tokenleader link` on the first to mint a one-time pairing code, then
+install on the second with `--link=<code>` — both machines count under one name, and
+nobody can claim a handle they don't hold a secret (or a live code) for. Details:
+[docs/daemon.md](docs/daemon.md#one-handle-multiple-machines).
+
 > The daemon is macOS-only today (Apple Silicon + Intel). Linux + WSL support is the
 > headline item of the next release — the update manifest already carries the OS
 > dimension, so it lands without breaking anything.

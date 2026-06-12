@@ -156,6 +156,7 @@ resolve_handle() {
 ARG_NAME=""
 ARG_JOIN=""
 ARG_COMPANY=""
+ARG_LINK=""
 while [ \$# -gt 0 ]; do
   case "\$1" in
     --name=*)     ARG_NAME="\${1#--name=}" ;;
@@ -164,18 +165,23 @@ while [ \$# -gt 0 ]; do
     --join)       ARG_JOIN="\${2:-}"; shift ;;
     --company=*)  ARG_COMPANY="\${1#--company=}" ;;
     --company)    ARG_COMPANY="\${2:-}"; shift ;;
+    --link=*)     ARG_LINK="\${1#--link=}" ;;
+    --link)       ARG_LINK="\${2:-}"; shift ;;
     -h|--help)
       printf "tokenleader installer\\n\\n"
-      printf "Usage: curl -fsSL %s/install | bash -s -- [--name=HANDLE] [--join=CODE] [--company=DOMAIN]\\n\\n" "\$SERVER_URL"
+      printf "Usage: curl -fsSL %s/install | bash -s -- [--name=HANDLE] [--join=CODE] [--company=DOMAIN] [--link=CODE]\\n\\n" "\$SERVER_URL"
       printf "Options:\\n"
       printf "  --name=HANDLE     pick the leaderboard handle (default: slugified \\\$USER)\\n"
       printf "  --join=CODE       join code for servers that gate new handles\\n"
       printf "  --company=DOMAIN  company affiliation shown on the leaderboard (e.g. anara.com)\\n"
+      printf "  --link=CODE       pairing code to add this machine to a handle you already\\n"
+      printf "                    own (mint one with 'tokenleader link' on the old machine)\\n"
       printf "  -h, --help        this message\\n"
       printf "\\nEnvironment overrides:\\n"
       printf "  TOKENLEADER_USER      same as --name (lower priority than the flag)\\n"
       printf "  TOKENLEADER_JOIN      same as --join (lower priority than the flag)\\n"
       printf "  TOKENLEADER_COMPANY   same as --company (lower priority than the flag)\\n"
+      printf "  TOKENLEADER_LINK      same as --link (lower priority than the flag)\\n"
       exit 0
       ;;
     *) printf "Unknown argument: %s\\nRun with --help for usage.\\n" "\$1" >&2; exit 1 ;;
@@ -191,6 +197,11 @@ JOIN_CODE="\${ARG_JOIN:-\${TOKENLEADER_JOIN:-}}"
 # sent raw by the daemon — the SERVER normalizes (lowercase bare hostname)
 # and ignores invalid values.
 COMPANY="\${ARG_COMPANY:-\${TOKENLEADER_COMPANY:-}}"
+
+# Link code: flag wins over env. Written into the plist below; the daemon
+# presents it on its first sync to join an already-claimed handle as an
+# additional device (single use — inert afterwards).
+LINK_CODE="\${ARG_LINK:-\${TOKENLEADER_LINK:-}}"
 
 # --- spinner + step line --------------------------------------------------
 # Each step renders on one line rewritten via \\r; finish redraws with ✓/✗.
@@ -326,6 +337,14 @@ write_plist_and_register() {
         <string>\$COMPANY</string>"
   fi
 
+  # Optional device-link code → daemon env; same conditional-entry shape.
+  LINK_PLIST_ENTRY=""
+  if [ -n "\$LINK_CODE" ]; then
+    LINK_PLIST_ENTRY="
+        <key>TOKENLEADER_LINK</key>
+        <string>\$LINK_CODE</string>"
+  fi
+
   cat >"\$PLIST" <<PLIST_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
@@ -346,7 +365,7 @@ write_plist_and_register() {
         <key>TOKENLEADER_ENDPOINT</key>
         <string>\${SERVER_URL}</string>
         <key>TOKENLEADER_HOME</key>
-        <string>\${HOME}/.local/share/anara-leaderboard</string>\${JOIN_PLIST_ENTRY}\${COMPANY_PLIST_ENTRY}
+        <string>\${HOME}/.local/share/anara-leaderboard</string>\${JOIN_PLIST_ENTRY}\${COMPANY_PLIST_ENTRY}\${LINK_PLIST_ENTRY}
         <key>HOME</key>
         <string>\${HOME}</string>
         <key>PATH</key>
@@ -547,6 +566,13 @@ do_download() {
   mv -f "\$tmp_bin" "\$BIN_DST"
   rm -f "\$tmp_manifest"
 
+  # The documented CLI name (\`tokenleader link\` etc.) beside the legacy
+  # binary name the fleet depends on. Only create/replace when missing or
+  # already a symlink — never clobber a real file that owns the name.
+  if [ ! -e "\$HOME/.local/bin/tokenleader" ] || [ -L "\$HOME/.local/bin/tokenleader" ]; then
+    ln -sfn "\$BIN_DST" "\$HOME/.local/bin/tokenleader"
+  fi
+
   # curl's bar left the cursor on a fresh line; emit the success line.
   if [ -t 1 ]; then
     CUR_STEP_N=2
@@ -672,6 +698,12 @@ if [ -f "\$BIN" ]; then
   ok "Removed \$BIN"
 else
   info "No binary at \$BIN"
+fi
+
+# The CLI-name symlink the installer (or daemon) created beside the binary.
+if [ -L "\$HOME/.local/bin/tokenleader" ]; then
+  rm -f "\$HOME/.local/bin/tokenleader"
+  ok "Removed \$HOME/.local/bin/tokenleader"
 fi
 
 ANSWER="\${TOKENLEADER_PURGE:-}"

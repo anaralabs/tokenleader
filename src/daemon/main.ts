@@ -1,6 +1,8 @@
-import { homedir } from "node:os";
+import { promises as fsp } from "node:fs";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import { BUILD_SHA, BUILD_VERSION } from "./build-info";
+import { CLI_COMMANDS, type CliCommand, runCliCommand } from "./cli";
 import { normalizeEndpoint, readEndpointOverride } from "./endpoint-override";
 import { log, LOG_FILE } from "./log";
 import { loadOrCreateSecret } from "./secret";
@@ -33,6 +35,14 @@ export interface ResolvedConfig {
    * bare hostname) and ignores invalid values.
    */
   company?: string;
+  /**
+   * Optional one-time link code (TOKENLEADER_LINK, written into the plist
+   * by the installer's --link flag). Sent as X-Tokenleader-Link on every
+   * ingest POST; the server only consults it when this machine's secret
+   * doesn't match an existing device, and the single-use redemption makes
+   * the header inert afterwards.
+   */
+  link?: string;
   intervalSec: number;
   stateDir: string;
   batchSize: number;
@@ -84,6 +94,9 @@ export function resolveConfig(env: NodeJS.ProcessEnv): ResolvedConfig {
   const rawCompany = env.TOKENLEADER_COMPANY;
   const company = rawCompany && rawCompany.trim().length > 0 ? rawCompany.trim() : undefined;
 
+  const rawLink = env.TOKENLEADER_LINK;
+  const link = rawLink && rawLink.trim().length > 0 ? rawLink.trim() : undefined;
+
   // Auto-update cadence. Default 1h so new builds propagate fast. Floor at
   // 60s so dev/test can crank it down; ceiling at 7d so a typo doesn't
   // strand a daemon forever.
@@ -100,6 +113,7 @@ export function resolveConfig(env: NodeJS.ProcessEnv): ResolvedConfig {
     ...(token ? { token } : {}),
     ...(join ? { join } : {}),
     ...(company ? { company } : {}),
+    ...(link ? { link } : {}),
     intervalSec,
     stateDir,
     batchSize,
@@ -132,6 +146,43 @@ function isTruthy(v: string | undefined): boolean {
 // platform key is the literal darwin-<arch> while the binary is darwin-only.
 export function versionLine(): string {
   return `${BUILD_VERSION} ${BUILD_SHA} darwin-${pickArch()}`;
+}
+
+/**
+ * Make the documented CLI name (`tokenleader link` …) real on machines that
+ * only ever auto-update: when this binary is the legacy-named install,
+ * ensure a sibling `tokenleader` symlink points at it. Best-effort and
+ * never fatal; a no-op under `bun run` (execPath is bun) and when a real
+ * file already owns the name.
+ */
+export async function ensureCliSymlink(execPath: string = process.execPath): Promise<void> {
+  try {
+    if (path.basename(execPath) !== "anara-leaderboard") return;
+    const linkPath = path.join(path.dirname(execPath), "tokenleader");
+    try {
+      const st = await fsp.lstat(linkPath);
+      if (!st.isSymbolicLink()) return;
+      if ((await fsp.readlink(linkPath)) === execPath) return;
+      await fsp.unlink(linkPath);
+    } catch {
+      // nothing there — create below
+    }
+    await fsp.symlink(execPath, linkPath);
+  } catch {
+    // cosmetic; never block the daemon
+  }
+}
+
+/** Short hostname → device label ("Krishs-MacBook-Pro.local" →
+ *  "krishs-macbook-pro"). Sent as X-Tokenleader-Device; the server treats
+ *  it as cosmetic. undefined when nothing survives the cleanup. */
+export function deviceLabelFromHost(host: string): string | undefined {
+  const s = (host.split(".")[0] ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+  return s.length > 0 ? s : undefined;
 }
 
 /**
@@ -217,9 +268,11 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
   const rnd = deps.random ?? Math.random;
 
   await ensureStateDir(cfg.stateDir);
+  await ensureCliSymlink();
 
   const secret = await loadSecretFn(cfg.stateDir);
 
+  const device = deviceLabelFromHost(hostname());
   const transport: TransportOpts = {
     endpoint: cfg.endpoint,
     secret,
@@ -228,6 +281,8 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
     arch: process.arch,
     ...(cfg.join ? { join: cfg.join } : {}),
     ...(cfg.company ? { company: cfg.company } : {}),
+    ...(device ? { device } : {}),
+    ...(cfg.link ? { link: cfg.link } : {}),
   };
 
   let state = await loadFn(cfg.stateDir);
@@ -401,6 +456,12 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (argv.includes("--version") || argv.includes("-v")) {
     console.log(versionLine());
     return 0;
+  }
+
+  // Multi-device subcommands (link/devices/revoke) run in the user's shell,
+  // not under launchd — they resolve user/endpoint from env or the plist.
+  if (argv[0] && (CLI_COMMANDS as readonly string[]).includes(argv[0])) {
+    return runCliCommand(argv[0] as CliCommand, argv.slice(1));
   }
 
   let cfg: ResolvedConfig;

@@ -1,4 +1,4 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -12,7 +12,7 @@ import { normalizeCompany } from "./company.ts";
 import { BinaryMirror, normalizeArch } from "./binary-mirror.ts";
 import { ConfigError, echoConfig, parseServerConfig, type ServerConfig } from "./config.ts";
 import { CursorMirror } from "./cursor-mirror.ts";
-import { type Bucket, Store } from "./db.ts";
+import { type Bucket, type DeviceInfo, Store } from "./db.ts";
 import { renderInstallScript, renderUninstallScript } from "./install-script.ts";
 import { PricingCache, computeRowCostUsd, roundUsd } from "./pricing.ts";
 import { parseStatsRange } from "./range.ts";
@@ -47,8 +47,13 @@ function isNonNegInt(v: unknown): v is number {
 function validateEvent(raw: unknown, idx: number): TokenEvent | string {
   if (!raw || typeof raw !== "object") return `events[${idx}] not an object`;
   const e = raw as Record<string, unknown>;
-  if (typeof e.user !== "string" || e.user.length === 0)
-    return `events[${idx}].user must be non-empty string`;
+  // The handle is the trust boundary's join key AND is interpolated into the
+  // rendered install command (link flow). The installer slugifies client-side
+  // to [a-z0-9._-]; enforce that server-side too so a raw POST can't claim a
+  // handle carrying shell metacharacters or break the install-command round
+  // trip. 64 = generous headroom over the installer's 32-char slug cap.
+  if (typeof e.user !== "string" || !/^[a-z0-9._-]{1,64}$/.test(e.user))
+    return `events[${idx}].user must match /^[a-z0-9._-]{1,64}$/`;
   if (typeof e.source !== "string" || !VALID_SOURCES.has(e.source as Source))
     return `events[${idx}].source must be 'claude_code' | 'codex'`;
   if (typeof e.sessionId !== "string" || e.sessionId.length === 0)
@@ -240,6 +245,39 @@ function timingSafeEqStr(a: string, b: string): boolean {
   return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
+// --- device link codes ------------------------------------------------------
+// Pairing codes for adding another machine to a claimed handle. Minted by an
+// authenticated device (POST /devices/link) or the admin (POST /admin/link);
+// redeemed by the new machine's first /ingest via X-Tokenleader-Link.
+const LINK_CODE_TTL_MS = 10 * 60 * 1000;
+// 32 symbols (no modulo bias off a byte) with O/I/L/1 dropped — codes get
+// read aloud and retyped across machines. 8 symbols = 40 bits.
+const LINK_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ023456789";
+
+function generateLinkCode(): string {
+  const bytes = randomBytes(8);
+  let raw = "";
+  for (const b of bytes) raw += LINK_CODE_ALPHABET[b % LINK_CODE_ALPHABET.length];
+  return `${raw.slice(0, 4)}-${raw.slice(4)}`;
+}
+
+/** Case/punctuation-insensitive compare form ("abcd-2345" → "ABCD2345"). */
+function normalizeLinkCode(s: string): string {
+  return s.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+/** X-Tokenleader-Device → display label: lowercase, [a-z0-9._-], ≤32 chars;
+ *  empty after cleanup → null. Cosmetic only — auth never consults it. */
+function deviceLabelFrom(raw: string | undefined): string | null {
+  const s = (raw ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "")
+    .slice(0, 32);
+  return s.length > 0 ? s : null;
+}
+
 function readCookie(header: string | undefined, name: string): string | null {
   if (!header) return null;
   for (const part of header.split(";")) {
@@ -351,6 +389,29 @@ export function buildApp(opts: BuildOptions) {
     );
     trailingClear.unref?.();
   }
+
+  // Outstanding link codes, one per user — minting replaces any prior code.
+  // In-memory by design: single-use 10-minute codes don't merit persistence;
+  // a server restart just means re-minting.
+  const linkCodes = new Map<string, { code: string; expiresAt: number }>();
+  const mintLinkCode = (user: string): { code: string; expiresAt: number } => {
+    const entry = { code: generateLinkCode(), expiresAt: Date.now() + LINK_CODE_TTL_MS };
+    linkCodes.set(user, entry);
+    return entry;
+  };
+  const consumeLinkCode = (user: string, presented: string): boolean => {
+    const entry = linkCodes.get(user);
+    if (!entry) return false;
+    if (entry.expiresAt <= Date.now()) {
+      linkCodes.delete(user);
+      return false;
+    }
+    if (!timingSafeEqStr(normalizeLinkCode(presented), normalizeLinkCode(entry.code))) {
+      return false;
+    }
+    linkCodes.delete(user);
+    return true;
+  };
 
   // --- dashboard viewer auth ----------------------------------------------
   // Gated routes are EXACTLY DASHBOARD_GATED — Hono's '/stats/*' does NOT
@@ -868,28 +929,54 @@ export function buildApp(opts: BuildOptions) {
     });
   });
 
-  // Fleet view: each teammate's daemon build vs the published version.
-  // Pre-reporting daemons show version=null until they update. Not cached:
-  // a couple of tiny indexed reads.
+  // Fleet view: every active device per teammate vs the published version.
+  // The user row mirrors its most recently seen reporting device; per-device
+  // rows ride along so multi-machine users don't flap. Not cached: a couple
+  // of tiny indexed reads.
   app.get("/stats/fleet", (c) => {
     const latest = currentDaemonVersion();
-    const statusByUser = new Map(store.listDaemonStatus().map((r) => [r.username, r]));
     const uninstalled = new Set(store.listUninstalledUsers().map((u) => u.user));
+    const devicesByUser = new Map<string, DeviceInfo[]>();
+    for (const { user, device } of store.listFleetDevices()) {
+      const list = devicesByUser.get(user);
+      if (list) list.push(device);
+      else devicesByUser.set(user, [device]);
+    }
     const fleet = store
       .listClaimedUsers()
       .filter((u) => !uninstalled.has(u.user))
       .map((u) => {
-        const s = statusByUser.get(u.user) ?? null;
+        const devices = (devicesByUser.get(u.user) ?? []).map((d) => ({
+          label: d.label,
+          version: d.version,
+          arch: d.arch,
+          lastSeen: d.lastSeen,
+          // Tri-state: true = on latest, false = stale/not-reporting, null =
+          // can't compare (no published manifest yet — boot window or no GH
+          // token). null must NOT render as "stale".
+          isLatest: d.version === null ? false : latest === null ? null : d.version === latest,
+        }));
+        const reporting = devices.filter((d) => d.version !== null);
+        let newest: (typeof devices)[number] | null = null;
+        for (const d of reporting) {
+          // >= so a lastSeen tie goes to the later-added device.
+          if (newest === null || (d.lastSeen ?? 0) >= (newest.lastSeen ?? 0)) newest = d;
+        }
         return {
           user: u.user,
-          version: s ? s.version : null,
-          arch: s ? s.arch : null,
-          lastSeen: s ? s.last_seen : null,
-          reporting: s !== null,
-          // Tri-state: true = on latest, false = stale, null = can't compare
-          // (no published manifest yet — boot window or no GH token). null
-          // must NOT render as "stale".
-          isLatest: s === null ? false : latest === null ? null : s.version === latest,
+          version: newest?.version ?? null,
+          arch: newest?.arch ?? null,
+          lastSeen: newest?.lastSeen ?? null,
+          reporting: newest !== null,
+          // Same tri-state; true only when EVERY reporting device is on
+          // latest, so one stale laptop can't hide behind a fresh desktop.
+          isLatest:
+            newest === null
+              ? false
+              : latest === null
+                ? null
+                : reporting.every((d) => d.version === latest),
+          devices,
         };
       })
       // Stale / unknown first so they stand out; then alphabetical.
@@ -1134,12 +1221,16 @@ export function buildApp(opts: BuildOptions) {
       }
     }
 
-    // TOFU: the first request for a username claims it; later requests must
-    // present the same secret. Rows with `uninstalled_at` set are re-claim
-    // eligible — a reinstall generates a fresh secret, so /ingest accepts
-    // it, rotates the hash, and clears the marker.
+    // TOFU device auth: the first request for a username claims it; later
+    // requests must present a secret matching one of the user's active
+    // devices. Order: claim → device match → re-claim (uninstalled users
+    // have no active devices, so a reinstall's fresh secret rotates the
+    // claim) → link-code redemption (adds this machine as a new device) →
+    // 403.
     const presentedHash = createHash("sha256").update(presentedSecret).digest("hex");
+    const deviceLabel = deviceLabelFrom(c.req.header("x-tokenleader-device"));
     const existing = store.getUserSecretRow(firstUser);
+    let deviceId: number;
     if (existing === null) {
       // Join gate: the FIRST claim of an unclaimed username must present
       // X-Tokenleader-Join. Claimed users (incl. the re-claim branch
@@ -1150,34 +1241,55 @@ export function buildApp(opts: BuildOptions) {
           return c.json({ error: "join_required" }, 403);
         }
       }
-      store.claimUserSecret(firstUser, presentedHash, Date.now());
-    } else if (existing.uninstalledAt !== null) {
-      store.reclaimUserSecret(firstUser, presentedHash, Date.now());
-      // Forget the pre-reinstall daemon build; re-recorded below if a
-      // version header is present, so a header-less reinstall reverts to
-      // "unknown".
-      store.clearUserDaemonStatus(firstUser);
-    } else {
-      const a = Buffer.from(existing.secretHash, "hex");
-      const b = Buffer.from(presentedHash, "hex");
-      if (a.length !== b.length || !timingSafeEqual(a, b)) {
+      const claimed = store.claimUserSecret(firstUser, presentedHash, Date.now(), deviceLabel);
+      if (claimed === null) {
+        // Another machine won the claim race between our read and write.
         return c.json({ error: `secret mismatch for user '${firstUser}'` }, 403);
+      }
+      deviceId = claimed;
+    } else {
+      const auth = store.authenticateDevice(firstUser, presentedHash);
+      if (auth) {
+        deviceId = auth.deviceId;
+        // Reconcile rollback drift: an old server may have set uninstalled_at
+        // while this device stayed active. In forward-only operation an
+        // authenticated device implies uninstalled_at is already null, so
+        // this repairs only the drift state — blocking the stranger-reclaim
+        // takeover it would otherwise enable.
+        if (existing.uninstalledAt !== null) store.clearUninstalledMark(firstUser);
+      } else if (
+        existing.uninstalledAt !== null &&
+        !store.isSecretBarred(firstUser, presentedHash)
+      ) {
+        // Re-claim of a genuinely uninstalled handle by a fresh secret. A
+        // secret barred via /devices/revoke is refused here so a kicked
+        // machine's still-running daemon can't resurrect itself.
+        deviceId = store.reclaimUserSecret(firstUser, presentedHash, Date.now(), deviceLabel);
+      } else {
+        const linkHeader = c.req.header("x-tokenleader-link") ?? "";
+        if (linkHeader.length === 0) {
+          return c.json({ error: `secret mismatch for user '${firstUser}'` }, 403);
+        }
+        if (!consumeLinkCode(firstUser, linkHeader)) {
+          return c.json({ error: `link code invalid or expired for user '${firstUser}'` }, 403);
+        }
+        deviceId = store.linkUserDevice(firstUser, presentedHash, Date.now(), deviceLabel);
       }
     }
 
-    // Record which daemon build + arch checked in. Best-effort — must never
-    // fail an otherwise-valid ingest.
+    // Record the check-in (build, arch, label, last-seen) on the matched
+    // device. Best-effort — must never fail an otherwise-valid ingest.
     try {
       const dVer = (c.req.header("x-tokenleader-version") ?? "").trim();
-      if (dVer.length > 0 && dVer.toLowerCase() !== "dev") {
-        const dArch = (c.req.header("x-tokenleader-arch") ?? "").trim();
-        store.recordDaemonStatus(
-          firstUser,
-          dVer.slice(0, 64),
-          dArch.length > 0 ? dArch.slice(0, 16) : null,
-          Date.now(),
-        );
-      }
+      const dArch = (c.req.header("x-tokenleader-arch") ?? "").trim();
+      store.recordDeviceCheckIn(
+        firstUser,
+        deviceId,
+        dVer.length > 0 && dVer.toLowerCase() !== "dev" ? dVer.slice(0, 64) : null,
+        dArch.length > 0 ? dArch.slice(0, 16) : null,
+        deviceLabel,
+        Date.now(),
+      );
     } catch {
       // fleet tracking is non-critical; never block an ingest on it
     }
@@ -1243,6 +1355,123 @@ export function buildApp(opts: BuildOptions) {
     return c.json({ ok: true, uninstalledAt: result.uninstalledAt });
   });
 
+  // Admin bearer gate shared by /admin/link and /admin/clear; unset → 503.
+  const requireAdmin = (c: Context): Response | null => {
+    if (!opts.adminToken || opts.adminToken.length === 0) {
+      return c.json({ error: "admin token not configured" }, 503);
+    }
+    const authHeader = c.req.header("authorization") ?? "";
+    const presented = authHeader.replace(/^Bearer\s+/i, "").trim();
+    if (presented.length === 0) {
+      return c.json({ error: "missing bearer token" }, 401);
+    }
+    if (!timingSafeEqStr(presented, opts.adminToken)) {
+      return c.json({ error: "invalid bearer token" }, 403);
+    }
+    return null;
+  };
+
+  // --- multi-device management --------------------------------------------
+  // All device-secret-auth'd (the /ingest scheme), never dashboard-gated.
+  // The flow: an existing machine mints a one-time pairing code, the new
+  // machine installs with --link=CODE, and its first /ingest redeems the
+  // code (see the link branch in /ingest above).
+  const authDevice = (c: Context, user: string): { deviceId: number } | null => {
+    const secret = c.req.header("x-tokenleader-secret") ?? "";
+    if (secret.length === 0) return null;
+    const hash = createHash("sha256").update(secret).digest("hex");
+    return store.authenticateDevice(user, hash);
+  };
+
+  const parseUserBody = async (
+    c: Context,
+  ): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; res: Response }> => {
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return { ok: false, res: c.json({ error: "invalid json body" }, 400) };
+    }
+    const user = (body as { user?: unknown } | null)?.user;
+    if (typeof user !== "string" || user.length === 0) {
+      return { ok: false, res: c.json({ error: "body.user must be non-empty string" }, 400) };
+    }
+    return { ok: true, body: body as Record<string, unknown> };
+  };
+
+  const linkCodeResponse = (c: Context, user: string): Response => {
+    const minted = mintLinkCode(user);
+    const url = resolveServerUrl(c, opts.serverUrl);
+    return c.json({
+      user,
+      code: minted.code,
+      expiresAt: minted.expiresAt,
+      command: `curl -fsSL ${url}/install | bash -s -- --name=${user} --link=${minted.code}`,
+    });
+  };
+
+  // Mint a pairing code for adding another machine to this handle.
+  app.post("/devices/link", async (c) => {
+    const parsed = await parseUserBody(c);
+    if (!parsed.ok) return parsed.res;
+    const user = parsed.body.user as string;
+    if (!authDevice(c, user)) {
+      return c.json({ error: `secret mismatch for user '${user}'` }, 403);
+    }
+    return linkCodeResponse(c, user);
+  });
+
+  // List a user's active devices. `current` marks the one whose secret
+  // authenticated this request.
+  app.get("/devices", (c) => {
+    const user = c.req.query("user") ?? "";
+    if (user.length === 0) return c.json({ error: "user query param required" }, 400);
+    const auth = authDevice(c, user);
+    if (!auth) return c.json({ error: `secret mismatch for user '${user}'` }, 403);
+    const devices = store
+      .listUserDevices(user)
+      .map((d) => ({ ...d, current: d.id === auth.deviceId }));
+    return c.json({ user, devices });
+  });
+
+  // Revoke one device by id. Any of the user's devices may revoke any other
+  // (including itself — that's "unlink this machine"). Revoking the last
+  // device marks the user uninstalled, same as the uninstall script.
+  app.post("/devices/revoke", async (c) => {
+    const parsed = await parseUserBody(c);
+    if (!parsed.ok) return parsed.res;
+    const user = parsed.body.user as string;
+    const deviceId = parsed.body.deviceId;
+    if (typeof deviceId !== "number" || !Number.isInteger(deviceId)) {
+      return c.json({ error: "body.deviceId must be an integer" }, 400);
+    }
+    if (!authDevice(c, user)) {
+      return c.json({ error: `secret mismatch for user '${user}'` }, 403);
+    }
+    // barred=true: the deliberate-revoke path bars this secret from
+    // auto-reclaim, so a kicked machine's daemon can't resurrect the handle.
+    const r = store.revokeUserDevice(user, deviceId, Date.now(), true);
+    if (!r.revoked) {
+      return c.json({ error: "device not found (or already revoked)" }, 404);
+    }
+    return c.json({ ok: true, deviceId, uninstalled: r.uninstalled });
+  });
+
+  // Admin escape hatch: mint a link code with the admin bearer instead of a
+  // device secret — for when a user's only machine is gone and nothing can
+  // mint. Unknown users get a 404: a FIRST install needs no code.
+  app.post("/admin/link", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const parsed = await parseUserBody(c);
+    if (!parsed.ok) return parsed.res;
+    const user = parsed.body.user as string;
+    if (store.getUserSecretRow(user) === null) {
+      return c.json({ error: `unknown user '${user}' — a first install needs no link code` }, 404);
+    }
+    return linkCodeResponse(c, user);
+  });
+
   app.get("/stats", (c) => {
     const user = c.req.query("user");
     if (!user) return c.json({ error: "user query param required" }, 400);
@@ -1286,23 +1515,11 @@ export function buildApp(opts: BuildOptions) {
     });
   });
 
-  // Destructive maintenance route, gated by the admin bearer; unset → 503.
+  // Destructive maintenance route, gated by the admin bearer.
   // Body: { scope: "all"|"user"|"reset-user"|"full", user?: string }.
   app.post("/admin/clear", async (c) => {
-    if (!opts.adminToken || opts.adminToken.length === 0) {
-      return c.json({ error: "admin token not configured" }, 503);
-    }
-    const authHeader = c.req.header("authorization") ?? c.req.header("Authorization") ?? "";
-    const presented = authHeader.replace(/^Bearer\s+/i, "").trim();
-    if (presented.length === 0) {
-      return c.json({ error: "missing bearer token" }, 401);
-    }
-    // Timing-safe equality check.
-    const a = Buffer.from(opts.adminToken);
-    const b = Buffer.from(presented);
-    if (a.length !== b.length || !timingSafeEqual(a, b)) {
-      return c.json({ error: "invalid bearer token" }, 403);
-    }
+    const denied = requireAdmin(c);
+    if (denied) return denied;
     let body: unknown;
     try {
       body = await c.req.json();
@@ -1332,7 +1549,6 @@ export function buildApp(opts: BuildOptions) {
       if (!userStr) return c.json({ error: "scope=reset-user requires `user` field" }, 400);
       const removedEvents = store.clearUserEvents(userStr);
       const removedSecret = store.clearUserSecret(userStr);
-      store.clearUserDaemonStatus(userStr);
       invalidateStatsCache();
       return c.json({
         scope,

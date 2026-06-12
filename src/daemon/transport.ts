@@ -28,6 +28,15 @@ export interface TransportOpts {
   // X-Tokenleader-Company on every ingest POST when set; the server
   // normalizes to a bare hostname and ignores invalid values.
   company?: string;
+  // Short hostname, sent as X-Tokenleader-Device so the server can label
+  // this machine's device row. Cosmetic — auth never consults it.
+  device?: string;
+  // Optional link code (TOKENLEADER_LINK, from the installer's --link
+  // flag). Sent on every POST when set — the server only consults it when
+  // the secret doesn't match an existing device, and ignores it after the
+  // single-use redemption, so "always send" is the simplest correct
+  // client behavior (same contract as `join`).
+  link?: string;
   batchSize?: number;
   // Test/DI hooks. Real callers don't pass these.
   fetchImpl?: typeof fetch;
@@ -153,6 +162,8 @@ async function postBatch(
             "X-Tokenleader-Arch": opts.arch ?? "",
             ...(opts.join ? { "X-Tokenleader-Join": opts.join } : {}),
             ...(opts.company ? { "X-Tokenleader-Company": opts.company } : {}),
+            ...(opts.device ? { "X-Tokenleader-Device": opts.device } : {}),
+            ...(opts.link ? { "X-Tokenleader-Link": opts.link } : {}),
           },
           body: JSON.stringify(body),
         },
@@ -169,19 +180,28 @@ async function postBatch(
         };
       }
 
-      // 403 "secret mismatch": the username is already claimed by a
-      // different machine. Retrying will keep failing — surface a loud
-      // error so the user knows to pick a new name (or have the admin
-      // reset it via `sqlite3 ... 'delete from user_secrets where ...'`).
+      // 403 "secret mismatch" / "link code invalid": the username is
+      // claimed by a different machine and this one isn't (yet) linked.
+      // Retrying will keep failing — surface a loud, actionable error.
       if (res.status === 403) {
         let bodyText = "";
         try {
           bodyText = await res.text();
         } catch {}
-        if (bodyText.toLowerCase().includes("secret mismatch")) {
+        const lower = bodyText.toLowerCase();
+        if (lower.includes("link code")) {
+          log.error("post_link_invalid", {
+            url,
+            hint: "Link code expired or already used — run `anara-leaderboard link` on the linked machine and reinstall here with the fresh --link code",
+            serverBody: bodyText.slice(0, 200),
+            batchSize: events.length,
+          });
+          return { ok: false, inserted: 0, duplicates: 0, error: "link_invalid" };
+        }
+        if (lower.includes("secret mismatch")) {
           log.error("post_secret_mismatch", {
             url,
-            hint: "Username already claimed by a different machine — pick a new name or have admin reset",
+            hint: "Username already claimed by a different machine — to share the handle, run `anara-leaderboard link` there and reinstall here with --link=CODE; otherwise pick a new name",
             serverBody: bodyText.slice(0, 200),
             batchSize: events.length,
           });

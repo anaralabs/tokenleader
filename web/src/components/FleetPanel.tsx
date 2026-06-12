@@ -1,5 +1,11 @@
-import type { FleetEntry, FleetStats } from "../api";
+import type { FleetDevice, FleetEntry, FleetStats } from "../api";
 import { relTime } from "../format";
+
+function deviceSummary(d: FleetDevice): string {
+  const name = d.label ?? "unnamed";
+  const seen = d.lastSeen ? relTime(d.lastSeen) : "never";
+  return `${name}: ${d.version ?? "unknown"} (${seen})`;
+}
 
 // A daemon seen within its hourly update window (+ jitter slack) that isn't
 // on the newest build yet is just mid-rollout, not a problem — "updating".
@@ -77,9 +83,20 @@ export function FleetPanel({
             {data.fleet.map((f) => {
               const b = badge(f);
               const dimmed = focusUser !== undefined && f.user !== focusUser;
+              const devices = f.devices ?? [];
               return (
                 <tr key={f.user} className={dimmed ? "is-dimmed" : ""}>
-                  <td>{f.user}</td>
+                  <td>
+                    {f.user}
+                    {devices.length > 1 && (
+                      <span
+                        className="fleet-devcount"
+                        title={devices.map(deviceSummary).join("\n")}
+                      >
+                        ×{devices.length}
+                      </span>
+                    )}
+                  </td>
                   <td className="fleet-version">
                     {f.reporting ? f.version : <span className="muted-2">unknown</span>}
                   </td>

@@ -1310,3 +1310,68 @@ describe("sleep", () => {
     expect(Date.now() - t0).toBeLessThan(500);
   });
 });
+
+// ---------------------------------------------------------------------------
+// device-link plumbing
+// ---------------------------------------------------------------------------
+
+describe("device link", () => {
+  test("TOKENLEADER_LINK is parsed, trimmed, optional", () => {
+    const base = {
+      TOKENLEADER_USER: "u",
+      TOKENLEADER_ENDPOINT: "https://x",
+    };
+    const cfg = resolveConfig({
+      ...base,
+      TOKENLEADER_LINK: "  ABCD-2345  ",
+    } as NodeJS.ProcessEnv);
+    expect(cfg.link).toBe("ABCD-2345");
+    expect(resolveConfig(base as NodeJS.ProcessEnv).link).toBeUndefined();
+    expect(
+      resolveConfig({ ...base, TOKENLEADER_LINK: "   " } as NodeJS.ProcessEnv).link,
+    ).toBeUndefined();
+  });
+
+  test("postEvents sends X-Tokenleader-Link + X-Tokenleader-Device only when set", async () => {
+    let captured: Request | null = null;
+    const capture = (async (input: unknown, init?: unknown) => {
+      captured = new Request(input as string, init as RequestInit | undefined);
+      return new Response(JSON.stringify({ inserted: 1, duplicates: 0 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    await postEvents(
+      [makeEvent()],
+      mkTransport({ fetchImpl: capture, link: "ABCD-2345", device: "krishs-mbp" }),
+    );
+    expect(captured!.headers.get("X-Tokenleader-Link")).toBe("ABCD-2345");
+    expect(captured!.headers.get("X-Tokenleader-Device")).toBe("krishs-mbp");
+
+    captured = null;
+    await postEvents([makeEvent()], mkTransport({ fetchImpl: capture }));
+    expect(captured!.headers.get("X-Tokenleader-Link")).toBeNull();
+    expect(captured!.headers.get("X-Tokenleader-Device")).toBeNull();
+  });
+
+  test("postEvents treats 403 'link code invalid' as non-retriable link_invalid", async () => {
+    let calls = 0;
+    const r = await postEvents(
+      [makeEvent()],
+      mkTransport({
+        sleepMs: async () => {},
+        fetchImpl: (async () => {
+          calls++;
+          return new Response(
+            JSON.stringify({ error: "link code invalid or expired for user 'krish'" }),
+            { status: 403, headers: { "Content-Type": "application/json" } },
+          );
+        }) as unknown as typeof fetch,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    expect(calls).toBe(1);
+    expect(r.error).toBe("link_invalid");
+  });
+});

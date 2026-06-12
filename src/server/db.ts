@@ -42,14 +42,38 @@ CREATE TABLE IF NOT EXISTS user_secrets (
   company        TEXT
 );
 
--- Per-user daemon build last reported on /ingest (X-Tokenleader-Version /
--- X-Tokenleader-Arch headers); powers the dashboard fleet view.
+-- Legacy per-user daemon build table. Superseded by user_devices (which
+-- carries version/arch/last_seen per machine); kept so a server rollback
+-- finds its table. No longer read or written.
 CREATE TABLE IF NOT EXISTS daemon_status (
   username   TEXT PRIMARY KEY,
   version    TEXT NOT NULL,
   arch       TEXT,
   last_seen  INTEGER NOT NULL
 );
+
+-- One row per machine authorized to post as a user. secret_hash is the
+-- sha256 of that machine's TOFU secret; /ingest auth passes when the
+-- presented hash matches ANY non-revoked row. user_secrets.secret_hash
+-- stays mirrored to a SURVIVING active device's hash so a server rollback
+-- keeps authenticating. version/arch/last_seen power the per-device fleet
+-- view (replacing daemon_status). barred=1 marks a device kicked via the
+-- deliberate /devices/revoke path (vs left via uninstall) — its secret can
+-- never auto-reclaim the handle, so a revoked machine's still-running
+-- daemon can't resurrect itself.
+CREATE TABLE IF NOT EXISTS user_devices (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  username    TEXT NOT NULL,
+  secret_hash TEXT NOT NULL,
+  label       TEXT,
+  version     TEXT,
+  arch        TEXT,
+  added_at    INTEGER NOT NULL,
+  last_seen   INTEGER,
+  revoked_at  INTEGER,
+  barred      INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS user_devices_user ON user_devices (username);
 
 -- Tiny KV for server state that must survive restarts
 -- (e.g. cursor_watermark_ms, the CursorMirror backfill watermark).
@@ -107,6 +131,40 @@ function migrateCompany(db: Database): void {
   if (!hasCol) {
     db.exec("ALTER TABLE user_secrets ADD COLUMN company TEXT");
   }
+}
+
+/**
+ * Migration: seed `user_devices` from pre-multi-device rows. Idempotent —
+ * only users with ZERO device rows are seeded, so post-migration rotations
+ * are never clobbered. The seed device inherits the user's TOFU hash, the
+ * legacy daemon_status build info, and (for uninstalled users) a revoked_at
+ * matching uninstalled_at — preserving the invariant that an uninstalled
+ * user has no active devices.
+ */
+function migrateUserDevices(db: Database): void {
+  db.exec(
+    `INSERT INTO user_devices (username, secret_hash, label, version, arch, added_at, last_seen, revoked_at)
+     SELECT us.username, us.secret_hash, NULL, ds.version, ds.arch, us.claimed_at, ds.last_seen, us.uninstalled_at
+       FROM user_secrets us
+       LEFT JOIN daemon_status ds ON ds.username = us.username
+      WHERE NOT EXISTS (SELECT 1 FROM user_devices d WHERE d.username = us.username)`,
+  );
+  // Roll-forward reconcile: if a rollback-window reclaim (old code rotated
+  // user_secrets.secret_hash without touching user_devices) left the live
+  // device hash absent from this user's rows, re-register it as an active
+  // device so the daemon isn't stranded on a 403. Matching ANY row by hash
+  // (active OR revoked) keeps a deliberately-revoked secret from being
+  // resurrected; no-op for forward-only users (claim/reclaim always wrote a
+  // matching row).
+  db.exec(
+    `INSERT INTO user_devices (username, secret_hash, added_at)
+     SELECT us.username, us.secret_hash, us.claimed_at
+       FROM user_secrets us
+      WHERE us.uninstalled_at IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM user_devices d
+           WHERE d.username = us.username AND d.secret_hash = us.secret_hash)`,
+  );
 }
 
 /**
@@ -258,11 +316,27 @@ export interface UninstalledUserRow {
   uninstalled_at: number;
 }
 
-export interface DaemonStatusRow {
+export interface UserDeviceRow {
+  id: number;
   username: string;
-  version: string;
+  secret_hash: string;
+  label: string | null;
+  version: string | null;
   arch: string | null;
-  last_seen: number;
+  added_at: number;
+  last_seen: number | null;
+  revoked_at: number | null;
+  barred: number;
+}
+
+/** Camel-cased device row for API surfaces; never carries the hash. */
+export interface DeviceInfo {
+  id: number;
+  label: string | null;
+  version: string | null;
+  arch: string | null;
+  addedAt: number;
+  lastSeen: number | null;
 }
 
 /** Default exclusive upper bound for "lifetime" ranges. 2^53-1 ms ≈ year
@@ -272,6 +346,17 @@ export const MAX_TS_MS = Number.MAX_SAFE_INTEGER;
 /** server_meta key for the CursorMirror backfill watermark (the only
  *  cursor-owned key); clearFull deletes it so cleared history re-imports. */
 export const CURSOR_WATERMARK_META_KEY = "cursor_watermark_ms";
+
+function deviceInfo(r: UserDeviceRow): DeviceInfo {
+  return {
+    id: r.id,
+    label: r.label,
+    version: r.version,
+    arch: r.arch,
+    addedAt: r.added_at,
+    lastSeen: r.last_seen,
+  };
+}
 
 /** Company scope: restrict to events whose user is claimed under the given
  *  company (user_secrets.company, from X-Tokenleader-Company). A fixed
@@ -326,9 +411,16 @@ export class Store {
   private readonly markUserUninstalledStmt: Statement;
   private readonly clearUninstalledAtStmt: Statement;
   private readonly updateUserSecretHashStmt: Statement;
+  private readonly repointUserSecretHashStmt: Statement;
   private readonly listUninstalledUsersStmt: Statement<UninstalledUserRow>;
-  private readonly recordDaemonStatusStmt: Statement;
-  private readonly listDaemonStatusStmt: Statement<DaemonStatusRow>;
+  private readonly listUserDevicesStmt: Statement<UserDeviceRow, [string]>;
+  private readonly listUserDevicesAllStmt: Statement<UserDeviceRow, [string]>;
+  private readonly listFleetDevicesStmt: Statement<UserDeviceRow, []>;
+  private readonly insertDeviceStmt: Statement;
+  private readonly revokeDeviceStmt: Statement;
+  private readonly revokeAllDevicesStmt: Statement;
+  private readonly deviceCheckInStmt: Statement;
+  private readonly setDeviceLabelStmt: Statement;
   private readonly setUserCompanyStmt: Statement;
   private readonly getUserCompanyStmt: Statement<{ company: string | null }, [string]>;
   private readonly userMessageCountsAllStmt: Statement<UserMessageCountsRow, [number, number]>;
@@ -397,6 +489,7 @@ export class Store {
     migrateUninstalledAt(this.db);
     migrateCompany(this.db);
     migrateCostUsdMicros(this.db);
+    migrateUserDevices(this.db);
 
     this.insertStmt = this.db.prepare(
       `INSERT INTO events (user, source, sessionId, messageId, requestId, timestamp,
@@ -591,6 +684,9 @@ export class Store {
       `UPDATE user_secrets SET uninstalled_at = $uninstalled_at
         WHERE username = $username`,
     );
+    this.clearUninstalledAtStmt = this.db.prepare(
+      "UPDATE user_secrets SET uninstalled_at = NULL WHERE username = $username",
+    );
     // /ingest re-claim path: rotate the stored hash + clear uninstalled_at
     // in a single update.
     this.updateUserSecretHashStmt = this.db.prepare(
@@ -600,25 +696,53 @@ export class Store {
               uninstalled_at = NULL
         WHERE username = $username`,
     );
-    this.clearUninstalledAtStmt = this.db.prepare(
-      `UPDATE user_secrets SET uninstalled_at = NULL WHERE username = $username`,
+    // Re-point the rollback mirror to a surviving device's hash (no
+    // claimed_at / uninstalled_at change) when the mirrored device is
+    // revoked but others remain.
+    this.repointUserSecretHashStmt = this.db.prepare(
+      "UPDATE user_secrets SET secret_hash = $secret_hash WHERE username = $username",
     );
     this.listUninstalledUsersStmt = this.db.prepare<UninstalledUserRow, []>(
       `SELECT username, uninstalled_at FROM user_secrets
         WHERE uninstalled_at IS NOT NULL
         ORDER BY uninstalled_at DESC`,
     );
-    this.recordDaemonStatusStmt = this.db.prepare(
-      `INSERT INTO daemon_status (username, version, arch, last_seen)
-       VALUES ($username, $version, $arch, $last_seen)
-       ON CONFLICT(username) DO UPDATE SET
-         version   = $version,
-         arch      = $arch,
-         last_seen = $last_seen`,
+    this.listUserDevicesStmt = this.db.prepare<UserDeviceRow, [string]>(
+      `SELECT * FROM user_devices
+        WHERE username = ? AND revoked_at IS NULL
+        ORDER BY added_at ASC, id ASC`,
     );
-    this.listDaemonStatusStmt = this.db.prepare<DaemonStatusRow, []>(
-      `SELECT username, version, arch, last_seen FROM daemon_status
-        ORDER BY username ASC`,
+    this.listUserDevicesAllStmt = this.db.prepare<UserDeviceRow, [string]>(
+      "SELECT * FROM user_devices WHERE username = ? ORDER BY added_at ASC, id ASC",
+    );
+    this.listFleetDevicesStmt = this.db.prepare<UserDeviceRow, []>(
+      `SELECT * FROM user_devices
+        WHERE revoked_at IS NULL
+        ORDER BY username ASC, added_at ASC, id ASC`,
+    );
+    this.insertDeviceStmt = this.db.prepare(
+      `INSERT INTO user_devices (username, secret_hash, label, added_at)
+       VALUES ($username, $secret_hash, $label, $added_at)`,
+    );
+    this.revokeDeviceStmt = this.db.prepare(
+      `UPDATE user_devices SET revoked_at = $revoked_at
+        WHERE id = $id AND username = $username AND revoked_at IS NULL`,
+    );
+    this.revokeAllDevicesStmt = this.db.prepare(
+      `UPDATE user_devices SET revoked_at = $revoked_at
+        WHERE username = $username AND revoked_at IS NULL`,
+    );
+    // Every authed ingest stamps last_seen; version/arch only overwrite
+    // with real values (old daemons omit the headers).
+    this.deviceCheckInStmt = this.db.prepare(
+      `UPDATE user_devices
+          SET last_seen = $last_seen,
+              version   = COALESCE($version, version),
+              arch      = COALESCE($arch, arch)
+        WHERE id = $id`,
+    );
+    this.setDeviceLabelStmt = this.db.prepare(
+      "UPDATE user_devices SET label = $label WHERE id = $id AND label IS NULL",
     );
     // UPDATE (not upsert): /ingest only calls this after a successful
     // claim/auth, so the user_secrets row always exists.
@@ -1041,23 +1165,19 @@ export class Store {
     return Number(r.changes);
   }
 
-  /** Remove the TOFU claim for a user (so the next post claims fresh). */
+  /** Remove the TOFU claim + every device row for a user (so the next
+   *  post claims fresh). */
   clearUserSecret(user: string): number {
+    this.db.prepare("DELETE FROM user_devices WHERE username = ?").run(user);
     const r = this.db.prepare("DELETE FROM user_secrets WHERE username = ?").run(user);
     return Number(r.changes);
-  }
-
-  /** Forget a user's reported daemon build. Called wherever the claim is
-   *  reset or reclaimed, so the fleet view never shows a stale build. */
-  clearUserDaemonStatus(user: string): void {
-    this.db.prepare("DELETE FROM daemon_status WHERE username = ?").run(user);
   }
 
   /** Nuclear: drop and recreate all tables. */
   clearFull(): void {
     this.cachedCount = null;
     this.db.exec(
-      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status;",
+      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices;",
     );
     // server_meta survives (other keys may be unrelated state), but the
     // cursor watermark must go or cleared Cursor history never re-imports.
@@ -1095,22 +1215,211 @@ export class Store {
     };
   }
 
-  claimUserSecret(user: string, secretHash: string, now: number): void {
-    this.claimUserSecretStmt.run({
-      $username: user,
-      $secret_hash: secretHash,
-      $claimed_at: now,
+  /**
+   * First claim of an unclaimed username: the user_secrets row and the
+   * machine's device row are created in one transaction. Returns the new
+   * device id, or null when another machine won the claim race first —
+   * the caller must treat null as a secret mismatch.
+   */
+  claimUserSecret(
+    user: string,
+    secretHash: string,
+    now: number,
+    label: string | null = null,
+  ): number | null {
+    const tx = this.db.transaction((): number | null => {
+      const res = this.claimUserSecretStmt.run({
+        $username: user,
+        $secret_hash: secretHash,
+        $claimed_at: now,
+      });
+      if (res.changes === 0) return null;
+      return this.insertDevice(user, secretHash, label, now);
     });
+    return tx();
   }
 
-  /** Re-claim: rotate the stored secret hash and clear `uninstalled_at` in
-   *  one UPDATE. Used by /ingest for previously-uninstalled users. */
-  reclaimUserSecret(user: string, secretHash: string, now: number): void {
-    this.updateUserSecretHashStmt.run({
+  /**
+   * Re-claim of an uninstalled username: rotate the user_secrets hash,
+   * clear `uninstalled_at`, revoke any leftover device rows, and register
+   * the new machine as the sole device. Returns the new device id.
+   */
+  reclaimUserSecret(
+    user: string,
+    secretHash: string,
+    now: number,
+    label: string | null = null,
+  ): number {
+    const tx = this.db.transaction((): number => {
+      this.updateUserSecretHashStmt.run({
+        $username: user,
+        $secret_hash: secretHash,
+        $claimed_at: now,
+      });
+      this.revokeAllDevicesStmt.run({ $username: user, $revoked_at: now });
+      return this.insertDevice(user, secretHash, label, now);
+    });
+    return tx();
+  }
+
+  /** Add a machine to an already-claimed username (link-code redemption).
+   *  Returns the new device id. */
+  linkUserDevice(user: string, secretHash: string, now: number, label: string | null): number {
+    return this.insertDevice(user, secretHash, label, now);
+  }
+
+  private insertDevice(
+    user: string,
+    secretHash: string,
+    label: string | null,
+    now: number,
+  ): number {
+    const res = this.insertDeviceStmt.run({
       $username: user,
       $secret_hash: secretHash,
-      $claimed_at: now,
+      $label: this.dedupedLabel(user, label),
+      $added_at: now,
     });
+    return Number(res.lastInsertRowid);
+  }
+
+  /** "mbp" → "mbp-2" when an active sibling already holds the label. */
+  private dedupedLabel(user: string, label: string | null): string | null {
+    if (!label) return null;
+    const taken = new Set(this.listUserDevicesStmt.all(user).map((d) => d.label));
+    if (!taken.has(label)) return label;
+    for (let i = 2; ; i++) {
+      const candidate = `${label}-${i}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+  }
+
+  /** Active devices for a user, oldest first. Never exposes hashes. */
+  listUserDevices(user: string): DeviceInfo[] {
+    return this.listUserDevicesStmt.all(user).map(deviceInfo);
+  }
+
+  /** Every user's active devices, (username, added_at)-sorted, for the
+   *  fleet view. */
+  listFleetDevices(): Array<{ user: string; device: DeviceInfo }> {
+    return this.listFleetDevicesStmt
+      .all()
+      .map((r) => ({ user: r.username, device: deviceInfo(r) }));
+  }
+
+  /**
+   * Timing-safe device auth: does the presented sha256 hash match any
+   * active device? Every row is compared (no early exit) so response
+   * timing doesn't reveal which device matched.
+   */
+  authenticateDevice(user: string, presentedHash: string): { deviceId: number } | null {
+    const presented = Buffer.from(presentedHash, "hex");
+    let matched: number | null = null;
+    for (const row of this.listUserDevicesStmt.all(user)) {
+      const stored = Buffer.from(row.secret_hash, "hex");
+      if (
+        stored.length === presented.length &&
+        timingSafeEqual(stored, presented) &&
+        matched === null
+      ) {
+        matched = row.id;
+      }
+    }
+    return matched === null ? null : { deviceId: matched };
+  }
+
+  /**
+   * Revoke one device. `barred` = the deliberate /devices/revoke path: the
+   * device's secret is marked so it can never auto-reclaim the handle (a
+   * kicked machine's still-running daemon can't resurrect itself). The
+   * uninstall path passes barred=false — that secret may seamlessly
+   * reinstall. When the last active device goes, the user is marked
+   * uninstalled (re-claim invariant: no active devices ⇒ uninstalled_at set
+   * ⇒ a NON-barred secret may re-claim). When devices remain, the rollback
+   * mirror is re-pointed off the revoked device so a rollback keeps
+   * authenticating a survivor.
+   */
+  revokeUserDevice(
+    user: string,
+    deviceId: number,
+    now: number,
+    barred = false,
+  ): { revoked: boolean; uninstalled: boolean } {
+    const tx = this.db.transaction((): { revoked: boolean; uninstalled: boolean } => {
+      const before = this.listUserDevicesStmt.all(user);
+      const target = before.find((d) => d.id === deviceId);
+      const res = this.revokeDeviceStmt.run({
+        $id: deviceId,
+        $username: user,
+        $revoked_at: now,
+      });
+      if (res.changes === 0) return { revoked: false, uninstalled: false };
+      if (barred) {
+        this.db.prepare("UPDATE user_devices SET barred = 1 WHERE id = ?").run(deviceId);
+      }
+      const remaining = this.listUserDevicesStmt.all(user);
+      if (remaining.length === 0) {
+        this.markUserUninstalledStmt.run({ $username: user, $uninstalled_at: now });
+        return { revoked: true, uninstalled: true };
+      }
+      // If the revoked device's hash was the rollback mirror, re-point it
+      // to the oldest survivor so an old server keeps authenticating.
+      if (target && this.getUserSecretStmt.get(user)?.secret_hash === target.secret_hash) {
+        this.repointUserSecretHashStmt.run({
+          $username: user,
+          $secret_hash: remaining[0]!.secret_hash,
+        });
+      }
+      return { revoked: true, uninstalled: false };
+    });
+    return tx();
+  }
+
+  /** Has this secret been barred (kicked via /devices/revoke) for the user?
+   *  Timing-safe; gates the /ingest reclaim branch so a revoked machine
+   *  can't resurrect its handle. */
+  isSecretBarred(user: string, presentedHash: string): boolean {
+    const presented = Buffer.from(presentedHash, "hex");
+    let barred = false;
+    for (const row of this.listUserDevicesAllStmt.all(user)) {
+      if (row.barred !== 1) continue;
+      const stored = Buffer.from(row.secret_hash, "hex");
+      if (stored.length === presented.length && timingSafeEqual(stored, presented)) {
+        barred = true;
+      }
+    }
+    return barred;
+  }
+
+  /** Clear the uninstalled marker (no-op when already null). Used to
+   *  reconcile rollback drift on a successful device auth. */
+  clearUninstalledMark(user: string): void {
+    this.clearUninstalledAtStmt.run({ $username: user });
+  }
+
+  /**
+   * Stamp a device's check-in: last_seen always; version/arch only when
+   * the daemon sent real values; label adopted only while NULL (an
+   * existing label is never renamed by a later header).
+   */
+  recordDeviceCheckIn(
+    user: string,
+    deviceId: number,
+    version: string | null,
+    arch: string | null,
+    label: string | null,
+    now: number,
+  ): void {
+    this.deviceCheckInStmt.run({
+      $id: deviceId,
+      $last_seen: now,
+      $version: version,
+      $arch: arch,
+    });
+    if (!label) return;
+    const self = this.listUserDevicesStmt.all(user).find((d) => d.id === deviceId);
+    if (!self || self.label !== null) return;
+    this.setDeviceLabelStmt.run({ $id: deviceId, $label: this.dedupedLabel(user, label) });
   }
 
   listClaimedUsers(): Array<{ user: string; claimedAt: number }> {
@@ -1120,37 +1429,34 @@ export class Store {
   }
 
   /**
-   * Mark a user uninstalled after a timing-safe secret compare (same scheme
-   * as /ingest). Idempotent on repeat calls. Callers must pre-check
-   * `getUserSecretRow` for the unknown-user case — the row must exist.
+   * /events/uninstall: authenticate the presented hash against the user's
+   * devices and revoke the matching one. `uninstalledAt` is non-null only
+   * when that was the last active device — a user whose other machines are
+   * still posting stays on the board. Idempotent: a repeat call (secret
+   * matches an already-revoked device) reports the stored state without
+   * changing anything.
    */
   markUserUninstalled(
     user: string,
     secretHash: string,
     now: number,
   ): { matched: boolean; uninstalledAt: number | null } {
-    const row = this.getUserSecretStmt.get(user);
-    if (!row) return { matched: false, uninstalledAt: null };
-    // Both sides are fixed 64-char hex digests; the length check is
-    // defense-in-depth.
-    const stored = Buffer.from(row.secret_hash, "hex");
+    const auth = this.authenticateDevice(user, secretHash);
+    if (auth) {
+      const r = this.revokeUserDevice(user, auth.deviceId, now);
+      return { matched: true, uninstalledAt: r.uninstalled ? now : null };
+    }
     const presented = Buffer.from(secretHash, "hex");
-    if (stored.length !== presented.length) {
-      return { matched: false, uninstalledAt: null };
+    for (const row of this.listUserDevicesAllStmt.all(user)) {
+      const stored = Buffer.from(row.secret_hash, "hex");
+      if (stored.length === presented.length && timingSafeEqual(stored, presented)) {
+        return {
+          matched: true,
+          uninstalledAt: this.getUserSecretStmt.get(user)?.uninstalled_at ?? null,
+        };
+      }
     }
-    if (!timingSafeEqual(stored, presented)) {
-      return { matched: false, uninstalledAt: null };
-    }
-    this.markUserUninstalledStmt.run({
-      $username: user,
-      $uninstalled_at: now,
-    });
-    return { matched: true, uninstalledAt: now };
-  }
-
-  /** Clear the uninstalled_at marker on a user (no-op if already null). */
-  clearUserUninstalledAt(user: string): void {
-    this.clearUninstalledAtStmt.run({ $username: user });
+    return { matched: false, uninstalledAt: null };
   }
 
   /** Users with `uninstalled_at` set, newest first. */
@@ -1158,24 +1464,6 @@ export class Store {
     return this.listUninstalledUsersStmt
       .all()
       .map((r) => ({ user: r.username, uninstalledAt: r.uninstalled_at }));
-  }
-
-  /**
-   * Upsert the daemon build a user last reported on /ingest. Best-effort:
-   * old daemons omit the headers, so their row stays absent → "unknown".
-   */
-  recordDaemonStatus(user: string, version: string, arch: string | null, now: number): void {
-    this.recordDaemonStatusStmt.run({
-      $username: user,
-      $version: version,
-      $arch: arch,
-      $last_seen: now,
-    });
-  }
-
-  /** Every user's last-reported daemon build, username-sorted. */
-  listDaemonStatus(): DaemonStatusRow[] {
-    return this.listDaemonStatusStmt.all();
   }
 
   /**

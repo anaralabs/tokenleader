@@ -1,0 +1,300 @@
+// `anara-leaderboard link|devices|revoke` — context resolution (env / plist /
+// endpoint override / secret file) and the server round-trips, all through
+// the DI seams so nothing touches the network or the real LaunchAgent.
+import { describe, expect, test } from "bun:test";
+import { promises as fsp } from "node:fs";
+import { join } from "node:path";
+import { makeTmpDir } from "../test-helpers.ts";
+import { type CliDeps, parsePlistEnv, runCliCommand } from "./cli.ts";
+import { deviceLabelFromHost, ensureCliSymlink } from "./main.ts";
+
+const PLIST = `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.anara.leaderboard</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TOKENLEADER_USER</key>
+        <string>krish</string>
+        <key>TOKENLEADER_ENDPOINT</key>
+        <string>https://plist.example.com</string>
+        <key>HOME</key>
+        <string>/Users/krish</string>
+    </dict>
+</dict>
+</plist>`;
+
+describe("parsePlistEnv", () => {
+  test("extracts the ALL-CAPS env entries and skips Label", () => {
+    const env = parsePlistEnv(PLIST);
+    expect(env.TOKENLEADER_USER).toBe("krish");
+    expect(env.TOKENLEADER_ENDPOINT).toBe("https://plist.example.com");
+    expect(env.Label).toBeUndefined();
+  });
+});
+
+describe("deviceLabelFromHost", () => {
+  test("lowercases and drops the domain part", () => {
+    expect(deviceLabelFromHost("Krishs-MacBook-Pro.local")).toBe("krishs-macbook-pro");
+  });
+  test("collapses junk and bounds the length", () => {
+    expect(deviceLabelFromHost("My Mac!!")).toBe("my-mac");
+    expect(deviceLabelFromHost("x".repeat(99))).toBe("x".repeat(32));
+  });
+  test("nothing left → undefined", () => {
+    expect(deviceLabelFromHost("---")).toBeUndefined();
+    expect(deviceLabelFromHost("")).toBeUndefined();
+  });
+});
+
+describe("ensureCliSymlink", () => {
+  test("creates `tokenleader` beside the legacy-named binary", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-symlink-");
+    try {
+      const bin = join(dir, "anara-leaderboard");
+      await fsp.writeFile(bin, "#!/bin/sh\n");
+      await ensureCliSymlink(bin);
+      expect(await fsp.readlink(join(dir, "tokenleader"))).toBe(bin);
+      // Idempotent on re-run.
+      await ensureCliSymlink(bin);
+      expect(await fsp.readlink(join(dir, "tokenleader"))).toBe(bin);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("never clobbers a real file that owns the name", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-symlink-");
+    try {
+      const bin = join(dir, "anara-leaderboard");
+      await fsp.writeFile(bin, "#!/bin/sh\n");
+      await fsp.writeFile(join(dir, "tokenleader"), "someone else's tool");
+      await ensureCliSymlink(bin);
+      expect(await fsp.readFile(join(dir, "tokenleader"), "utf8")).toBe("someone else's tool");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("no-op when the binary isn't the legacy-named install (bun run)", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-symlink-");
+    try {
+      const bin = join(dir, "bun");
+      await fsp.writeFile(bin, "");
+      await ensureCliSymlink(bin);
+      expect(fsp.lstat(join(dir, "tokenleader"))).rejects.toThrow();
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+interface StubCall {
+  url: string;
+  method: string;
+  secret: string | null;
+  body: unknown;
+}
+
+function makeDeps(opts: {
+  stateDir: string;
+  responses: Array<{ status: number; json: unknown }>;
+  calls: StubCall[];
+  env?: NodeJS.ProcessEnv;
+}): { deps: CliDeps; out: string[]; err: string[] } {
+  const out: string[] = [];
+  const err: string[] = [];
+  let i = 0;
+  const deps: CliDeps = {
+    env: { TOKENLEADER_STATE_DIR: opts.stateDir, ...opts.env },
+    readPlist: async () => PLIST,
+    fetchImpl: (async (input: unknown, init?: RequestInit) => {
+      const req = new Request(input as string, init);
+      opts.calls.push({
+        url: req.url,
+        method: req.method,
+        secret: req.headers.get("X-Tokenleader-Secret"),
+        body: req.method === "POST" ? await req.json() : null,
+      });
+      const r = opts.responses[Math.min(i++, opts.responses.length - 1)]!;
+      return new Response(JSON.stringify(r.json), {
+        status: r.status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch,
+    print: (l) => out.push(l),
+    printErr: (l) => err.push(l),
+  };
+  return { deps, out, err };
+}
+
+async function withSecretDir(fn: (stateDir: string) => Promise<void>): Promise<void> {
+  const { dir, cleanup } = await makeTmpDir("tokenleader-cli-test-");
+  try {
+    await fsp.writeFile(join(dir, "secret"), "cli-test-secret\n");
+    await fn(dir);
+  } finally {
+    await cleanup();
+  }
+}
+
+describe("runCliCommand", () => {
+  test("link: resolves user/endpoint from the plist, prints code + command", async () => {
+    await withSecretDir(async (stateDir) => {
+      const calls: StubCall[] = [];
+      const { deps, out } = makeDeps({
+        stateDir,
+        calls,
+        responses: [
+          {
+            status: 200,
+            json: {
+              user: "krish",
+              code: "ABCD-2345",
+              expiresAt: Date.now() + 600_000,
+              command: "curl ... --link=ABCD-2345",
+            },
+          },
+        ],
+      });
+      expect(await runCliCommand("link", [], deps)).toBe(0);
+      expect(calls[0]!.url).toBe("https://plist.example.com/devices/link");
+      expect(calls[0]!.secret).toBe("cli-test-secret");
+      expect(calls[0]!.body).toEqual({ user: "krish" });
+      expect(out.join("\n")).toContain("ABCD-2345");
+      expect(out.join("\n")).toContain("--link=ABCD-2345");
+    });
+  });
+
+  test("link: the endpoint override file beats the plist endpoint", async () => {
+    await withSecretDir(async (stateDir) => {
+      await fsp.writeFile(join(stateDir, "endpoint"), "https://override.example.com\n");
+      const calls: StubCall[] = [];
+      const { deps } = makeDeps({
+        stateDir,
+        calls,
+        responses: [{ status: 200, json: { code: "X", expiresAt: Date.now(), command: "c" } }],
+      });
+      expect(await runCliCommand("link", [], deps)).toBe(0);
+      expect(calls[0]!.url).toBe("https://override.example.com/devices/link");
+    });
+  });
+
+  test("devices: lists with ids, labels and the current marker", async () => {
+    await withSecretDir(async (stateDir) => {
+      const calls: StubCall[] = [];
+      const { deps, out } = makeDeps({
+        stateDir,
+        calls,
+        responses: [
+          {
+            status: 200,
+            json: {
+              user: "krish",
+              devices: [
+                {
+                  id: 1,
+                  label: "mbp",
+                  version: "v0.2.0",
+                  arch: "arm64",
+                  addedAt: 1,
+                  lastSeen: Date.now(),
+                  current: true,
+                },
+                {
+                  id: 2,
+                  label: null,
+                  version: null,
+                  arch: null,
+                  addedAt: 2,
+                  lastSeen: null,
+                  current: false,
+                },
+              ],
+            },
+          },
+        ],
+      });
+      expect(await runCliCommand("devices", [], deps)).toBe(0);
+      const text = out.join("\n");
+      expect(text).toContain("[1] mbp");
+      expect(text).toContain("(this machine)");
+      expect(text).toContain("[2] device-2");
+    });
+  });
+
+  test("revoke: resolves a label to its id and POSTs the revocation", async () => {
+    await withSecretDir(async (stateDir) => {
+      const calls: StubCall[] = [];
+      const { deps, out } = makeDeps({
+        stateDir,
+        calls,
+        responses: [
+          {
+            status: 200,
+            json: {
+              user: "krish",
+              devices: [
+                {
+                  id: 7,
+                  label: "old-imac",
+                  version: null,
+                  arch: null,
+                  addedAt: 1,
+                  lastSeen: null,
+                  current: false,
+                },
+              ],
+            },
+          },
+          { status: 200, json: { ok: true, deviceId: 7, uninstalled: false } },
+        ],
+      });
+      expect(await runCliCommand("revoke", ["old-imac"], deps)).toBe(0);
+      expect(calls[1]!.url).toContain("/devices/revoke");
+      expect(calls[1]!.body).toEqual({ user: "krish", deviceId: 7 });
+      expect(out.join("\n")).toContain("Revoked");
+    });
+  });
+
+  test("revoke: unknown target is a clean error, no revoke POST", async () => {
+    await withSecretDir(async (stateDir) => {
+      const calls: StubCall[] = [];
+      const { deps, err } = makeDeps({
+        stateDir,
+        calls,
+        responses: [{ status: 200, json: { user: "krish", devices: [] } }],
+      });
+      expect(await runCliCommand("revoke", ["nope"], deps)).toBe(1);
+      expect(calls.length).toBe(1);
+      expect(err.join("\n")).toContain("no active device matches");
+    });
+  });
+
+  test("missing secret file is a clean error pointing at the daemon", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-cli-nosecret-");
+    try {
+      const calls: StubCall[] = [];
+      const { deps, err } = makeDeps({ stateDir: dir, calls, responses: [] });
+      expect(await runCliCommand("link", [], deps)).toBe(1);
+      expect(err.join("\n")).toContain("no device secret");
+      expect(calls.length).toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("server 403 surfaces the server's error text", async () => {
+    await withSecretDir(async (stateDir) => {
+      const calls: StubCall[] = [];
+      const { deps, err } = makeDeps({
+        stateDir,
+        calls,
+        responses: [{ status: 403, json: { error: "secret mismatch for user 'krish'" } }],
+      });
+      expect(await runCliCommand("link", [], deps)).toBe(1);
+      expect(err.join("\n")).toContain("secret mismatch");
+    });
+  });
+});

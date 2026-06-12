@@ -55,32 +55,70 @@ only the four locations above.
 On first run the daemon generates a random secret at `<stateDir>/secret` and
 sends it as `X-Tokenleader-Secret` on every POST. The server stores a hash on
 the **first claim** of a username (trust-on-first-use) and from then on only
-accepts that secret for that name.
+accepts that machine's secret for that name — or another machine explicitly
+linked to it (next section). Nobody posts as you without compromising one of
+your machines or a pairing code you minted.
 
 - **`403 join_required`** — the server gates new names with a join token;
   re-run the installer with `--join=<code>`.
 - **`403 secret mismatch for user '<name>'`** — the name is claimed under a
-  different secret than yours. See below.
+  different secret than yours. Link the machine (below) or see
+  [fixing a 403](#fixing-a-403-secret-mismatch).
+
+## One handle, multiple machines
+
+Each machine keeps its own secret; the server keeps one **device** row per
+machine. To add a second machine to your handle:
+
+```bash
+# on a machine that already posts as you:
+tokenleader link
+# → Link code for 'alice': ABCD-2345   (valid 10 minutes, single use)
+
+# on the new machine, paste the command `link` printed:
+curl -fsSL https://leaderboard.example.com/install | bash -s -- --name=alice --link=ABCD-2345
+```
+
+The new machine's first sync redeems the code and registers its own secret as
+an additional device; from then on both machines post and their counts merge
+under your name (dedup is per message id, so nothing double-counts). Codes
+can only be minted from a machine that already holds your secret, expire
+after 10 minutes, and die on first use — treat one like a password while
+it's live.
+
+Manage your machines from any of them:
+
+```bash
+tokenleader devices       # list, with ids + labels
+tokenleader revoke <id>   # lock a machine out (lost/stolen/retired)
+```
+
+Uninstalling one machine only removes that device; your handle stays active
+while any machine remains. If your **only** machine is gone, an admin can
+mint a code for you (see below) — no history is lost.
 
 ### Fixing a 403 secret mismatch
 
 Typical cause: a deleted state dir (new laptop, manual cleanup) — fresh
-secret, but the server holds the old hash. Two ways out:
+secret, but the server holds the old hash. Three ways out:
 
-1. **If the previous install was uninstalled properly** (`/uninstall` ran),
+1. **If another linked machine still works**, mint a code there
+   (`tokenleader link`) and reinstall here with `--link=<code>`.
+2. **If the previous install was uninstalled properly** (`/uninstall` ran),
    the name is re-claimable — just reinstall.
-2. **Otherwise, an admin resets the name** (requires
+3. **Otherwise, an admin mints a link code** (requires
    `TOKENLEADER_ADMIN_TOKEN` on the server):
 
    ```bash
-   curl -X POST https://leaderboard.example.com/admin/clear \
+   curl -X POST https://leaderboard.example.com/admin/link \
      -H "Authorization: Bearer $TOKENLEADER_ADMIN_TOKEN" \
      -H "Content-Type: application/json" \
-     -d '{"scope":"reset-user","user":"alice"}'
+     -d '{"user":"alice"}'
    ```
 
-   This clears the stored secret (and that user's events + fleet status);
-   then reinstall on the teammate's machine to re-claim the name.
+   then reinstall with `--link=<code>`. The history-destroying fallback
+   (`/admin/clear` with `{"scope":"reset-user"}`) still exists, but the link
+   code keeps the user's events intact.
 
 ## Uninstall
 

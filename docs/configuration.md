@@ -101,6 +101,7 @@ Out-of-range numerics clamp; truthy flags accept `1`, `true`, `yes`, `on`.
 | `TOKENLEADER_ENDPOINT` | **required** | Base URL of your server. Note: a persisted `<stateDir>/endpoint` override file, if present, wins over this env (see [Fleet migration](#fleet-migration)). |
 | `TOKENLEADER_JOIN` | unset | Join code, sent as `X-Tokenleader-Join` on every ingest POST. The server only consults it on first claim of a handle. |
 | `TOKENLEADER_COMPANY` | unset | Company affiliation as a domain or URL (installer `--company` flag), sent as `X-Tokenleader-Company` on ingest POSTs. The server normalizes to a lowercase bare hostname (`https://www.Anara.com/x` → `anara.com`, ≤ 64 chars) and stores it per user (last write wins; absent never clears; invalid values are ignored with a warn). |
+| `TOKENLEADER_LINK` | unset | One-time pairing code (installer `--link` flag), sent as `X-Tokenleader-Link` on every ingest POST. The server only consults it when this machine's secret doesn't match an existing device; single-use, so the header is inert after redemption. See [one handle, multiple machines](daemon.md#one-handle-multiple-machines). |
 | `TOKENLEADER_INTERVAL_SEC` | `300` (5 min) | Tick cadence — how often local logs are scanned and new events posted. Clamped to `[5, 86400]`. |
 | `TOKENLEADER_BATCH_SIZE` | `1000` | Max events per ingest POST. Clamped to `[1, 10000]`. |
 | `TOKENLEADER_STATE_DIR` | `~/.local/share/tokenleader` | Holds `secret` (TOFU identity), `state.json` (per-file read offsets), and the optional `endpoint` override. |
@@ -122,6 +123,8 @@ Your server renders these scripts at `GET /install` and `GET /uninstall`.
 |---|---|---|
 | `--name=HANDLE` | `TOKENLEADER_USER` | Leaderboard handle (flag wins over env; defaults to `$USER`). |
 | `--join=CODE` | `TOKENLEADER_JOIN` | Join code, for servers that set `TOKENLEADER_JOIN_TOKEN`. |
+| `--company=DOMAIN` | `TOKENLEADER_COMPANY` | Company affiliation shown on the leaderboard. |
+| `--link=CODE` | `TOKENLEADER_LINK` | Pairing code that adds this machine to a handle you already own (mint with `tokenleader link` on the old machine). |
 
 **Script env overrides:**
 

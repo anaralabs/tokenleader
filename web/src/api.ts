@@ -78,6 +78,15 @@ export interface AdminStats {
   companies?: string[];
 }
 
+export interface FleetDevice {
+  label: string | null;
+  version: string | null;
+  arch: string | null;
+  lastSeen: number | null;
+  /** Same tri-state contract as FleetEntry.isLatest. */
+  isLatest: boolean | null;
+}
+
 export interface FleetEntry {
   user: string;
   version: string | null;
@@ -86,6 +95,8 @@ export interface FleetEntry {
   reporting: boolean;
   /** true = on latest, false = stale, null = no published manifest to compare. */
   isLatest: boolean | null;
+  /** One row per active machine. Optional so older server payloads render. */
+  devices?: FleetDevice[];
 }
 
 export interface FleetStats {

@@ -580,6 +580,12 @@ button.link {
   font-weight: 400;
   color: var(--text-secondary);
 }
+.fleet-devcount {
+  margin-left: 6px;
+  font-size: 11px;
+  color: var(--text-tertiary);
+  cursor: default;
+}
 .fleet-badge {
   display: inline-block;
   padding: 1px 8px;
