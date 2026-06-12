@@ -138,6 +138,13 @@ export async function tick(
           accepted.push(ev);
         }
         for (const ev of accepted) collected.push(ev);
+        if (r.oversizeSkipped) {
+          log.warn("oversize_record_skipped", {
+            path: item.path,
+            kind: item.kind,
+            count: r.oversizeSkipped,
+          });
+        }
         pendingUpdates.push({
           path: item.path,
           mtimeMs: st.mtimeMs,
@@ -157,6 +164,13 @@ export async function tick(
           if (seenThisTick.has(k)) continue;
           seenThisTick.add(k);
           collected.push(ev);
+        }
+        if (r.oversizeSkipped) {
+          log.warn("oversize_record_skipped", {
+            path: item.path,
+            kind: item.kind,
+            count: r.oversizeSkipped,
+          });
         }
         pendingUpdates.push({
           path: item.path,

@@ -28,6 +28,9 @@ export interface ParseCodexResult {
   events: TokenEvent[];
   newOffset: number;
   sessionTotals: SessionTotals;
+  /** Count of records dropped because they exceeded the read window (data
+   *  loss — surfaced so the daemon can warn). Absent/0 in the common case. */
+  oversizeSkipped?: number;
 }
 
 interface CodexUsage {
@@ -136,12 +139,18 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
   // Track how many events share an identical timestamp so messageIds stay unique.
   let lastTs = "";
   let ixForTs = 0;
+  let oversizeSkipped = 0;
 
   // Read line-by-line in capped windows so an oversized file never lands as
   // one string and we never build a giant per-chunk line array.
-  for await (const { line, newOffset: off } of readNewlineLines(file, byteOffset)) {
-    newOffset = off;
-    if (line === null) continue;
+  for await (const part of readNewlineLines(file, byteOffset)) {
+    newOffset = part.newOffset;
+    if (part.kind === "oversize") {
+      oversizeSkipped++;
+      continue;
+    }
+    if (part.kind !== "line") continue;
+    const line = part.text;
 
     let raw: CodexLine;
     try {
@@ -263,5 +272,5 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     });
   }
 
-  return { events, newOffset, sessionTotals: totals };
+  return { events, newOffset, sessionTotals: totals, oversizeSkipped };
 }

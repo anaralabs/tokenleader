@@ -11,21 +11,23 @@ async function tempFile(contents: string): Promise<string> {
   return path;
 }
 
-/** Drain the generator, returning the emitted lines and the final offset. */
+/** Drain the generator, collecting lines, oversize-drop count, final offset. */
 async function drain(
   path: string,
   byteOffset: number,
   maxBytes?: number,
-): Promise<{ lines: string[]; newOffset: number; reads: number }> {
+): Promise<{ lines: string[]; oversize: number; newOffset: number; reads: number }> {
   const lines: string[] = [];
+  let oversize = 0;
   let newOffset = byteOffset;
   let reads = 0;
   for await (const r of readNewlineLines(Bun.file(path), byteOffset, maxBytes)) {
     reads++;
-    if (r.line !== null) lines.push(r.line);
     newOffset = r.newOffset;
+    if (r.kind === "line") lines.push(r.text);
+    else if (r.kind === "oversize") oversize++;
   }
-  return { lines, newOffset, reads };
+  return { lines, oversize, newOffset, reads };
 }
 
 describe("readNewlineLines", () => {
@@ -80,12 +82,13 @@ describe("readNewlineLines", () => {
 
   // --- oversized single line (longer than the window) ----------------------
 
-  it("discards an oversized line entirely and keeps the following line", async () => {
+  it("discards an oversized line entirely, reports it, and keeps the next line", async () => {
     const huge = "x".repeat(100);
     const body = `${huge}\nafter\n`;
     const path = await tempFile(body);
     const r = await drain(path, 0, 8); // window far smaller than the huge line
     expect(r.lines).toEqual(["after"]); // the huge line is dropped, not yielded
+    expect(r.oversize).toBe(1); // the drop is reported, not silent
     expect(r.newOffset).toBe(Buffer.byteLength(body, "utf8")); // reached EOF
   });
 
@@ -99,16 +102,18 @@ describe("readNewlineLines", () => {
     const r = await drain(path, 0, 16);
     expect(r.lines).toEqual(['{"type":"next"}']);
     expect(r.lines.some((l) => l.includes('"real"'))).toBe(false);
+    expect(r.oversize).toBe(1);
   });
 
   it("never stalls: an unterminated oversized tail leaves the offset put", async () => {
     // One giant line with no terminator at all (a file still being written).
-    // We must not consume a partial record, and must not loop forever.
+    // We must not consume a partial record, report a drop, or loop forever.
     const body = "y".repeat(1000); // no newline
     const path = await tempFile(body);
     const r = await drain(path, 0, 8);
     expect(r.lines).toEqual([]);
-    expect(r.newOffset).toBe(0); // nothing consumed; wait for the terminator
+    expect(r.oversize).toBe(0); // not a completed drop — wait for the terminator
+    expect(r.newOffset).toBe(0); // nothing consumed
   });
 
   // --- UTF-8 correctness ---------------------------------------------------

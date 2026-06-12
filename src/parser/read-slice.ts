@@ -31,28 +31,32 @@ const decoder = new TextDecoder();
  */
 export const MAX_READ_BYTES = 64 * 1024 * 1024;
 
-export interface LineRead {
-  /**
-   * One decoded JSONL line without its trailing newline, or `null` for an
-   * offset-only advance (a skipped oversized line or blank bytes). Callers
-   * ignore `null` lines but must still adopt `newOffset`.
-   */
-  line: string | null;
-  /** Byte offset consumed through — always at a line boundary. */
-  newOffset: number;
-}
+/**
+ * One unit of progress from `readNewlineLines`. A discriminated union so an
+ * oversized-record drop is an explicit, visible state — never silently folded
+ * into a plain offset advance. Callers always adopt `newOffset`.
+ *
+ *  - `line`:     a decoded JSONL line (no trailing newline) to parse.
+ *  - `advance`:  bytes consumed (blank lines / window boundary), nothing to do.
+ *  - `oversize`: a record longer than `maxBytes` was dropped (its `bytes` were
+ *                skipped). The caller should surface this — it is data loss.
+ */
+export type LineRead =
+  | { kind: "line"; text: string; newOffset: number }
+  | { kind: "advance"; newOffset: number }
+  | { kind: "oversize"; bytes: number; newOffset: number };
 
 /**
  * Yield the lines of `file` starting at `byteOffset`, reading at most
  * `maxBytes` of raw bytes per window. The caller advances its saved offset to
- * the latest `newOffset` (including for `null` reads, so progress is never
- * lost).
+ * the latest `newOffset` (including for `advance`/`oversize` reads, so progress
+ * is never lost).
  *
  * A trailing line with no terminator (a file still being written) is left
- * unconsumed for the next read. A single line longer than `maxBytes` can't be
+ * unconsumed for the next read. A single record longer than `maxBytes` can't be
  * held as one string, so it is discarded through its terminating newline — its
- * bytes are skipped a window at a time (guaranteeing forward progress) and its
- * eventual suffix is *not* emitted as a record.
+ * bytes are skipped a window at a time (guaranteeing forward progress), its
+ * suffix is *not* emitted as a record, and an `oversize` read reports the drop.
  */
 export async function* readNewlineLines(
   file: ReturnType<typeof Bun.file>,
@@ -65,9 +69,8 @@ export async function* readNewlineLines(
 
   const totalSize = file.size;
   let offset = byteOffset;
-  // True while skipping the remainder of a line that overflowed the window —
-  // its suffix must not be emitted as a standalone record.
-  let discarding = false;
+  // Byte offset where an over-window record began, or -1 when not discarding.
+  let discardStart = -1;
 
   while (offset < totalSize) {
     const end = Math.min(totalSize, offset + maxBytes);
@@ -77,12 +80,12 @@ export async function* readNewlineLines(
     if (lastNewline === -1) {
       // No line boundary in this window. At EOF it's an unterminated tail —
       // leave it (and do not commit an offset inside it) so the whole record
-      // is re-read once it's complete. Otherwise a single line is longer than
+      // is re-read once it's complete. Otherwise a single record is longer than
       // the window: skip its bytes without committing and stay in discard mode
       // so its continuation isn't mistaken for a new line. The offset only
-      // moves forward once that line's terminating newline is found below.
+      // moves forward once that record's terminating newline is found below.
       if (end >= totalSize) return;
-      discarding = true;
+      if (discardStart === -1) discardStart = offset;
       offset = end;
       continue;
     }
@@ -90,13 +93,16 @@ export async function* readNewlineLines(
     let start = 0;
     let nl = bytes.indexOf(NEWLINE);
     while (nl !== -1) {
-      if (discarding) {
-        // This newline closes the oversized line we were discarding.
-        discarding = false;
+      const lineEnd = offset + nl + 1;
+      if (discardStart !== -1) {
+        // This newline closes the oversized record we were discarding. Report
+        // the drop so the caller can surface the lost usage.
+        yield { kind: "oversize", bytes: lineEnd - discardStart, newOffset: lineEnd };
+        discardStart = -1;
       } else if (nl > start) {
         // Decode exactly one line's bytes — a clean range between newlines, so
         // it is always whole UTF-8.
-        yield { line: decoder.decode(bytes.subarray(start, nl)), newOffset: offset + nl + 1 };
+        yield { kind: "line", text: decoder.decode(bytes.subarray(start, nl)), newOffset: lineEnd };
       }
       start = nl + 1;
       if (start > lastNewline) break;
@@ -106,6 +112,6 @@ export async function* readNewlineLines(
     // Advance past the last complete line; any partial tail is re-read next
     // window. The marker syncs the offset even if the final lines were blank.
     offset += lastNewline + 1;
-    yield { line: null, newOffset: offset };
+    yield { kind: "advance", newOffset: offset };
   }
 }

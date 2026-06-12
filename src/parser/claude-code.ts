@@ -11,6 +11,9 @@ export interface ParseClaudeCodeResult {
   events: TokenEvent[];
   newOffset: number;
   seenDedupKeys: string[];
+  /** Count of records dropped because they exceeded the read window (data
+   *  loss — surfaced so the daemon can warn). Absent/0 in the common case. */
+  oversizeSkipped?: number;
 }
 
 interface RawCCRecord {
@@ -72,12 +75,18 @@ export async function parseClaudeCodeFile(
   // Advance only past fully-terminated lines; a partial trailing line keeps
   // the offset put so the next read re-consumes it once it's complete.
   let newOffset = byteOffset;
+  let oversizeSkipped = 0;
 
   // Read line-by-line in capped windows so an oversized file never lands as
   // one string and we never build a giant per-chunk line array.
-  for await (const { line, newOffset: off } of readNewlineLines(file, byteOffset)) {
-    newOffset = off;
-    if (line === null) continue;
+  for await (const part of readNewlineLines(file, byteOffset)) {
+    newOffset = part.newOffset;
+    if (part.kind === "oversize") {
+      oversizeSkipped++;
+      continue;
+    }
+    if (part.kind !== "line") continue;
+    const line = part.text;
 
     let raw: RawCCRecord;
     try {
@@ -169,5 +178,5 @@ export async function parseClaudeCodeFile(
     seenDedupKeys.push(dedupKey);
   }
 
-  return { events, newOffset, seenDedupKeys };
+  return { events, newOffset, seenDedupKeys, oversizeSkipped };
 }
