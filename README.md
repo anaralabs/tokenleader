@@ -62,7 +62,7 @@ repo's releases, so your teammates' machines never call GitHub.
 
 ### 1. Deploy the server
 
-[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/PLACEHOLDER-TEMPLATE-ID)
+[![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/T3RB43?referralCode=aRX70I&utm_medium=integration&utm_source=template&utm_campaign=generic)
 
 One click, ~$5/mo, volume included. The template generates a **private dashboard token**
 for you — when the dashboard asks for it, find it under your Railway service's
