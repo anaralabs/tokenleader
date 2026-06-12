@@ -6,6 +6,7 @@
 import { readFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import path from "node:path";
+import { normalizeCompany } from "./company";
 
 export class ConfigError extends Error {}
 
@@ -37,6 +38,10 @@ export interface ServerConfig {
   /** Lowercased email → handle map. Missing/empty with cursorToken set →
    *  the cursor mirror stays off (warned, non-fatal). */
   cursorUserMap?: Readonly<Record<string, string>>;
+  /** Normalized domain → domain rewrites applied to X-Tokenleader-Company
+   *  at ingest. Operator lever for typo'd self-reported affiliations
+   *  ("sync.labs" → "sync.so") without touching teammate machines. */
+  companyAliases?: Readonly<Record<string, string>>;
 }
 
 export interface ConfigLogger {
@@ -184,6 +189,8 @@ export function parseServerConfig(
     );
   }
 
+  const companyAliases = parseCompanyAliases(env, log);
+
   const teamName = nonEmpty(env.TOKENLEADER_TEAM_NAME);
   const adminToken = nonEmpty(env.TOKENLEADER_ADMIN_TOKEN);
   const dashboardToken = nonEmpty(env.TOKENLEADER_DASHBOARD_TOKEN);
@@ -211,7 +218,43 @@ export function parseServerConfig(
   if (ghToken !== undefined) cfg.ghToken = ghToken;
   if (cursorToken !== undefined) cfg.cursorToken = cursorToken;
   if (cursorUserMap !== undefined) cfg.cursorUserMap = cursorUserMap;
+  if (companyAliases !== undefined) cfg.companyAliases = companyAliases;
   return cfg;
+}
+
+/** TOKENLEADER_COMPANY_ALIASES: inline JSON object of domain → domain
+ *  rewrites. Both sides run through normalizeCompany; entries that don't
+ *  normalize are dropped with a warn. Empty/absent → undefined. */
+export function parseCompanyAliases(
+  env: NodeJS.ProcessEnv,
+  log: ConfigLogger,
+): Readonly<Record<string, string>> | undefined {
+  const raw = nonEmpty(env.TOKENLEADER_COMPANY_ALIASES);
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new ConfigError(
+      `TOKENLEADER_COMPANY_ALIASES is not valid JSON: ${String((err as Error)?.message ?? err)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ConfigError('TOKENLEADER_COMPANY_ALIASES must be a JSON object of "from": "to"');
+  }
+  const out: Record<string, string> = {};
+  for (const [from, to] of Object.entries(parsed)) {
+    const f = normalizeCompany(from);
+    const t = typeof to === "string" ? normalizeCompany(to) : null;
+    if (f === null || t === null) {
+      log.warn(
+        `[tokenleader] company alias ${JSON.stringify(from)} -> ${JSON.stringify(to)} dropped (not domain-shaped)`,
+      );
+      continue;
+    }
+    out[f] = t;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /** One boot echo per resolved knob — the operator's "what am I running". */

@@ -2518,3 +2518,35 @@ describe("stats-cache invalidation coalescing", () => {
     }
   });
 });
+
+describe("company aliases (TOKENLEADER_COMPANY_ALIASES)", () => {
+  test("ingest header is rewritten through the alias map; others pass through", async () => {
+    const t = createTestApp({ companyAliases: { "sync.labs": "sync.so" } });
+    try {
+      const post = (user: string, secret: string, company: string) =>
+        t.app.request(
+          new Request("http://x/ingest", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-tokenleader-user": user,
+              "x-tokenleader-secret": secret,
+              "x-tokenleader-company": company,
+            },
+            body: JSON.stringify({ events: [makeTokenEvent({ user, messageId: `m-${user}` })] }),
+          }),
+        );
+      expect((await post("seb", "s".repeat(40), "Sync.Labs")).status).toBe(200);
+      expect((await post("viv", "v".repeat(40), "listener.com")).status).toBe(200);
+      const rows = (
+        await jsonOf<{ leaderboard: { user: string; company: string | null }[] }>(
+          await t.app.request(new Request("http://x/stats/admin")),
+        )
+      ).leaderboard;
+      expect(rows.find((r) => r.user === "seb")?.company).toBe("sync.so");
+      expect(rows.find((r) => r.user === "viv")?.company).toBe("listener.com");
+    } finally {
+      await t.cleanup();
+    }
+  });
+});

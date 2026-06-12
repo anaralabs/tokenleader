@@ -3,7 +3,13 @@ import { readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { makeTmpDirSync } from "../test-helpers.ts";
-import { ConfigError, parseCursorUserMap, parseServerConfig, resolveDataDir } from "./config.ts";
+import {
+  ConfigError,
+  parseCompanyAliases,
+  parseCursorUserMap,
+  parseServerConfig,
+  resolveDataDir,
+} from "./config.ts";
 
 let tmpDir: string;
 let rmTmpDir: () => void;
@@ -236,5 +242,38 @@ describe(".env.example parity", () => {
     // making both sides empty-and-equal).
     expect(readVars.has("TOKENLEADER_DATA_DIR")).toBe(true);
     expect(readVars.has("TOKENLEADER_CURSOR_USER_MAP_FILE")).toBe(true);
+  });
+});
+
+describe("parseCompanyAliases (TOKENLEADER_COMPANY_ALIASES)", () => {
+  const warnings: string[] = [];
+  const log = { warn: (m: string) => warnings.push(m) };
+
+  test("normalizes both sides and applies domain shape", () => {
+    const out = parseCompanyAliases(
+      { TOKENLEADER_COMPANY_ALIASES: '{"Sync.Labs":"https://www.sync.so/x","ok.com":"ok.com"}' },
+      log,
+    );
+    expect(out).toEqual({ "sync.labs": "sync.so", "ok.com": "ok.com" });
+  });
+
+  test("drops non-domain entries with a warn, empty result is undefined", () => {
+    warnings.length = 0;
+    const out = parseCompanyAliases(
+      { TOKENLEADER_COMPANY_ALIASES: '{"notadomain":"also bad"}' },
+      log,
+    );
+    expect(out).toBeUndefined();
+    expect(warnings.length).toBe(1);
+  });
+
+  test("absent → undefined; malformed JSON is fatal", () => {
+    expect(parseCompanyAliases({}, log)).toBeUndefined();
+    expect(() => parseCompanyAliases({ TOKENLEADER_COMPANY_ALIASES: "{nope" }, log)).toThrow(
+      ConfigError,
+    );
+    expect(() => parseCompanyAliases({ TOKENLEADER_COMPANY_ALIASES: "[1]" }, log)).toThrow(
+      ConfigError,
+    );
   });
 });

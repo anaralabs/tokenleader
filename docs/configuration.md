@@ -78,6 +78,7 @@ own reported cost, which wins over derived pricing.
 | `TOKENLEADER_CURSOR_INTERVAL_SEC` | `900` (15 min) | Cursor polling cadence. Clamped to `[60, 86400]`. |
 | `TOKENLEADER_CURSOR_USER_MAP` | unset | Inline JSON object mapping Cursor account emails to leaderboard handles, e.g. `{"alice@example.com":"alice","bob@example.com":"bob"}`. Keys are lowercased; handles must be non-empty, ≤64 chars; characters outside `[A-Za-z0-9._-]` only warn. |
 | `TOKENLEADER_CURSOR_USER_MAP_FILE` | unset | Path to a file containing the same JSON. When set, the file **wins entirely** over the inline value (no merge). An unreadable file is a fatal config error. |
+| `TOKENLEADER_COMPANY_ALIASES` | unset | Inline JSON of `"from-domain": "to-domain"` rewrites applied to the `X-Tokenleader-Company` header at ingest — fixes a typo'd self-reported affiliation without touching the teammate's machine. Both sides are normalized; non-domain entries are dropped with a warning. |
 
 ### Per-platform cheat sheet
 

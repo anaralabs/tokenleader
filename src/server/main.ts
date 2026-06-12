@@ -143,6 +143,9 @@ export interface BuildOptions {
    *  (TOKENLEADER_CURSOR_USER_MAP(_FILE)). The mirror only starts when
    *  this is non-empty AND cursorToken is set. */
   cursorUserMap?: Readonly<Record<string, string>>;
+  /** Normalized domain → domain rewrites applied to X-Tokenleader-Company
+   *  at ingest (operator typo-fix lever; TOKENLEADER_COMPANY_ALIASES). */
+  companyAliases?: Readonly<Record<string, string>>;
   /** Test-only clock for `range=<N>d` resolution (pins the minute so
    *  rolling-window cache keys are deterministic). */
   now?: () => number;
@@ -1189,7 +1192,9 @@ export function buildApp(opts: BuildOptions) {
       if (rawCompany.length > 0) {
         const company = normalizeCompany(rawCompany);
         if (company !== null) {
-          store.setUserCompany(firstUser, company);
+          // Operator alias map wins over the self-reported value — fixes a
+          // typo'd install without touching the teammate's machine.
+          store.setUserCompany(firstUser, opts.companyAliases?.[company] ?? company);
         } else {
           console.warn(
             `[tokenleader] ignoring invalid X-Tokenleader-Company ${JSON.stringify(rawCompany)} from user '${firstUser}'`,
@@ -1486,6 +1491,7 @@ if (import.meta.main) {
   if (cfg.ghToken !== undefined) buildOpts.ghToken = cfg.ghToken;
   if (cfg.cursorToken !== undefined) buildOpts.cursorToken = cfg.cursorToken;
   if (cfg.cursorUserMap !== undefined) buildOpts.cursorUserMap = cfg.cursorUserMap;
+  if (cfg.companyAliases !== undefined) buildOpts.companyAliases = cfg.companyAliases;
   const rt = buildApp(buildOpts);
   echoConfig(cfg);
   console.log(
