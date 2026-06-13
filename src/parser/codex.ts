@@ -1,5 +1,6 @@
 import { basename } from "node:path";
 import type { TokenEvent } from "../types.ts";
+import { readNewlineLines } from "./read-slice.ts";
 
 /**
  * Cumulative running totals for one Codex session, kept across reads so we
@@ -27,6 +28,9 @@ export interface ParseCodexResult {
   events: TokenEvent[];
   newOffset: number;
   sessionTotals: SessionTotals;
+  /** Count of records dropped because they exceeded the read window (data
+   *  loss — surfaced so the daemon can warn). Absent/0 in the common case. */
+  oversizeSkipped?: number;
 }
 
 interface CodexUsage {
@@ -126,27 +130,28 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     return { events: [], newOffset: totalSize, sessionTotals: totals };
   }
 
-  const slice = file.slice(byteOffset);
-  const text = await slice.text();
-  const lastNewline = text.lastIndexOf("\n");
-  const consumeUpTo = lastNewline === -1 ? 0 : lastNewline + 1;
-  const consumable = text.slice(0, consumeUpTo);
-  const consumedBytes = Buffer.byteLength(consumable, "utf8");
-  const newOffset = byteOffset + consumedBytes;
-
   const events: TokenEvent[] = [];
-  if (consumable.length === 0) {
-    return { events, newOffset, sessionTotals: totals };
-  }
+  // Advance only past fully-terminated lines; a partial trailing line keeps
+  // the offset put so the next read re-consumes it once it's complete.
+  let newOffset = byteOffset;
 
   let currentModel: string | null = null;
   // Track how many events share an identical timestamp so messageIds stay unique.
   let lastTs = "";
   let ixForTs = 0;
+  let oversizeSkipped = 0;
 
-  const lines = consumable.split("\n");
-  for (const line of lines) {
-    if (line.length === 0) continue;
+  // Read line-by-line in capped windows so an oversized file never lands as
+  // one string and we never build a giant per-chunk line array.
+  for await (const part of readNewlineLines(file, byteOffset)) {
+    newOffset = part.newOffset;
+    if (part.kind === "oversize") {
+      oversizeSkipped++;
+      continue;
+    }
+    if (part.kind !== "line") continue;
+    const line = part.text;
+
     let raw: CodexLine;
     try {
       raw = JSON.parse(line) as CodexLine;
@@ -267,5 +272,5 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     });
   }
 
-  return { events, newOffset, sessionTotals: totals };
+  return { events, newOffset, sessionTotals: totals, oversizeSkipped };
 }
