@@ -53,7 +53,12 @@ export async function extractCursorSessionToken(
   const auth = readCursorIdeAuth(dbPath, { skipCopy: opts.skipCopy });
   // The auth DB carries the same serviceMachineId Cursor signs requests with;
   // fall back to telemetry.machineId in storage.json only when the DB lacks it.
-  const machineId = auth.serviceMachineId ?? readCursorMachineId(opts.storageJsonPath);
+  // Empty/whitespace counts as missing — `??` alone would let "" through.
+  const dbMachineId = auth.serviceMachineId?.trim();
+  const machineId =
+    dbMachineId && dbMachineId.length > 0
+      ? dbMachineId
+      : readCursorMachineId(opts.storageJsonPath);
 
   let accessToken = auth.accessToken;
   const fetchImpl = opts.fetchImpl;

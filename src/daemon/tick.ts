@@ -104,13 +104,15 @@ export async function tick(
       err: String((err as Error)?.message ?? err),
     });
   }
-  const useCloudCursor = cursorToken !== null;
-  const cursorLocalEnabled = cursorEnabled;
+  const hasCursorToken = cursorToken !== null;
 
+  // List cursor_transcript paths whenever local Cursor is env-enabled, even when
+  // we end up using cloud — keeping them in presentSet preserves byte offsets
+  // so a cloud→local fallback doesn't re-ingest history from byte 0.
   const [ccPaths, cxPaths, curTxPaths] = await Promise.all([
     safeList(listCC, "claude_code"),
     safeList(listCx, "codex"),
-    cursorLocalEnabled ? safeList(listCurTx, "cursor_transcript") : Promise.resolve([]),
+    cursorEnabled ? safeList(listCurTx, "cursor_transcript") : Promise.resolve([]),
   ]);
 
   const allPaths = [
@@ -128,9 +130,49 @@ export async function tick(
   // Pending file updates we will write only after a successful POST.
   const pendingUpdates: FileState[] = [];
   let pendingCursorLocal: DaemonState["cursorLocal"] | undefined;
+  let pendingCursorCloud:
+    | { mode: "incremental"; events: TokenEvent[] }
+    | undefined;
+
+  // Run cloud Cursor fetch up front: its outcome decides whether to parse
+  // local Cursor sources this tick (avoids double-counting the same usage
+  // via cloud + local, but falls back to local when the cloud path fails).
+  let cloudReady = false;
+  if (hasCursorToken) {
+    try {
+      const cloud = await fetchCloud({
+        user: deps.user,
+        stateDir: deps.stateDir,
+        state: initial,
+        mode: "incremental",
+        signal: deps.signal,
+        now,
+      });
+      if (!cloud.skipped) {
+        cloudReady = true;
+        pendingCursorCloud = { mode: "incremental", events: cloud.events };
+        for (const ev of cloud.events) {
+          const k = dedupKey(ev);
+          if (seenThisTick.has(k)) continue;
+          seenThisTick.add(k);
+          collected.push(ev);
+        }
+      }
+    } catch (err: unknown) {
+      log.error("cursor_cloud_fetch_failed", {
+        err: String((err as Error)?.message ?? err),
+      });
+    }
+  }
+  const cursorLocalEnabled = cursorEnabled && !cloudReady;
 
   for (const item of allPaths) {
     if (deps.signal?.aborted) break;
+
+    // Cloud Cursor already covered this user's transcript usage this tick;
+    // skip parsing to avoid double-counting. The path is still in presentSet
+    // so its FileState (byte offset) survives for cloud→local fallback.
+    if (item.kind === "cursor_transcript" && !cursorLocalEnabled) continue;
 
     const prev = initial.files[item.path];
     if (!prev) newFiles++;
@@ -289,42 +331,12 @@ export async function tick(
     }
   }
 
-  let pendingCursorCloud:
-    | { mode: "incremental"; events: TokenEvent[] }
-    | undefined;
-
-  if (useCloudCursor) {
-    try {
-      const cloud = await fetchCloud({
-        user: deps.user,
-        stateDir: deps.stateDir,
-        state: initial,
-        mode: "incremental",
-        signal: deps.signal,
-        now,
-      });
-      if (!cloud.skipped) {
-        pendingCursorCloud = { mode: "incremental", events: cloud.events };
-        for (const ev of cloud.events) {
-          const k = dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          collected.push(ev);
-        }
-      }
-    } catch (err: unknown) {
-      log.error("cursor_cloud_fetch_failed", {
-        err: String((err as Error)?.message ?? err),
-      });
-    }
-  }
-
   log.info("tick_collected", {
     scanned: allPaths.length,
     eligible,
     events: collected.length,
     newFiles,
-    cursorCloud: useCloudCursor,
+    cursorCloud: cloudReady,
   });
 
   // POST events — only persist state on success.

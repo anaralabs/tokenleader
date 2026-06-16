@@ -702,6 +702,100 @@ describe("tick", () => {
     expect(out.state.cursorLocal).toEqual({ dbPath, lastRowid: 42 });
   });
 
+  test("cursor cloud success suppresses local Cursor parsing this tick", async () => {
+    const dir = await makeTmpDir();
+    const cloudEv = makeEvent({ messageId: "cloud1", source: "cursor", model: "cursor" });
+    let transcriptParseCalls = 0;
+    let localCursorParseCalls = 0;
+    const out = await tick(
+      emptyState(),
+      mkTickDeps(dir, {
+        listClaudeCodeFiles: async () => [],
+        listCodexFiles: async () => [],
+        listCursorTranscriptFiles: async () => ["/tx.jsonl"],
+        isCursorLocalEnabled: () => true,
+        loadCursorToken: async () => "cursor-session",
+        statFile: async () => ({ mtimeMs: 1 }),
+        fetchCursorCloudEvents: async () => ({
+          skipped: false,
+          startDate: 0,
+          mode: "incremental",
+          events: [cloudEv],
+          totalCount: 1,
+          pagesFetched: 1,
+        }),
+        parseCursorTranscriptFile: async (input) => {
+          transcriptParseCalls++;
+          return {
+            events: [makeEvent({ messageId: "tx1", source: "cursor_local" })],
+            newOffset: input.byteOffset + 50,
+            seenDedupKeys: ["tx1:"],
+            nextLineIndex: (input.startingLineIndex ?? 0) + 1,
+          };
+        },
+        parseCursorLocal: (input) => {
+          localCursorParseCalls++;
+          return {
+            events: [makeEvent({ messageId: "loc1", source: "cursor_local" })],
+            newRowid: input.lastRowid + 1,
+            seenDedupKeys: ["loc1:"],
+          };
+        },
+        postEvents: async (evs) => ({
+          ok: true,
+          inserted: evs.length,
+          duplicates: 0,
+        }),
+      }),
+    );
+    expect(transcriptParseCalls).toBe(0);
+    expect(localCursorParseCalls).toBe(0);
+    expect(out.result.eventsPosted).toBe(1);
+    expect(out.state.cursorCloud?.fullSyncDone).toBeUndefined();
+    expect(out.state.cursorCloud?.lastSyncAt).toBe(42);
+  });
+
+  test("cursor cloud skipped falls back to local Cursor parsing", async () => {
+    const dir = await makeTmpDir();
+    let transcriptParseCalls = 0;
+    const out = await tick(
+      emptyState(),
+      mkTickDeps(dir, {
+        listClaudeCodeFiles: async () => [],
+        listCodexFiles: async () => [],
+        listCursorTranscriptFiles: async () => ["/tx.jsonl"],
+        isCursorLocalEnabled: () => true,
+        loadCursorToken: async () => "cursor-session",
+        statFile: async () => ({ mtimeMs: 1 }),
+        fetchCursorCloudEvents: async () => ({
+          skipped: true,
+          startDate: 0,
+          mode: "incremental",
+          events: [],
+          totalCount: 0,
+          pagesFetched: 0,
+        }),
+        parseCursorTranscriptFile: async (input) => {
+          transcriptParseCalls++;
+          return {
+            events: [makeEvent({ messageId: "tx1", source: "cursor_local" })],
+            newOffset: input.byteOffset + 50,
+            seenDedupKeys: ["tx1:"],
+            nextLineIndex: (input.startingLineIndex ?? 0) + 1,
+          };
+        },
+        postEvents: async (evs) => ({
+          ok: true,
+          inserted: evs.length,
+          duplicates: 0,
+        }),
+      }),
+    );
+    expect(transcriptParseCalls).toBe(1);
+    expect(out.result.eventsPosted).toBe(1);
+    expect(out.state.files["/tx.jsonl"]?.byteOffset).toBe(50);
+  });
+
   test("cursor cloud fetch failure does not block local Claude events", async () => {
     const dir = await makeTmpDir();
     const ccEv = makeEvent({ messageId: "cc1", source: "claude_code" });

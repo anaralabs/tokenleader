@@ -252,41 +252,46 @@ async function runLoginCursor(deps: CliDeps, args: string[]): Promise<number> {
     print(`Cursor credentials saved to ${path.join(stateDir, "cursor_credentials.json")}`);
 
     // Credentials are already on disk; the post-login sync is a convenience.
-    // Don't fail the command if the daemon isn't linked yet or the post fails.
+    // Only swallow errors from the setup path (e.g. daemon not linked yet);
+    // runCursorCloudSync reports fetch/post failures via posted=false below.
+    const loadFn = deps.loadState ?? loadState;
+    const saveFn = deps.saveState ?? saveState;
+    let ctx: Awaited<ReturnType<typeof resolveCliContext>>;
+    let state: Awaited<ReturnType<typeof loadFn>>;
     try {
-      const ctx = await resolveCliContext(deps);
-      const loadFn = deps.loadState ?? loadState;
-      const saveFn = deps.saveState ?? saveState;
-      const state = await loadFn(stateDir);
-      print("Syncing current month usage from Cursor Cloud...");
-      const r = await runCursorCloudSync({
-        user: ctx.user,
-        stateDir,
-        state,
-        transport: {
-          endpoint: ctx.endpoint,
-          secret: ctx.secret,
-          batchSize: DEFAULT_BATCH_SIZE,
-          ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-        },
-        mode: "month",
-        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-      });
-      if (!r.posted) {
-        print(
-          "Warning: could not post Cursor usage to the leaderboard — credentials are saved; run `tokenleader sync-cursor` when the server is reachable.",
-        );
-        return 0;
-      }
-      await saveFn(stateDir, r.state);
-      print(
-        `Synced ${r.eventsFetched} Cursor events this month (${r.inserted} new, ${r.duplicates} already on server).`,
-      );
+      ctx = await resolveCliContext(deps);
+      state = await loadFn(stateDir);
     } catch (err: unknown) {
       print(
         `Warning: skipped post-login sync (${String((err as Error)?.message ?? err)}). Run \`tokenleader link\` and then \`tokenleader sync-cursor\` when ready.`,
       );
+      return 0;
     }
+
+    print("Syncing current month usage from Cursor Cloud...");
+    const r = await runCursorCloudSync({
+      user: ctx.user,
+      stateDir,
+      state,
+      transport: {
+        endpoint: ctx.endpoint,
+        secret: ctx.secret,
+        batchSize: DEFAULT_BATCH_SIZE,
+        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+      },
+      mode: "month",
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    });
+    if (!r.posted) {
+      print(
+        "Warning: could not post Cursor usage to the leaderboard — credentials are saved; run `tokenleader sync-cursor` when the server is reachable.",
+      );
+      return 0;
+    }
+    await saveFn(stateDir, r.state);
+    print(
+      `Synced ${r.eventsFetched} Cursor events this month (${r.inserted} new, ${r.duplicates} already on server).`,
+    );
     return 0;
   }
 
