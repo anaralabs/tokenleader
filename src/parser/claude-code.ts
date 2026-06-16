@@ -5,12 +5,8 @@ export interface ParseClaudeCodeOptions {
   path: string;
   byteOffset: number;
   user: string;
-  /**
-   * Source tag to stamp on emitted events. Defaults to "claude_code". Claude
-   * Cowork (Desktop "local agent mode") writes byte-identical session JSONL, so
-   * it reuses this parser with source="claude_cowork" — keeping its usage
-   * reportable separately from CLI usage rather than masquerading as it.
-   */
+  /** Source tag for emitted events; defaults to "claude_code". Cowork passes
+   *  "claude_cowork" since its JSONL is the same format. */
   source?: Source;
 }
 

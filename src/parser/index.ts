@@ -20,6 +20,21 @@ export function getClaudeCodeProjectsDir(): string {
 }
 
 /**
+ * Per-OS root where desktop apps keep their support data: macOS
+ * `~/Library/Application Support`, Windows `%APPDATA%` (Roaming), Linux
+ * `~/.config`. Both Claude Desktop and Cursor live under here.
+ */
+function platformAppSupportRoot(): string {
+  if (process.platform === "darwin") return join(homedir(), "Library", "Application Support");
+  if (process.platform === "win32") {
+    return process.env.APPDATA && process.env.APPDATA.length > 0
+      ? process.env.APPDATA
+      : join(homedir(), "AppData", "Roaming");
+  }
+  return join(homedir(), ".config");
+}
+
+/**
  * Root of the Claude **Desktop** app's data dir, which holds Claude Cowork
  * ("local agent mode") sessions. Each session runs in a sandbox with its own
  * nested `.claude/projects/...jsonl` transcript — byte-identical to the CLI
@@ -27,19 +42,10 @@ export function getClaudeCodeProjectsDir(): string {
  * TOKENLEADER_CLAUDE_COWORK_DIR.
  */
 export function getClaudeCoworkDir(): string {
-  let fallback: string;
-  if (process.platform === "darwin") {
-    fallback = join(homedir(), "Library", "Application Support", "Claude");
-  } else if (process.platform === "win32") {
-    const appData =
-      process.env.APPDATA && process.env.APPDATA.length > 0
-        ? process.env.APPDATA
-        : join(homedir(), "AppData", "Roaming");
-    fallback = join(appData, "Claude");
-  } else {
-    fallback = join(homedir(), ".config", "Claude");
-  }
-  return resolveDir(process.env.TOKENLEADER_CLAUDE_COWORK_DIR, fallback);
+  return resolveDir(
+    process.env.TOKENLEADER_CLAUDE_COWORK_DIR,
+    join(platformAppSupportRoot(), "Claude"),
+  );
 }
 
 // Session-transcript roots under the Desktop data dir. The store reportedly
@@ -53,18 +59,7 @@ export function getCodexSessionsDir(): string {
 }
 
 export function getCursorGlobalStorageDir(): string {
-  let fallback: string;
-  if (process.platform === "darwin") {
-    fallback = join(homedir(), "Library", "Application Support", "Cursor", "User", "globalStorage");
-  } else if (process.platform === "win32") {
-    const appData =
-      process.env.APPDATA && process.env.APPDATA.length > 0
-        ? process.env.APPDATA
-        : join(homedir(), "AppData", "Roaming");
-    fallback = join(appData, "Cursor", "User", "globalStorage");
-  } else {
-    fallback = join(homedir(), ".config", "Cursor", "User", "globalStorage");
-  }
+  const fallback = join(platformAppSupportRoot(), "Cursor", "User", "globalStorage");
   return resolveDir(process.env.CURSOR_DATA_DIR, fallback);
 }
 
@@ -82,18 +77,21 @@ function isTruthyEnv(v: string | undefined): boolean {
   return s === "1" || s === "true" || s === "yes" || s === "on";
 }
 
-/** Default on; set TOKENLEADER_CURSOR_LOCAL=0 to disable local Cursor parsing. */
-export function isCursorLocalEnabled(): boolean {
-  const raw = process.env.TOKENLEADER_CURSOR_LOCAL;
+/** A toggle env var that defaults ON: unset/empty → true, else parse truthiness. */
+function isEnabledByDefault(envVar: string): boolean {
+  const raw = process.env[envVar];
   if (raw === undefined || raw.trim() === "") return true;
   return isTruthyEnv(raw);
 }
 
+/** Default on; set TOKENLEADER_CURSOR_LOCAL=0 to disable local Cursor parsing. */
+export function isCursorLocalEnabled(): boolean {
+  return isEnabledByDefault("TOKENLEADER_CURSOR_LOCAL");
+}
+
 /** Default on; set TOKENLEADER_CLAUDE_COWORK=0 to disable Claude Cowork parsing. */
 export function isClaudeCoworkEnabled(): boolean {
-  const raw = process.env.TOKENLEADER_CLAUDE_COWORK;
-  if (raw === undefined || raw.trim() === "") return true;
-  return isTruthyEnv(raw);
+  return isEnabledByDefault("TOKENLEADER_CLAUDE_COWORK");
 }
 
 async function scanGlob(
