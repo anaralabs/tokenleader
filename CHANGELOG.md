@@ -9,14 +9,34 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
-## [Unreleased]
+## [0.4.0] - 2026-06-17
+
+Claude Cowork usage now counts on the leaderboard.
 
 ### Added
-- Claude Cowork support: the daemon also parses Claude Desktop "local agent
-  mode" sessions (byte-identical JSONL under the Desktop data dir), tagged
-  `claude_cowork` so they report separately from CLI usage. On by default;
-  `TOKENLEADER_CLAUDE_COWORK=0` disables. Cloud/remote Cowork runs server-side
-  and leaves nothing on disk, so it is out of scope.
+- Claude Cowork tracking via a new `claude_cowork` source. The daemon discovers
+  Claude Desktop "local agent mode" (Cowork) session transcripts under the
+  Desktop app's data dir — macOS `~/Library/Application Support/Claude/`, Linux
+  `~/.config/Claude/`, Windows `%APPDATA%/Claude/`, scanning both the
+  `local-agent-mode-sessions` and migrated `claude-code-sessions` layouts — and
+  parses them through the **same** Claude Code parser: full input/output/cache
+  token counts, per model, with the same de-duplication. The distinct
+  `claude_cowork` tag keeps Cowork usage reportable separately from CLI usage,
+  since its sandbox project paths would otherwise mislabel the per-project view.
+  On by default; `TOKENLEADER_CLAUDE_COWORK=0` disables and
+  `TOKENLEADER_CLAUDE_COWORK_DIR` overrides the Desktop data dir.
+
+### Notes
+- Server and daemon ship together: the server accepts `source: "claude_cowork"`
+  only from this release onward, and the production server has already been
+  updated.
+- On by default means a daemon backfills historical Cowork sessions from byte 0
+  on its first tick after upgrade — intended and de-dup-safe (keyed on message
+  IDs), so re-reading never double-counts.
+- Cloud/remote Cowork runs server-side and leaves nothing on disk, so it cannot
+  be tracked locally and is out of scope; only local Cowork is captured. Privacy
+  is unchanged: token counts, model names, and timestamps — never message
+  content.
 
 ## [0.3.0] - 2026-06-17
 
@@ -112,6 +132,7 @@ never message content.
   reference, update/rollback runbook.
 
 [Unreleased]: https://github.com/anaralabs/tokenleader/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/anaralabs/tokenleader/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/anaralabs/tokenleader/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/anaralabs/tokenleader/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/anaralabs/tokenleader/compare/v0.2.0...v0.2.1
