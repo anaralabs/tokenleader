@@ -1,4 +1,4 @@
-export type Source = "claude_code" | "codex" | "cursor";
+export type Source = "claude_code" | "codex" | "cursor" | "cursor_local";
 
 export type MessageType = "user" | "assistant";
 
@@ -52,8 +52,26 @@ export interface FileState {
   };
 }
 
+export interface CursorLocalState {
+  dbPath: string;
+  lastRowid: number;
+}
+
+export interface CursorCloudState {
+  /** Wall-clock ms when cloud sync last completed successfully. */
+  lastSyncAt: number;
+  /** Highest event timestamp seen from the dashboard API. */
+  lastEventTimestamp?: number;
+  /** Set after a successful `sync-cursor` full backfill. */
+  fullSyncDone?: boolean;
+}
+
 export interface DaemonState {
   schemaVersion: 1;
   files: Record<string, FileState>;
   lastFlushAt: number;
+  /** Read-only Cursor SQLite watermark (daemon-only bookkeeping). */
+  cursorLocal?: CursorLocalState;
+  /** Cursor dashboard cloud sync watermark (daemon-only bookkeeping). */
+  cursorCloud?: CursorCloudState;
 }

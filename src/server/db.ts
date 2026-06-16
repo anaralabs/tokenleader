@@ -389,6 +389,7 @@ export interface ApiUsageRow {
 export class Store {
   readonly db: Database;
   private readonly insertStmt: Statement;
+  private readonly deleteCursorLocalAtTsStmt: Statement;
   private readonly countStmt: Statement<{ c: number }>;
   private readonly userTotalsStmt: Statement<UserTotalsRow, [string, number, number]>;
   private readonly userByModelStmt: Statement<ModelRow, [string, number, number]>;
@@ -499,6 +500,11 @@ export class Store {
                $model, $messageType, $inputTokens, $outputTokens, $cacheCreationTokens,
                $cacheReadTokens, $reasoningTokens, $costUsdMicros, $ingestedAt)
        ON CONFLICT DO NOTHING`,
+    );
+    this.deleteCursorLocalAtTsStmt = this.db.prepare(
+      `DELETE FROM events
+       WHERE user = $user AND source = 'cursor_local' AND messageType = 'assistant'
+         AND timestamp = $timestamp`,
     );
     this.countStmt = this.db.prepare<{ c: number }, []>("SELECT COUNT(*) AS c FROM events");
     // Token-aggregation queries restrict to messageType='assistant': user
@@ -988,6 +994,21 @@ export class Store {
     const now = Date.now();
     let inserted = 0;
     const tx = this.db.transaction((batch: TokenEvent[]) => {
+      const reconcileTimestamps = new Map<string, Set<number>>();
+      for (const e of batch) {
+        if (e.source !== "cursor") continue;
+        let tsSet = reconcileTimestamps.get(e.user);
+        if (!tsSet) {
+          tsSet = new Set<number>();
+          reconcileTimestamps.set(e.user, tsSet);
+        }
+        tsSet.add(e.timestamp);
+      }
+      for (const [user, timestamps] of reconcileTimestamps) {
+        for (const timestamp of timestamps) {
+          this.deleteCursorLocalAtTsStmt.run({ $user: user, $timestamp: timestamp });
+        }
+      }
       for (const e of batch) {
         const res = this.insertStmt.run({
           $user: e.user,

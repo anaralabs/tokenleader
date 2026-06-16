@@ -24,6 +24,43 @@ export function getCodexSessionsDir(): string {
   return join(root, "sessions");
 }
 
+export function getCursorGlobalStorageDir(): string {
+  let fallback: string;
+  if (process.platform === "darwin") {
+    fallback = join(homedir(), "Library", "Application Support", "Cursor", "User", "globalStorage");
+  } else if (process.platform === "win32") {
+    const appData =
+      process.env.APPDATA && process.env.APPDATA.length > 0
+        ? process.env.APPDATA
+        : join(homedir(), "AppData", "Roaming");
+    fallback = join(appData, "Cursor", "User", "globalStorage");
+  } else {
+    fallback = join(homedir(), ".config", "Cursor", "User", "globalStorage");
+  }
+  return resolveDir(process.env.CURSOR_DATA_DIR, fallback);
+}
+
+export function getCursorStateDbPath(): string {
+  return join(getCursorGlobalStorageDir(), "state.vscdb");
+}
+
+export function getCursorProjectsDir(): string {
+  return resolveDir(process.env.CURSOR_PROJECTS_DIR, join(homedir(), ".cursor", "projects"));
+}
+
+function isTruthyEnv(v: string | undefined): boolean {
+  if (!v) return false;
+  const s = v.trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+/** Default on; set TOKENLEADER_CURSOR_LOCAL=0 to disable local Cursor parsing. */
+export function isCursorLocalEnabled(): boolean {
+  const raw = process.env.TOKENLEADER_CURSOR_LOCAL;
+  if (raw === undefined || raw.trim() === "") return true;
+  return isTruthyEnv(raw);
+}
+
 async function scanGlob(cwd: string, pattern: string): Promise<string[]> {
   const out: string[] = [];
   try {
@@ -43,4 +80,8 @@ export async function listClaudeCodeFiles(): Promise<string[]> {
 
 export async function listCodexFiles(): Promise<string[]> {
   return scanGlob(getCodexSessionsDir(), "**/*.jsonl");
+}
+
+export async function listCursorTranscriptFiles(): Promise<string[]> {
+  return scanGlob(getCursorProjectsDir(), "**/agent-transcripts/**/*.jsonl");
 }

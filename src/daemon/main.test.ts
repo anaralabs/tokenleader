@@ -674,6 +674,34 @@ describe("tick", () => {
     });
   });
 
+  test("processes cursor_local SQLite in one tick and persists rowid watermark", async () => {
+    const dir = await makeTmpDir();
+    const curEv = makeEvent({ messageId: "cur1", source: "cursor_local", model: "cursor" });
+    const dbPath = "/tmp/cursor/state.vscdb";
+    const out = await tick(
+      emptyState(),
+      mkTickDeps(dir, {
+        listClaudeCodeFiles: async () => [],
+        listCodexFiles: async () => [],
+        getCursorStateDbPath: () => dbPath,
+        isCursorLocalEnabled: () => true,
+        statFile: async (path) => (path === dbPath ? { mtimeMs: 1 } : { mtimeMs: 1 }),
+        parseCursorLocal: (input) => ({
+          events: [curEv],
+          newRowid: 42,
+          seenDedupKeys: ["cur1:"],
+        }),
+        postEvents: async (evs) => ({
+          ok: true,
+          inserted: evs.length,
+          duplicates: 0,
+        }),
+      }),
+    );
+    expect(out.result.eventsPosted).toBe(1);
+    expect(out.state.cursorLocal).toEqual({ dbPath, lastRowid: 42 });
+  });
+
   test("parser exception on one file does not poison others", async () => {
     const dir = await makeTmpDir();
     const out = await tick(
@@ -740,6 +768,7 @@ function mkTickDeps(stateDir: string, over: Partial<TickDeps>): TickDeps {
     },
     listClaudeCodeFiles: async () => [],
     listCodexFiles: async () => [],
+    listCursorTranscriptFiles: async () => [],
     parseClaudeCodeFile: async (input) => ({
       events: [],
       newOffset: input.byteOffset,
@@ -750,6 +779,18 @@ function mkTickDeps(stateDir: string, over: Partial<TickDeps>): TickDeps {
       newOffset: input.byteOffset,
       sessionTotals: undefined as unknown as never,
     }),
+    parseCursorLocal: (input) => ({
+      events: [],
+      newRowid: input.lastRowid,
+      seenDedupKeys: [],
+    }),
+    parseCursorTranscriptFile: async (input) => ({
+      events: [],
+      newOffset: input.byteOffset,
+      seenDedupKeys: [],
+    }),
+    getCursorStateDbPath: () => "/tmp/cursor/state.vscdb",
+    isCursorLocalEnabled: () => false,
     postEvents: async () => ({ ok: true, inserted: 0, duplicates: 0 }),
     statFile: async () => ({ mtimeMs: 1 }),
     saveState,

@@ -466,6 +466,8 @@ Commands:
   link              Mint a one-time code to add another machine to your handle
   devices           List the machines posting under your handle
   revoke <id>       Revoke a machine (lost / stolen / retired)
+  login-cursor      Save Cursor dashboard session (--auto on macOS, or paste token)
+  sync-cursor       Backfill official Cursor usage from the dashboard API
   --version, -v     Print the daemon version
 
 The background daemon is installed and run for you by the install script

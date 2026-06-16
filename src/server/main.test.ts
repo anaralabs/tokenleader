@@ -259,6 +259,82 @@ describe("server", () => {
     expect(Math.abs(body.totalCostUsd - rowSum)).toBeLessThan(0.001);
   });
 
+  test("/ingest accepts cursor_local source events", async () => {
+    const events = [
+      makeEvent({
+        messageId: "cursor-b1",
+        user: "alice",
+        source: "cursor_local",
+        model: "cursor",
+      }),
+    ];
+    const res = await app.request(ingestReq(events, ALICE_SECRET));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ inserted: 1, duplicates: 0 });
+  });
+
+  test("/ingest accepts cursor cloud events with costUsdMicros", async () => {
+    const events = [
+      makeEvent({
+        messageId: "cloud-1",
+        user: "alice",
+        source: "cursor",
+        model: "claude-4.5-sonnet",
+        costUsdMicros: 12_300,
+      }),
+    ];
+    const res = await app.request(ingestReq(events, ALICE_SECRET));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ inserted: 1, duplicates: 0 });
+    const stats = await jsonOf(await app.request(new Request("http://x/stats?user=alice")));
+    const row = stats.byModel.find((m: { model: string }) => m.model === "claude-4.5-sonnet");
+    expect(row?.costUsd).toBeCloseTo(0.0123, 5);
+  });
+
+  test("/ingest cursor events replace cursor_local rows at the same timestamp", async () => {
+    const user = "reconcileuser";
+    const secret = "reconcile-secret";
+    const ts = Date.UTC(2026, 5, 10, 12, 0, 0);
+    await app.request(
+      ingestReq(
+        [
+          makeEvent({
+            user,
+            source: "cursor_local",
+            messageId: "local-bubble",
+            timestamp: ts,
+            model: "cursor",
+            inputTokens: 999,
+            outputTokens: 999,
+          }),
+        ],
+        secret,
+      ),
+    );
+    await app.request(
+      ingestReq(
+        [
+          makeEvent({
+            user,
+            source: "cursor",
+            messageId: "cloud-event",
+            timestamp: ts,
+            model: "claude-4.5-sonnet",
+            inputTokens: 100,
+            outputTokens: 50,
+            costUsdMicros: 50_000,
+          }),
+        ],
+        secret,
+      ),
+    );
+    const stats = await jsonOf(await app.request(new Request(`http://x/stats?user=${user}`)));
+    expect(stats.byModel.some((m: { model: string }) => m.model === "cursor")).toBe(false);
+    const cloud = stats.byModel.find((m: { model: string }) => m.model === "claude-4.5-sonnet");
+    expect(cloud?.input).toBe(100);
+    expect(cloud?.costUsd).toBeCloseTo(0.05, 5);
+  });
+
   test("/stats reports unknown models in unknownModels", async () => {
     const ev: TokenEvent = makeEvent({
       user: "carol",

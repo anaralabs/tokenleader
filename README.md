@@ -43,7 +43,7 @@ tokenleader ships **token counts, model names, and timestamps — never message 
 │ parses local session logs │ ──────────► │                                             │
 │  ~/.claude/projects       │  POST       │  /            dashboard                     │
 │  ~/.codex/sessions        │  /ingest    │  /ingest      token counts in               │
-│                           │             │  /install     daemon installer out          │
+│  Cursor state.vscdb       │             │  /install     daemon installer out          │
 │ posts only token counts   │ ◄────────── │  /manifest.json + /bin/*   daemon updates   │
 │ + metadata, never content │  GET        │  /api/v1/usage             totals for bots  │
 │                           │  hourly     │                                             │
@@ -136,11 +136,12 @@ curl -fsSL https://leaderboard.example.com/uninstall | bash
 
 ## Supported sources
 
-| Source      | How                                                        | Default |
-|-------------|------------------------------------------------------------|---------|
-| Claude Code | daemon parses `~/.claude/projects/` locally                | on      |
-| Codex CLI   | daemon parses `~/.codex/sessions/` locally                 | on      |
-| Cursor      | server-side mirror via Cursor Teams Admin API (no daemon)  | off — needs an admin key, see [docs/configuration.md](docs/configuration.md#cursor-mirror) |
+| Source        | How                                                        | Default |
+|---------------|------------------------------------------------------------|---------|
+| Claude Code   | daemon parses `~/.claude/projects/` locally                | on      |
+| Codex CLI     | daemon parses `~/.codex/sessions/` locally                 | on      |
+| Cursor (local)| daemon parses Cursor's local `state.vscdb` SQLite (personal)| on      |
+| Cursor (team) | server-side mirror via Cursor Teams Admin API (no daemon)  | off — needs an admin key, see [docs/configuration.md](docs/configuration.md#cursor-mirror) |
 
 ## API
 

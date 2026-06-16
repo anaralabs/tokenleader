@@ -250,12 +250,17 @@ ensure_dirs() {
 # fresh we skip the build to keep re-runs fast.
 do_build() {
   step_start 2 "Building local binary"
+  # Stop the daemon before swapping the binary — overwriting in place while
+  # launchd has it mapped can leave macOS killing the new Mach-O (SIGKILL / 9).
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
   if [ -x "$BIN_SRC" ]; then
-    # Already built. Copy it over.
-    if ! cp "$BIN_SRC" "$BIN_DST" 2>/dev/null; then
-      step_fail "could not copy $BIN_SRC -> $BIN_DST"
+    # Already built. Atomically replace the installed copy.
+    tmp="${BIN_DST}.tmp.$$"
+    if ! cp "$BIN_SRC" "$tmp" 2>/dev/null; then
+      step_fail "could not copy $BIN_SRC -> $tmp"
     fi
-    chmod +x "$BIN_DST"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$BIN_DST"
     step_ok "reused $BIN_SRC"
     return 0
   fi
@@ -279,8 +284,10 @@ do_build() {
     CUR_STEP_LABEL="Building local binary"
     step_fail "build did not produce $BIN_SRC"
   fi
-  cp "$BIN_SRC" "$BIN_DST"
-  chmod +x "$BIN_DST"
+  tmp="${BIN_DST}.tmp.$$"
+  cp "$BIN_SRC" "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" "$BIN_DST"
   CUR_STEP_N=2
   CUR_STEP_LABEL="Built local binary"
   if [ -t 1 ]; then
