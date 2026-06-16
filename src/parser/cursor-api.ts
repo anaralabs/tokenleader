@@ -1,5 +1,6 @@
 import { buildWorkosSessionToken, refreshCursorAccessToken } from "./cursor-auth.ts";
 import { centsToMicros, cursorMessageId, cursorSessionId } from "./cursor-dedup.ts";
+import { fetchSignal } from "./cursor-http.ts";
 import type { TokenEvent } from "../types.ts";
 
 /** Bare-host canonical URL — www redirects and POST CSRF checks expect this. */
@@ -280,7 +281,10 @@ export async function validateCursorToken(
     const res = await fetchImpl(CURSOR_USAGE_SUMMARY_API, {
       method: "GET",
       headers: summaryHeaders(auth),
-      signal: opts.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      // Canonical host doesn't redirect; fail closed rather than replay the
+      // session cookie to a redirect target.
+      redirect: "error",
+      signal: fetchSignal(opts.signal, FETCH_TIMEOUT_MS),
     });
 
     if (res.status === 401 && attempt === 0 && auth.refreshToken) {
@@ -343,7 +347,8 @@ export async function fetchFilteredUsageEvents(
       method: "POST",
       headers: dashboardHeaders(auth),
       body: JSON.stringify(body),
-      signal: opts.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      redirect: "error",
+      signal: fetchSignal(opts.signal, FETCH_TIMEOUT_MS),
     });
 
     if (res.status === 401 && auth.refreshToken) {
@@ -353,7 +358,8 @@ export async function fetchFilteredUsageEvents(
         method: "POST",
         headers: dashboardHeaders(auth),
         body: JSON.stringify(body),
-        signal: opts.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        redirect: "error",
+        signal: fetchSignal(opts.signal, FETCH_TIMEOUT_MS),
       });
     }
 

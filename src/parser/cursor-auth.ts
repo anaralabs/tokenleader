@@ -1,3 +1,5 @@
+import { fetchSignal } from "./cursor-http.ts";
+
 export const CURSOR_AUTH_USAGE_API = "https://api2.cursor.sh/auth/usage";
 export const CURSOR_OAUTH_TOKEN_API = "https://api2.cursor.sh/oauth/token";
 export const CURSOR_OAUTH_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB";
@@ -42,7 +44,8 @@ export async function verifyCursorAccessToken(
   const res = await fetchImpl(CURSOR_AUTH_USAGE_API, {
     method: "GET",
     headers,
-    signal: opts.signal ?? AbortSignal.timeout(15_000),
+    redirect: "error",
+    signal: fetchSignal(opts.signal, 15_000),
   });
   if (res.status === 401 || res.status === 403) return false;
   if (!res.ok) {
@@ -64,7 +67,8 @@ export async function refreshCursorAccessToken(
       client_id: CURSOR_OAUTH_CLIENT_ID,
       refresh_token: refreshToken.trim(),
     }),
-    signal: opts.signal ?? AbortSignal.timeout(15_000),
+    redirect: "error",
+    signal: fetchSignal(opts.signal, 15_000),
   });
 
   let json: {
@@ -109,7 +113,8 @@ export async function fetchCursorUserEmail(
   const res = await fetchImpl(CURSOR_USER_API, {
     method: "GET",
     headers,
-    signal: opts.signal ?? AbortSignal.timeout(15_000),
+    redirect: "error",
+    signal: fetchSignal(opts.signal, 15_000),
   });
 
   if (res.status === 401 || res.status === 403) {

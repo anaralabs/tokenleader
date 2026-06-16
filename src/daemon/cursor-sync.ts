@@ -287,7 +287,14 @@ export async function runCursorCloudSync(
   let inserted = 0;
   let duplicates = 0;
   if (fetched.events.length > 0) {
-    const r = await post(fetched.events, opts.transport, opts.signal);
+    let r: Awaited<ReturnType<typeof post>>;
+    try {
+      r = await post(fetched.events, opts.transport, opts.signal);
+    } catch (err: unknown) {
+      // A thrown transport error (vs a returned { ok: false }) must still land
+      // on the failure path — don't let it escape and abort the caller.
+      r = { ok: false, inserted: 0, duplicates: 0, error: String((err as Error)?.message ?? err) };
+    }
     if (!r.ok) {
       log.error("cursor_cloud_post_failed", {
         mode: opts.mode,

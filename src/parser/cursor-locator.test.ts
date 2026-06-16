@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,13 +13,11 @@ import {
 function makeTestVscdb(values: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "tokenleader-vscdb-"));
   const dbPath = join(dir, "state.vscdb");
-  execFileSync("sqlite3", [dbPath, "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);"]);
-  for (const [key, value] of Object.entries(values)) {
-    execFileSync("sqlite3", [
-      dbPath,
-      `INSERT INTO ItemTable (key, value) VALUES ('${key.replace(/'/g, "''")}', '${value.replace(/'/g, "''")}');`,
-    ]);
-  }
+  const db = new Database(dbPath, { create: true });
+  db.run("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)");
+  const insert = db.query("INSERT INTO ItemTable (key, value) VALUES ($k, $v)");
+  for (const [key, value] of Object.entries(values)) insert.run({ $k: key, $v: value });
+  db.close();
   return dbPath;
 }
 
@@ -67,11 +64,11 @@ describe("cursor-locator", () => {
     }
   });
 
-  test("readCursorMachineId reads telemetry.machineId from storage.json", () => {
+  test("readCursorMachineId reads telemetry.machineId from storage.json", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tokenleader-storage-"));
     const storagePath = join(dir, "storage.json");
     const machineId = "289aedcf3ccf5d3814ed682c26c4076833600e42e397cd1c50d918a335a531a8";
-    Bun.write(storagePath, JSON.stringify({ [CURSOR_STORAGE_MACHINE_ID_KEY]: machineId }));
+    await Bun.write(storagePath, JSON.stringify({ [CURSOR_STORAGE_MACHINE_ID_KEY]: machineId }));
     try {
       expect(readCursorMachineId(storagePath)).toBe(machineId);
     } finally {

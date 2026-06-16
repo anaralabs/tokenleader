@@ -1,5 +1,5 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,13 +25,11 @@ function makeJwt(sub: string): string {
 function makeTestVscdb(values: Record<string, string>): string {
   const dir = mkdtempSync(join(tmpdir(), "tokenleader-vscdb-"));
   const dbPath = join(dir, "state.vscdb");
-  execFileSync("sqlite3", [dbPath, "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);"]);
-  for (const [key, value] of Object.entries(values)) {
-    execFileSync("sqlite3", [
-      dbPath,
-      `INSERT INTO ItemTable (key, value) VALUES ('${key.replace(/'/g, "''")}', '${value.replace(/'/g, "''")}');`,
-    ]);
-  }
+  const db = new Database(dbPath, { create: true });
+  db.run("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)");
+  const insert = db.query("INSERT INTO ItemTable (key, value) VALUES ($k, $v)");
+  for (const [key, value] of Object.entries(values)) insert.run({ $k: key, $v: value });
+  db.close();
   return dbPath;
 }
 
