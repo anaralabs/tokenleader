@@ -457,6 +457,10 @@ describe("runCliCommand", () => {
       const ingestCalls: unknown[][] = [];
       const deps: CliDeps = {
         env: { TOKENLEADER_STATE_DIR: stateDir },
+        // Inject the fixture plist so resolveCliContext doesn't read the host's
+        // real LaunchAgent (USER/ENDPOINT) — otherwise this passes only on a
+        // machine with the daemon installed and fails on a clean CI runner.
+        readPlist: async () => PLIST,
         fetchImpl: (async (input: unknown, init?: RequestInit) => {
           const url = String(input);
           if (url.includes("cursor.com")) {
