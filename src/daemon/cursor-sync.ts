@@ -5,7 +5,6 @@ import {
   loadCursorCredentials,
   saveCursorCredentials,
   saveCursorToken,
-  type loadCursorToken,
 } from "./cursor-token";
 import { log } from "./log";
 import { postEvents, type TransportOpts } from "./transport";
@@ -27,7 +26,6 @@ export interface FetchCursorCloudOpts {
   state: DaemonState;
   mode: CursorSyncMode;
   signal?: AbortSignal;
-  loadCursorToken?: typeof loadCursorToken;
   loadCursorCloudAuth?: typeof loadCursorCloudAuth;
   saveCursorCredentials?: typeof saveCursorCredentials;
   fetchFilteredUsageEvents?: typeof fetchFilteredUsageEvents;
@@ -51,7 +49,8 @@ export interface CursorCloudSyncOpts {
   transport: TransportOpts;
   mode: CursorSyncMode;
   signal?: AbortSignal;
-  loadCursorToken?: typeof loadCursorToken;
+  loadCursorCloudAuth?: typeof loadCursorCloudAuth;
+  saveCursorCredentials?: typeof saveCursorCredentials;
   fetchFilteredUsageEvents?: typeof fetchFilteredUsageEvents;
   fetchImpl?: typeof fetch;
   postEvents?: typeof postEvents;

@@ -51,7 +51,9 @@ export async function extractCursorSessionToken(
 ): Promise<ExtractCursorSessionResult> {
   const dbPath = opts.dbPath ?? defaultCursorStateDbPathForPlatform();
   const auth = readCursorIdeAuth(dbPath, { skipCopy: opts.skipCopy });
-  const machineId = readCursorMachineId(opts.storageJsonPath);
+  // The auth DB carries the same serviceMachineId Cursor signs requests with;
+  // fall back to telemetry.machineId in storage.json only when the DB lacks it.
+  const machineId = auth.serviceMachineId ?? readCursorMachineId(opts.storageJsonPath);
 
   let accessToken = auth.accessToken;
   const fetchImpl = opts.fetchImpl;

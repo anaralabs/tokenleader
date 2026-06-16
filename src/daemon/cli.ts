@@ -251,34 +251,42 @@ async function runLoginCursor(deps: CliDeps, args: string[]): Promise<number> {
     print(`Authenticated as: ${email}`);
     print(`Cursor credentials saved to ${path.join(stateDir, "cursor_credentials.json")}`);
 
-    const ctx = await resolveCliContext(deps);
-    const loadFn = deps.loadState ?? loadState;
-    const saveFn = deps.saveState ?? saveState;
-    const state = await loadFn(stateDir);
-    print("Syncing current month usage from Cursor Cloud...");
-    const r = await runCursorCloudSync({
-      user: ctx.user,
-      stateDir,
-      state,
-      transport: {
-        endpoint: ctx.endpoint,
-        secret: ctx.secret,
-        batchSize: DEFAULT_BATCH_SIZE,
+    // Credentials are already on disk; the post-login sync is a convenience.
+    // Don't fail the command if the daemon isn't linked yet or the post fails.
+    try {
+      const ctx = await resolveCliContext(deps);
+      const loadFn = deps.loadState ?? loadState;
+      const saveFn = deps.saveState ?? saveState;
+      const state = await loadFn(stateDir);
+      print("Syncing current month usage from Cursor Cloud...");
+      const r = await runCursorCloudSync({
+        user: ctx.user,
+        stateDir,
+        state,
+        transport: {
+          endpoint: ctx.endpoint,
+          secret: ctx.secret,
+          batchSize: DEFAULT_BATCH_SIZE,
+          ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+        },
+        mode: "month",
         ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-      },
-      mode: "month",
-      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-    });
-    if (!r.posted) {
+      });
+      if (!r.posted) {
+        print(
+          "Warning: could not post Cursor usage to the leaderboard — credentials are saved; run `tokenleader sync-cursor` when the server is reachable.",
+        );
+        return 0;
+      }
+      await saveFn(stateDir, r.state);
       print(
-        "Warning: could not post Cursor usage to the leaderboard — credentials are saved; run `tokenleader sync-cursor` when the server is reachable.",
+        `Synced ${r.eventsFetched} Cursor events this month (${r.inserted} new, ${r.duplicates} already on server).`,
       );
-      return 0;
+    } catch (err: unknown) {
+      print(
+        `Warning: skipped post-login sync (${String((err as Error)?.message ?? err)}). Run \`tokenleader link\` and then \`tokenleader sync-cursor\` when ready.`,
+      );
     }
-    await saveFn(stateDir, r.state);
-    print(
-      `Synced ${r.eventsFetched} Cursor events this month (${r.inserted} new, ${r.duplicates} already on server).`,
-    );
     return 0;
   }
 

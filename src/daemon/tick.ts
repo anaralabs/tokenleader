@@ -105,7 +105,7 @@ export async function tick(
     });
   }
   const useCloudCursor = cursorToken !== null;
-  const cursorLocalEnabled = cursorEnabled && !useCloudCursor;
+  const cursorLocalEnabled = cursorEnabled;
 
   const [ccPaths, cxPaths, curTxPaths] = await Promise.all([
     safeList(listCC, "claude_code"),
@@ -301,7 +301,6 @@ export async function tick(
         state: initial,
         mode: "incremental",
         signal: deps.signal,
-        loadCursorToken: loadToken,
         now,
       });
       if (!cloud.skipped) {
