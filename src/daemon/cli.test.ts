@@ -496,4 +496,63 @@ describe("runCliCommand", () => {
       expect(state.cursorCloud.lastSyncAt).toBeGreaterThan(0);
     });
   });
+
+  test("login-cursor -: reads the token from stdin (keeps it out of argv)", async () => {
+    await withSecretDir(async (stateDir) => {
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: stateDir },
+        readStdin: async () => "  piped-session-token\n",
+        fetchImpl: (async () =>
+          new Response("{}", {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })) as unknown as typeof fetch,
+        print: () => {},
+        printErr: () => {},
+      };
+      expect(await runCliCommand("login-cursor", ["-"], deps)).toBe(0);
+      const saved = await fsp.readFile(join(stateDir, CURSOR_TOKEN_FILENAME), "utf8");
+      expect(saved.trim()).toBe("piped-session-token");
+    });
+  });
+
+  test("sync-cursor: drains a truncated backfill across passes until complete", async () => {
+    await withSecretDir(async (stateDir) => {
+      await fsp.writeFile(join(stateDir, CURSOR_TOKEN_FILENAME), "session-token\n", {
+        mode: 0o600,
+      });
+      let passes = 0;
+      const runSync = (async (o: { state: Record<string, unknown> }) => {
+        passes += 1;
+        const complete = passes >= 3;
+        return {
+          state: {
+            ...o.state,
+            cursorCloud: complete
+              ? { lastSyncAt: passes, fullSyncDone: true }
+              : { lastSyncAt: passes, resumePage: passes + 1, resumeStartDate: 0 },
+          },
+          eventsFetched: 10,
+          eventsPosted: 10,
+          inserted: 10,
+          duplicates: 0,
+          posted: true,
+          skipped: false,
+          complete,
+          ...(complete ? {} : { nextPage: passes + 1 }),
+        };
+      }) as unknown as CliDeps["runCursorCloudSync"];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: stateDir },
+        readPlist: async () => PLIST,
+        runCursorCloudSync: runSync,
+        print: () => {},
+        printErr: () => {},
+      };
+      expect(await runCliCommand("sync-cursor", [], deps)).toBe(0);
+      expect(passes).toBe(3);
+      const state = JSON.parse(await fsp.readFile(join(stateDir, "state.json"), "utf8"));
+      expect(state.cursorCloud.fullSyncDone).toBe(true);
+    });
+  });
 });

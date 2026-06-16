@@ -43,6 +43,9 @@ export async function loadCursorCredentials(stateDir: string): Promise<CursorCre
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException | undefined)?.code;
     if (code === "ENOENT") return null;
+    // A truncated/corrupt creds file is treated as absent, not fatal — it must
+    // not block an otherwise-valid cursor_token from authenticating.
+    if (err instanceof SyntaxError) return null;
     throw err;
   }
 }

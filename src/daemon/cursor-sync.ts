@@ -92,6 +92,13 @@ export function computeCursorSyncStartDate(
   if (mode === "full") return 0;
   if (mode === "month") return currentMonthStartMs(now);
   const cloud = state.cursorCloud;
+  // A pending truncated incremental walk pins its exact window: lastSyncAt
+  // advances every tick, so without this the basis would drift, the
+  // resumeStartDate guard would reject resumePage, and the unfetched tail of
+  // the original window would be skipped permanently.
+  if (cloud?.resumePage !== undefined && cloud.resumeStartDate !== undefined) {
+    return cloud.resumeStartDate;
+  }
   if (cloud?.lastEventTimestamp && cloud.lastEventTimestamp > 0) {
     return Math.max(0, cloud.lastEventTimestamp - CURSOR_SYNC_OVERLAP_MS);
   }

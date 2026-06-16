@@ -65,6 +65,19 @@ describe("cursor-token credential stores", () => {
     }
   });
 
+  test("a corrupt credentials file doesn't block a valid cursor_token", async () => {
+    const { dir, cleanup } = makeTmpDirSync("cursor-token-corrupt-");
+    try {
+      await fs.writeFile(join(dir, CURSOR_TOKEN_FILENAME), "good-session", { mode: 0o600 });
+      await fs.writeFile(join(dir, CURSOR_CREDENTIALS_FILENAME), "{ truncated", { mode: 0o600 });
+      const auth = await loadCursorCloudAuth(dir);
+      expect(auth?.sessionToken).toBe("good-session");
+      expect(auth?.refreshToken).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
   test("saveCursorCredentials writes both stores atomically", async () => {
     const { dir, cleanup } = makeTmpDirSync("cursor-token-save-");
     try {

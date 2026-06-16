@@ -44,6 +44,16 @@ describe("computeCursorSyncStartDate", () => {
     );
   });
 
+  test("a pending resume pins resumeStartDate so the window can't drift with lastSyncAt", () => {
+    const state = {
+      ...emptyState(),
+      // No event watermark, so the basis would otherwise be lastSyncAt (which
+      // advances every tick) — the resume must stay anchored to its window.
+      cursorCloud: { lastSyncAt: 50_000_000, resumePage: 7, resumeStartDate: 1_234_000 },
+    };
+    expect(computeCursorSyncStartDate(state, "incremental", 99_000_000)).toBe(1_234_000);
+  });
+
   test("month mode starts at the first day of the current UTC month", () => {
     const now = Date.UTC(2026, 5, 15, 12, 0, 0);
     expect(computeCursorSyncStartDate(emptyState(), "month", now)).toBe(currentMonthStartMs(now));

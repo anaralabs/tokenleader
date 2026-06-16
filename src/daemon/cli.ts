@@ -26,8 +26,12 @@ export interface CliDeps {
   extractCursorSession?: typeof extractCursorSessionToken;
   /** Test seam for the plist read; default reads the real LaunchAgent. */
   readPlist?: () => Promise<string>;
+  /** Reads a Cursor token from stdin for `login-cursor -`. Default reads stdin. */
+  readStdin?: () => Promise<string>;
   loadState?: typeof loadState;
   saveState?: typeof saveState;
+  /** Test seam for the cloud sync; default runs the real backfill. */
+  runCursorCloudSync?: typeof runCursorCloudSync;
   print?: (line: string) => void;
   printErr?: (line: string) => void;
 }
@@ -195,12 +199,14 @@ async function runDevices(deps: CliDeps): Promise<number> {
 
 function loginCursorUsageMessage(): string {
   return (
-    "usage: tokenleader login-cursor [--auto | <WorkosCursorSessionToken>]\n" +
+    "usage: tokenleader login-cursor [--auto | <WorkosCursorSessionToken> | -]\n" +
     "  Recommended on macOS:\n" +
     "    tokenleader login-cursor --auto\n" +
     "    Reads your Cursor IDE login from ~/Library/Application Support/Cursor/...\n" +
     "  Manual fallback:\n" +
-    "    Copy the WorkosCursorSessionToken cookie from cursor.com (DevTools → Application → Cookies)."
+    "    Copy the WorkosCursorSessionToken cookie from cursor.com (DevTools → Application → Cookies).\n" +
+    "    Pass `-` to read the token from stdin (keeps it out of your shell history):\n" +
+    "      pbpaste | tokenleader login-cursor -"
   );
 }
 
@@ -297,7 +303,12 @@ async function runLoginCursor(deps: CliDeps, args: string[]): Promise<number> {
     return 0;
   }
 
-  const token = arg0;
+  // `-` reads the token from stdin so it never lands in argv / shell history.
+  let token = arg0;
+  if (token === "-") {
+    const readStdin = deps.readStdin ?? (() => Bun.stdin.text());
+    token = (await readStdin()).trim();
+  }
   if (!token) {
     throw new Error(loginCursorUsageMessage());
   }
@@ -329,31 +340,54 @@ async function runSyncCursor(deps: CliDeps): Promise<number> {
 
   const loadFn = deps.loadState ?? loadState;
   const saveFn = deps.saveState ?? saveState;
-  const state = await loadFn(stateDir);
+  const runSync = deps.runCursorCloudSync ?? runCursorCloudSync;
+  const transport = {
+    endpoint: ctx.endpoint,
+    secret: ctx.secret,
+    batchSize: DEFAULT_BATCH_SIZE,
+    ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+  };
 
   print("Fetching Cursor usage history from the dashboard (this may take a minute)...");
-  const r = await runCursorCloudSync({
-    user: ctx.user,
-    stateDir,
-    state,
-    transport: {
-      endpoint: ctx.endpoint,
-      secret: ctx.secret,
-      batchSize: DEFAULT_BATCH_SIZE,
+
+  // sync-cursor backfills *all* history now (the foreground counterpart to the
+  // daemon's chunked background drain). A single call caps at CURSOR_SYNC_FULL_MAX_PAGES,
+  // so loop on the resume watermark until the walk completes. The bound is a
+  // runaway guard far above any real history.
+  let state = await loadFn(stateDir);
+  let fetched = 0;
+  let inserted = 0;
+  let duplicates = 0;
+  let r: Awaited<ReturnType<typeof runSync>>;
+  const MAX_PASSES = 1000;
+  let passes = 0;
+  do {
+    r = await runSync({
+      user: ctx.user,
+      stateDir,
+      state,
+      transport,
+      mode: "full",
       ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-    },
-    mode: "full",
-    ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
-  });
+    });
+    if (!r.posted) {
+      throw new Error("cursor cloud sync failed — check your token and server connection");
+    }
+    state = r.state;
+    fetched += r.eventsFetched;
+    inserted += r.inserted;
+    duplicates += r.duplicates;
+    passes += 1;
+  } while (!r.complete && !r.skipped && passes < MAX_PASSES);
 
-  if (!r.posted) {
-    throw new Error("cursor cloud sync failed — check your token and server connection");
+  await saveFn(stateDir, state);
+  if (!r.complete && !r.skipped) {
+    print(
+      `Synced ${fetched} Cursor events so far — the history is unusually large; the daemon will finish the backfill on its next ticks.`,
+    );
+  } else {
+    print(`Synced ${fetched} Cursor events (${inserted} new, ${duplicates} already on server).`);
   }
-
-  await saveFn(stateDir, r.state);
-  print(
-    `Synced ${r.eventsFetched} Cursor events (${r.inserted} new, ${r.duplicates} already on server).`,
-  );
   return 0;
 }
 
