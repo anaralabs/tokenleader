@@ -157,7 +157,7 @@ cleanup_spinner() {
   fi
   SPINNER_PID=""
 }
-trap 'cleanup_spinner; tput cnorm 2>/dev/null || true' EXIT INT TERM
+trap 'cleanup_spinner; tput cnorm 2>/dev/null || true; rm -f "${tmp:-}" 2>/dev/null || true' EXIT INT TERM
 
 step_start() {
   CUR_STEP_N="$1"
@@ -251,11 +251,17 @@ ensure_dirs() {
 do_build() {
   step_start 2 "Building local binary"
   if [ -x "$BIN_SRC" ]; then
-    # Already built. Copy it over.
-    if ! cp "$BIN_SRC" "$BIN_DST" 2>/dev/null; then
-      step_fail "could not copy $BIN_SRC -> $BIN_DST"
+    # Already built. Atomically replace the installed copy.
+    tmp="${BIN_DST}.tmp.$$"
+    if ! cp "$BIN_SRC" "$tmp" 2>/dev/null; then
+      step_fail "could not copy $BIN_SRC -> $tmp"
     fi
-    chmod +x "$BIN_DST"
+    chmod +x "$tmp"
+    # Stop the daemon only now, right before the swap: booting it out earlier
+    # would leave it down if a build below failed. launchd has the old Mach-O
+    # mapped, so overwriting in place risks a SIGKILL — bootout, then mv.
+    launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+    mv -f "$tmp" "$BIN_DST"
     step_ok "reused $BIN_SRC"
     return 0
   fi
@@ -279,8 +285,12 @@ do_build() {
     CUR_STEP_LABEL="Building local binary"
     step_fail "build did not produce $BIN_SRC"
   fi
-  cp "$BIN_SRC" "$BIN_DST"
-  chmod +x "$BIN_DST"
+  tmp="${BIN_DST}.tmp.$$"
+  cp "$BIN_SRC" "$tmp"
+  chmod +x "$tmp"
+  # Build succeeded — now stop the daemon and swap the binary atomically.
+  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+  mv -f "$tmp" "$BIN_DST"
   CUR_STEP_N=2
   CUR_STEP_LABEL="Built local binary"
   if [ -t 1 ]; then

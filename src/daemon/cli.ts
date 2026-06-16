@@ -6,9 +6,15 @@
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { validateCursorToken } from "../parser/cursor-api";
+import { extractCursorSessionToken } from "./cursor-auto-login";
+import { runCursorCloudSync } from "./cursor-sync";
+import { loadCursorToken, saveCursorCredentials, saveCursorToken } from "./cursor-token";
 import { readEndpointOverride } from "./endpoint-override";
+import { loadState, saveState } from "./state";
+import { DEFAULT_BATCH_SIZE } from "./transport";
 
-export const CLI_COMMANDS = ["link", "devices", "revoke"] as const;
+export const CLI_COMMANDS = ["link", "devices", "revoke", "login-cursor", "sync-cursor"] as const;
 export type CliCommand = (typeof CLI_COMMANDS)[number];
 
 const FETCH_TIMEOUT_MS = 10_000;
@@ -16,8 +22,16 @@ const FETCH_TIMEOUT_MS = 10_000;
 export interface CliDeps {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  /** Test seam for `login-cursor --auto`. */
+  extractCursorSession?: typeof extractCursorSessionToken;
   /** Test seam for the plist read; default reads the real LaunchAgent. */
   readPlist?: () => Promise<string>;
+  /** Reads a Cursor token from stdin for `login-cursor -`. Default reads stdin. */
+  readStdin?: () => Promise<string>;
+  loadState?: typeof loadState;
+  saveState?: typeof saveState;
+  /** Test seam for the cloud sync; default runs the real backfill. */
+  runCursorCloudSync?: typeof runCursorCloudSync;
   print?: (line: string) => void;
   printErr?: (line: string) => void;
 }
@@ -43,6 +57,13 @@ export function parsePlistEnv(xml: string): Record<string, string> {
   return out;
 }
 
+function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
+  return (
+    env.TOKENLEADER_STATE_DIR?.trim() ||
+    path.join(homedir(), ".local", "share", "anara-leaderboard")
+  );
+}
+
 async function resolveCliContext(deps: CliDeps): Promise<CliContext> {
   const env = deps.env ?? process.env;
   const readPlist = deps.readPlist ?? (() => fs.readFile(plistPath(), "utf8"));
@@ -62,9 +83,7 @@ async function resolveCliContext(deps: CliDeps): Promise<CliContext> {
   }
 
   let endpoint = env.TOKENLEADER_ENDPOINT?.trim() || plistEnv.TOKENLEADER_ENDPOINT || "";
-  const stateDir =
-    env.TOKENLEADER_STATE_DIR?.trim() ||
-    path.join(homedir(), ".local", "share", "anara-leaderboard");
+  const stateDir = resolveStateDir(env);
   try {
     const override = await readEndpointOverride(stateDir);
     if (override) endpoint = override;
@@ -178,6 +197,200 @@ async function runDevices(deps: CliDeps): Promise<number> {
   return 0;
 }
 
+function loginCursorUsageMessage(): string {
+  return (
+    "usage: tokenleader login-cursor [--auto | <WorkosCursorSessionToken> | -]\n" +
+    "  Recommended on macOS:\n" +
+    "    tokenleader login-cursor --auto\n" +
+    "    Reads your Cursor IDE login from ~/Library/Application Support/Cursor/...\n" +
+    "  Manual fallback:\n" +
+    "    Copy the WorkosCursorSessionToken cookie from cursor.com (DevTools → Application → Cookies).\n" +
+    "    Pass `-` to read the token from stdin (keeps it out of your shell history):\n" +
+    "      pbpaste | tokenleader login-cursor -"
+  );
+}
+
+async function runLoginCursorAuto(deps: CliDeps): Promise<{
+  sessionToken: string;
+  email: string;
+  refreshToken: string;
+  machineId: string;
+}> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const extract = deps.extractCursorSession ?? extractCursorSessionToken;
+  if (!deps.extractCursorSession && process.platform !== "darwin") {
+    throw new Error("login-cursor --auto is supported on macOS only");
+  }
+  const { sessionToken, email, machineId, auth } = await extract({ fetchImpl });
+  return {
+    sessionToken,
+    email,
+    refreshToken: auth.refreshToken,
+    machineId,
+  };
+}
+
+async function runLoginCursor(deps: CliDeps, args: string[]): Promise<number> {
+  const print = deps.print ?? console.log;
+  const env = deps.env ?? process.env;
+  const arg0 = (args[0] ?? "").trim();
+
+  if (arg0 === "--auto") {
+    if (args.length > 1) {
+      throw new Error(loginCursorUsageMessage());
+    }
+    print("Reading Cursor session from local IDE storage...");
+    const { sessionToken, email, refreshToken, machineId } = await runLoginCursorAuto(deps);
+    const stateDir = resolveStateDir(env);
+    await saveCursorCredentials(stateDir, {
+      sessionToken,
+      refreshToken,
+      machineId,
+      email,
+    });
+    print(`Authenticated as: ${email}`);
+    print(`Cursor credentials saved to ${path.join(stateDir, "cursor_credentials.json")}`);
+
+    // Credentials are already on disk; the post-login sync is a convenience.
+    // Only swallow errors from the setup path (e.g. daemon not linked yet);
+    // runCursorCloudSync reports fetch/post failures via posted=false below.
+    const loadFn = deps.loadState ?? loadState;
+    const saveFn = deps.saveState ?? saveState;
+    let ctx: Awaited<ReturnType<typeof resolveCliContext>>;
+    let state: Awaited<ReturnType<typeof loadFn>>;
+    try {
+      ctx = await resolveCliContext(deps);
+      state = await loadFn(stateDir);
+    } catch (err: unknown) {
+      print(
+        `Warning: skipped post-login sync (${String((err as Error)?.message ?? err)}). Run \`tokenleader link\` and then \`tokenleader sync-cursor\` when ready.`,
+      );
+      return 0;
+    }
+
+    print("Syncing current month usage from Cursor Cloud...");
+    const r = await runCursorCloudSync({
+      user: ctx.user,
+      stateDir,
+      state,
+      transport: {
+        endpoint: ctx.endpoint,
+        secret: ctx.secret,
+        batchSize: DEFAULT_BATCH_SIZE,
+        ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+      },
+      mode: "month",
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    });
+    if (!r.posted) {
+      print(
+        "Warning: could not post Cursor usage to the leaderboard — credentials are saved; run `tokenleader sync-cursor` when the server is reachable.",
+      );
+      return 0;
+    }
+    // Auth + POST already succeeded; a watermark-save failure is non-fatal
+    // (the next sync re-fetches with overlap), so warn and still return 0.
+    try {
+      await saveFn(stateDir, r.state);
+    } catch (err: unknown) {
+      print(
+        `Warning: synced Cursor usage but couldn't save local state (${String((err as Error)?.message ?? err)}).`,
+      );
+    }
+    print(
+      `Synced ${r.eventsFetched} Cursor events this month (${r.inserted} new, ${r.duplicates} already on server).`,
+    );
+    return 0;
+  }
+
+  // `-` reads the token from stdin so it never lands in argv / shell history.
+  let token = arg0;
+  if (token === "-") {
+    const readStdin = deps.readStdin ?? (() => Bun.stdin.text());
+    token = (await readStdin()).trim();
+  }
+  if (!token) {
+    throw new Error(loginCursorUsageMessage());
+  }
+
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  await validateCursorToken(token, { fetchImpl });
+
+  const stateDir = resolveStateDir(env);
+  await saveCursorToken(stateDir, token);
+  print(`Cursor session token saved to ${path.join(stateDir, "cursor_token")}`);
+  print(
+    "The daemon backfills your full Cursor history automatically in the background; run `tokenleader sync-cursor` to do it now.",
+  );
+  return 0;
+}
+
+async function runSyncCursor(deps: CliDeps): Promise<number> {
+  const print = deps.print ?? console.log;
+  const env = deps.env ?? process.env;
+  const stateDir = resolveStateDir(env);
+  const ctx = await resolveCliContext(deps);
+
+  const token = await loadCursorToken(stateDir);
+  if (!token) {
+    throw new Error(
+      "no cursor session token — run `tokenleader login-cursor --auto` (macOS) or `tokenleader login-cursor <token>` first",
+    );
+  }
+
+  const loadFn = deps.loadState ?? loadState;
+  const saveFn = deps.saveState ?? saveState;
+  const runSync = deps.runCursorCloudSync ?? runCursorCloudSync;
+  const transport = {
+    endpoint: ctx.endpoint,
+    secret: ctx.secret,
+    batchSize: DEFAULT_BATCH_SIZE,
+    ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+  };
+
+  print("Fetching Cursor usage history from the dashboard (this may take a minute)...");
+
+  // sync-cursor backfills *all* history now (the foreground counterpart to the
+  // daemon's chunked background drain). A single call caps at CURSOR_SYNC_FULL_MAX_PAGES,
+  // so loop on the resume watermark until the walk completes. The bound is a
+  // runaway guard far above any real history.
+  let state = await loadFn(stateDir);
+  let fetched = 0;
+  let inserted = 0;
+  let duplicates = 0;
+  let r: Awaited<ReturnType<typeof runSync>>;
+  const MAX_PASSES = 1000;
+  let passes = 0;
+  do {
+    r = await runSync({
+      user: ctx.user,
+      stateDir,
+      state,
+      transport,
+      mode: "full",
+      ...(deps.fetchImpl ? { fetchImpl: deps.fetchImpl } : {}),
+    });
+    if (!r.posted) {
+      throw new Error("cursor cloud sync failed — check your token and server connection");
+    }
+    state = r.state;
+    fetched += r.eventsFetched;
+    inserted += r.inserted;
+    duplicates += r.duplicates;
+    passes += 1;
+  } while (!r.complete && !r.skipped && passes < MAX_PASSES);
+
+  await saveFn(stateDir, state);
+  if (!r.complete && !r.skipped) {
+    print(
+      `Synced ${fetched} Cursor events so far — the history is unusually large; the daemon will finish the backfill on its next ticks.`,
+    );
+  } else {
+    print(`Synced ${fetched} Cursor events (${inserted} new, ${duplicates} already on server).`);
+  }
+  return 0;
+}
+
 async function runRevoke(deps: CliDeps, args: string[]): Promise<number> {
   const print = deps.print ?? console.log;
   const ctx = await resolveCliContext(deps);
@@ -222,6 +435,8 @@ export async function runCliCommand(
   try {
     if (command === "link") return await runLink(deps);
     if (command === "devices") return await runDevices(deps);
+    if (command === "login-cursor") return await runLoginCursor(deps, args);
+    if (command === "sync-cursor") return await runSyncCursor(deps);
     return await runRevoke(deps, args);
   } catch (err: unknown) {
     printErr(`tokenleader ${command}: ${String((err as Error)?.message ?? err)}`);

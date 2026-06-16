@@ -1,12 +1,27 @@
 import { promises as fsp } from "node:fs";
 import type { DaemonState, FileState, TokenEvent } from "../types";
+import {
+  CURSOR_SYNC_BACKFILL_MAX_PAGES,
+  type CursorSyncMode,
+  fetchCursorCloudEvents,
+  nextCursorCloudState,
+} from "./cursor-sync";
+import { loadCursorToken } from "./cursor-token";
 import { log } from "./log";
-import { pruneMissingFiles, saveState } from "./state";
+import { loadState, pruneMissingFiles, saveState } from "./state";
 import { postEvents, type TransportOpts } from "./transport";
 
-import { listClaudeCodeFiles, listCodexFiles } from "../parser/index";
+import {
+  listClaudeCodeFiles,
+  listCodexFiles,
+  listCursorTranscriptFiles,
+  getCursorStateDbPath,
+  isCursorLocalEnabled,
+} from "../parser/index";
 import { parseClaudeCodeFile } from "../parser/claude-code";
 import { parseCodexFile, type CodexSessionTotals } from "../parser/codex";
+import { parseCursorLocal } from "../parser/cursor-local";
+import { parseCursorTranscriptFile } from "../parser/cursor-jsonl";
 
 export interface TickDeps {
   user: string;
@@ -17,11 +32,19 @@ export interface TickDeps {
   // Test seams. Real callers leave these undefined.
   listClaudeCodeFiles?: typeof listClaudeCodeFiles;
   listCodexFiles?: typeof listCodexFiles;
+  listCursorTranscriptFiles?: typeof listCursorTranscriptFiles;
   parseClaudeCodeFile?: typeof parseClaudeCodeFile;
   parseCodexFile?: typeof parseCodexFile;
+  parseCursorLocal?: typeof parseCursorLocal;
+  parseCursorTranscriptFile?: typeof parseCursorTranscriptFile;
+  getCursorStateDbPath?: typeof getCursorStateDbPath;
+  isCursorLocalEnabled?: typeof isCursorLocalEnabled;
+  loadCursorToken?: typeof loadCursorToken;
+  fetchCursorCloudEvents?: typeof fetchCursorCloudEvents;
   postEvents?: typeof postEvents;
   // stat returns mtimeMs. We override in tests.
   statFile?: (path: string) => Promise<{ mtimeMs: number } | null>;
+  loadState?: typeof loadState;
   saveState?: typeof saveState;
   now?: () => number;
 }
@@ -54,6 +77,26 @@ function dedupKey(ev: TokenEvent): string {
 }
 
 /**
+ * Append events to `collected`, rejecting any whose dedup key was already
+ * seen this tick. `seenKeys[i]` overrides the synthesized key for source i
+ * (CC / Cursor parsers report their own); fall back to `dedupKey`.
+ */
+function collectDeduped(
+  events: TokenEvent[],
+  collected: TokenEvent[],
+  seenThisTick: Set<string>,
+  seenKeys?: ReadonlyArray<string | undefined>,
+): void {
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    const k = seenKeys?.[i] ?? dedupKey(ev);
+    if (seenThisTick.has(k)) continue;
+    seenThisTick.add(k);
+    collected.push(ev);
+  }
+}
+
+/**
  * One poll iteration:
  *   1. List all current Claude Code + Codex files.
  *   2. For each, if mtime > recorded mtime (or unknown), parse from offset.
@@ -65,26 +108,62 @@ function dedupKey(ev: TokenEvent): string {
  * Mutates nothing; takes a state in, returns a new state out.
  */
 export async function tick(
-  initial: DaemonState,
+  inMemory: DaemonState,
   deps: TickDeps,
 ): Promise<{ state: DaemonState; result: TickResult }> {
   const listCC = deps.listClaudeCodeFiles ?? listClaudeCodeFiles;
   const listCx = deps.listCodexFiles ?? listCodexFiles;
+  const listCurTx = deps.listCursorTranscriptFiles ?? listCursorTranscriptFiles;
   const parseCC = deps.parseClaudeCodeFile ?? parseClaudeCodeFile;
   const parseCx = deps.parseCodexFile ?? parseCodexFile;
+  const parseCur = deps.parseCursorLocal ?? parseCursorLocal;
+  const parseCurTx = deps.parseCursorTranscriptFile ?? parseCursorTranscriptFile;
+  const cursorDbPathFn = deps.getCursorStateDbPath ?? getCursorStateDbPath;
+  const cursorEnabledFn = deps.isCursorLocalEnabled ?? isCursorLocalEnabled;
+  const loadToken = deps.loadCursorToken ?? loadCursorToken;
+  const fetchCloud = deps.fetchCursorCloudEvents ?? fetchCursorCloudEvents;
   const post = deps.postEvents ?? postEvents;
   const stat = deps.statFile ?? defaultStat;
+  const load = deps.loadState ?? loadState;
   const persist = deps.saveState ?? saveState;
   const now = deps.now ?? Date.now;
 
-  const [ccPaths, cxPaths] = await Promise.all([
+  // The CLI (`sync-cursor`, `login-cursor --auto`) writes cursorCloud /
+  // cursorLocal watermarks to state.json out-of-band. We hold file offsets in
+  // memory but those Cursor watermarks live only on disk, so re-read and merge
+  // them before computing this tick — otherwise our in-memory copy clobbers a
+  // concurrent CLI write. A corrupt/missing file yields emptyState (no-op merge).
+  const onDisk = await load(deps.stateDir);
+  const initial: DaemonState = {
+    ...inMemory,
+    ...(onDisk.cursorCloud ? { cursorCloud: onDisk.cursorCloud } : {}),
+    ...(onDisk.cursorLocal ? { cursorLocal: onDisk.cursorLocal } : {}),
+  };
+
+  const cursorEnabled = cursorEnabledFn();
+  let cursorToken: string | null = null;
+  try {
+    cursorToken = await loadToken(deps.stateDir);
+  } catch (err: unknown) {
+    log.error("cursor_token_load_failed", {
+      err: String((err as Error)?.message ?? err),
+    });
+  }
+  const hasCursorToken = cursorToken !== null;
+
+  // List cursor_transcript paths whenever local Cursor is env-enabled, even when
+  // we end up using cloud — keeping them in presentSet preserves byte offsets
+  // so a cloud→local fallback doesn't re-ingest history from byte 0.
+  const [ccPaths, cxPaths, curTxPaths] = await Promise.all([
     safeList(listCC, "claude_code"),
     safeList(listCx, "codex"),
+    cursorEnabled ? safeList(listCurTx, "cursor_transcript") : Promise.resolve([]),
   ]);
 
   const allPaths = [
     ...ccPaths.map((p) => ({ path: p, kind: "claude_code" as const })),
     ...cxPaths.map((p) => ({ path: p, kind: "codex" as const })),
+    ...curTxPaths.map((p) => ({ path: p, kind: "cursor_transcript" as const })),
   ];
 
   const presentSet = new Set(allPaths.map((x) => x.path));
@@ -95,9 +174,73 @@ export async function tick(
   const seenThisTick = new Set<string>();
   // Pending file updates we will write only after a successful POST.
   const pendingUpdates: FileState[] = [];
+  let pendingCursorLocal: DaemonState["cursorLocal"] | undefined;
+  let pendingCursorCloud:
+    | {
+        mode: CursorSyncMode;
+        startDate: number;
+        events: TokenEvent[];
+        complete: boolean;
+        nextPage?: number;
+      }
+    | undefined;
+
+  // Until the one-time all-time backfill completes (fullSyncDone), pull full
+  // history in bounded chunks drained across ticks via resumePage — so a large
+  // back-catalogue lands automatically in the background without ever blocking
+  // a tick. Once done, switch to the cheap incremental window.
+  const cloudNeedsBackfill = !initial.cursorCloud?.fullSyncDone;
+  const cloudMode: CursorSyncMode = cloudNeedsBackfill ? "full" : "incremental";
+
+  // Run cloud Cursor fetch up front: its outcome decides whether to parse
+  // local Cursor sources this tick (avoids double-counting the same usage
+  // via cloud + local, but falls back to local when the cloud path fails).
+  let cloudReady = false;
+  if (hasCursorToken) {
+    try {
+      const cloud = await fetchCloud({
+        user: deps.user,
+        stateDir: deps.stateDir,
+        state: initial,
+        mode: cloudMode,
+        signal: deps.signal,
+        now,
+        ...(cloudNeedsBackfill ? { maxPages: CURSOR_SYNC_BACKFILL_MAX_PAGES } : {}),
+      });
+      if (!cloud.skipped) {
+        cloudReady = true;
+        pendingCursorCloud = {
+          mode: cloudMode,
+          startDate: cloud.startDate,
+          events: cloud.events,
+          complete: cloud.complete,
+          ...(cloud.complete ? {} : { nextPage: cloud.nextPage }),
+        };
+        if (!cloud.complete) {
+          // Backfill chunking is expected progress (info); an incremental
+          // truncation is an anomaly worth a warning.
+          const evt = cloudNeedsBackfill ? "cursor_cloud_backfill" : "cursor_cloud_truncated";
+          const fields = { pagesFetched: cloud.pagesFetched, nextPage: cloud.nextPage };
+          if (cloudNeedsBackfill) log.info(evt, fields);
+          else log.warn(evt, fields);
+        }
+        collectDeduped(cloud.events, collected, seenThisTick);
+      }
+    } catch (err: unknown) {
+      log.error("cursor_cloud_fetch_failed", {
+        err: String((err as Error)?.message ?? err),
+      });
+    }
+  }
+  const cursorLocalEnabled = cursorEnabled && !cloudReady;
 
   for (const item of allPaths) {
     if (deps.signal?.aborted) break;
+
+    // Cloud Cursor already covered this user's transcript usage this tick;
+    // skip parsing to avoid double-counting. The path is still in presentSet
+    // so its FileState (byte offset) survives for cloud→local fallback.
+    if (item.kind === "cursor_transcript" && !cursorLocalEnabled) continue;
 
     const prev = initial.files[item.path];
     if (!prev) newFiles++;
@@ -129,15 +272,7 @@ export async function tick(
           byteOffset,
           user: deps.user,
         });
-        const accepted: TokenEvent[] = [];
-        for (let i = 0; i < r.events.length; i++) {
-          const ev = r.events[i]!;
-          const k = r.seenDedupKeys[i] ?? dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          accepted.push(ev);
-        }
-        for (const ev of accepted) collected.push(ev);
+        collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
         if (r.oversizeSkipped) {
           log.warn("oversize_record_skipped", {
             path: item.path,
@@ -151,6 +286,28 @@ export async function tick(
           byteOffset: r.newOffset,
           ...(prev?.lastSessionTotals ? { lastSessionTotals: prev.lastSessionTotals } : {}),
         });
+      } else if (item.kind === "cursor_transcript") {
+        const r = await parseCurTx({
+          path: item.path,
+          byteOffset,
+          user: deps.user,
+          fileMtimeMs: st.mtimeMs,
+          startingLineIndex: prev?.transcriptLineIndex ?? 0,
+        });
+        collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
+        if (r.oversizeSkipped) {
+          log.warn("oversize_record_skipped", {
+            path: item.path,
+            kind: item.kind,
+            count: r.oversizeSkipped,
+          });
+        }
+        pendingUpdates.push({
+          path: item.path,
+          mtimeMs: st.mtimeMs,
+          byteOffset: r.newOffset,
+          transcriptLineIndex: r.nextLineIndex,
+        });
       } else {
         const prevTotals = toCodexTotals(prev?.lastSessionTotals);
         const r = await parseCx({
@@ -159,12 +316,7 @@ export async function tick(
           user: deps.user,
           ...(prevTotals ? { prevSessionTotals: prevTotals } : {}),
         });
-        for (const ev of r.events) {
-          const k = dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          collected.push(ev);
-        }
+        collectDeduped(r.events, collected, seenThisTick);
         if (r.oversizeSkipped) {
           log.warn("oversize_record_skipped", {
             path: item.path,
@@ -193,22 +345,46 @@ export async function tick(
     }
   }
 
+  if (cursorLocalEnabled) {
+    const cursorDbPath = cursorDbPathFn();
+    const dbStat = await stat(cursorDbPath);
+    if (dbStat) {
+      eligible++;
+      const prevCursor = initial.cursorLocal;
+      const lastRowid = prevCursor?.dbPath === cursorDbPath ? (prevCursor.lastRowid ?? 0) : 0;
+      try {
+        const r = parseCur({
+          dbPath: cursorDbPath,
+          lastRowid,
+          user: deps.user,
+          dbMtimeMs: dbStat.mtimeMs,
+        });
+        collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
+        pendingCursorLocal = { dbPath: cursorDbPath, lastRowid: r.newRowid };
+      } catch (err: unknown) {
+        log.error("parse_failed", {
+          path: cursorDbPath,
+          kind: "cursor_local",
+          err: String((err as Error)?.message ?? err),
+        });
+      }
+    }
+  }
+
   log.info("tick_collected", {
     scanned: allPaths.length,
     eligible,
     events: collected.length,
     newFiles,
+    cursorCloud: cloudReady,
   });
 
-  // POST events first — only persist state on success.
+  // POST events — only persist state on success.
   let posted = false;
   let inserted = 0;
   let duplicates = 0;
 
   if (collected.length === 0) {
-    // Nothing to send, but file mtimes may have advanced (e.g. user just
-    // opened a new session that produced no usage events yet). Persist
-    // pending offsets anyway so we don't keep re-reading.
     posted = true;
   } else {
     const r = await post(collected, deps.transport, deps.signal);
@@ -222,13 +398,29 @@ export async function tick(
 
   let nextState = initial;
   if (posted) {
-    // Apply pending updates and prune missing files.
     let merged = initial;
+    if (pendingCursorCloud) {
+      // `full` mode latches fullSyncDone only when the all-time walk completes;
+      // an unfinished backfill keeps fullSyncDone false and pins resumePage so
+      // the next tick continues the chunked drain.
+      merged = nextCursorCloudState(
+        merged,
+        pendingCursorCloud.mode,
+        pendingCursorCloud.events,
+        now(),
+        pendingCursorCloud.complete,
+        pendingCursorCloud.nextPage,
+        pendingCursorCloud.startDate,
+      );
+    }
     for (const u of pendingUpdates) {
       merged = {
         ...merged,
         files: { ...merged.files, [u.path]: u },
       };
+    }
+    if (pendingCursorLocal) {
+      merged = { ...merged, cursorLocal: pendingCursorLocal };
     }
     merged = pruneMissingFiles(merged, presentSet);
     merged = { ...merged, lastFlushAt: now() };

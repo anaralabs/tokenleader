@@ -25,8 +25,11 @@ The dashboard shows who's burning the most tokens, what it costs, and which mode
 tokenleader ships **token counts, model names, and timestamps — never message content.**
 
 - The daemon reads only the local session logs of your coding tools
-  (`~/.claude/projects/`, `~/.codex/sessions/`). No keylogger, no clipboard, no network
-  sniffing.
+  (`~/.claude/projects/`, `~/.codex/sessions/`, and Cursor's local `state.vscdb`). No
+  keylogger, no clipboard, no network sniffing.
+- The one outbound call beyond your server is opt-in: if you run `tokenleader
+  login-cursor`, the daemon fetches your own usage totals from Cursor's dashboard API
+  (token counts and costs, not message content) and forwards them on.
 - Each report also carries opaque session/message IDs — used purely for de-duplication,
   so re-posting an event can never double-count.
 - Want certainty? The daemon source is in this repo. Read it and build it yourself
@@ -43,7 +46,7 @@ tokenleader ships **token counts, model names, and timestamps — never message 
 │ parses local session logs │ ──────────► │                                             │
 │  ~/.claude/projects       │  POST       │  /            dashboard                     │
 │  ~/.codex/sessions        │  /ingest    │  /ingest      token counts in               │
-│                           │             │  /install     daemon installer out          │
+│  Cursor state.vscdb       │             │  /install     daemon installer out          │
 │ posts only token counts   │ ◄────────── │  /manifest.json + /bin/*   daemon updates   │
 │ + metadata, never content │  GET        │  /api/v1/usage             totals for bots  │
 │                           │  hourly     │                                             │
@@ -136,11 +139,13 @@ curl -fsSL https://leaderboard.example.com/uninstall | bash
 
 ## Supported sources
 
-| Source      | How                                                        | Default |
-|-------------|------------------------------------------------------------|---------|
-| Claude Code | daemon parses `~/.claude/projects/` locally                | on      |
-| Codex CLI   | daemon parses `~/.codex/sessions/` locally                 | on      |
-| Cursor      | server-side mirror via Cursor Teams Admin API (no daemon)  | off — needs an admin key, see [docs/configuration.md](docs/configuration.md#cursor-mirror) |
+| Source         | How                                                         | Default |
+|----------------|-------------------------------------------------------------|---------|
+| Claude Code    | daemon parses `~/.claude/projects/` locally                 | on      |
+| Codex CLI      | daemon parses `~/.codex/sessions/` locally                  | on      |
+| Cursor (local) | daemon parses Cursor's local `state.vscdb` SQLite (personal)| on      |
+| Cursor (cloud) | daemon syncs your personal usage from Cursor's dashboard API after `tokenleader login-cursor` — accurate models, tokens, and costs | off — opt in per machine, see [docs/daemon.md](docs/daemon.md#cursor-cloud-sync-recommended) |
+| Cursor (team)  | server-side mirror via Cursor Teams Admin API (no daemon)   | off — needs an admin key, see [docs/configuration.md](docs/configuration.md#cursor-mirror) |
 
 ## API
 

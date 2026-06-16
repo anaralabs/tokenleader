@@ -1,4 +1,4 @@
-export type Source = "claude_code" | "codex" | "cursor";
+export type Source = "claude_code" | "codex" | "cursor" | "cursor_local";
 
 export type MessageType = "user" | "assistant";
 
@@ -43,6 +43,8 @@ export interface FileState {
   path: string;
   mtimeMs: number;
   byteOffset: number;
+  /** Lines fully parsed in a Cursor transcript JSONL (stable message ids). */
+  transcriptLineIndex?: number;
   lastSessionTotals?: {
     sessionId: string;
     inputTokens: number;
@@ -52,8 +54,30 @@ export interface FileState {
   };
 }
 
+export interface CursorLocalState {
+  dbPath: string;
+  lastRowid: number;
+}
+
+export interface CursorCloudState {
+  /** Wall-clock ms when cloud sync last completed successfully. */
+  lastSyncAt: number;
+  /** Highest event timestamp seen from the dashboard API. */
+  lastEventTimestamp?: number;
+  /** Set once an all-time `full` backfill walk has completed. */
+  fullSyncDone?: boolean;
+  /** 1-based page to resume from when a fetch stopped at the page cap. */
+  resumePage?: number;
+  /** startDate the pending `resumePage` belongs to (guards cross-window reuse). */
+  resumeStartDate?: number;
+}
+
 export interface DaemonState {
   schemaVersion: 1;
   files: Record<string, FileState>;
   lastFlushAt: number;
+  /** Read-only Cursor SQLite watermark (daemon-only bookkeeping). */
+  cursorLocal?: CursorLocalState;
+  /** Cursor dashboard cloud sync watermark (daemon-only bookkeeping). */
+  cursorCloud?: CursorCloudState;
 }

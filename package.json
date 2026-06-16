@@ -23,6 +23,7 @@
   "scripts": {
     "dev:server": "bun run --hot src/server/main.ts",
     "dev:daemon": "bun run src/daemon/main.ts",
+    "cli": "bun run src/daemon/main.ts",
     "build:server": "bun build src/server/main.ts --compile --outfile bin/anara-leaderboard-server",
     "build:daemon": "bash scripts/build-daemon.sh '' bin/anara-leaderboard",
     "build:daemon-arm64": "bash scripts/build-daemon.sh bun-darwin-arm64 bin/anara-leaderboard-arm64",

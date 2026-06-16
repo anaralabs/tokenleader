@@ -389,6 +389,7 @@ export interface ApiUsageRow {
 export class Store {
   readonly db: Database;
   private readonly insertStmt: Statement;
+  private readonly deleteCursorLocalInSpanStmt: Statement;
   private readonly countStmt: Statement<{ c: number }>;
   private readonly userTotalsStmt: Statement<UserTotalsRow, [string, number, number]>;
   private readonly userByModelStmt: Statement<ModelRow, [string, number, number]>;
@@ -499,6 +500,17 @@ export class Store {
                $model, $messageType, $inputTokens, $outputTokens, $cacheCreationTokens,
                $cacheReadTokens, $reasoningTokens, $costUsdMicros, $ingestedAt)
        ON CONFLICT DO NOTHING`,
+    );
+    // Cloud `cursor` timestamps (per-request epoch-ms) and `cursor_local`
+    // timestamps (composer createdAt / DB mtime) are never byte-equal, so the
+    // reconcile keys on a coarser span: drop a user's cursor_local assistant
+    // rows that fall inside the [min, max] timestamp span of that user's
+    // incoming cloud `cursor` events. Inclusive bounds — a local row exactly
+    // at an edge is covered by the cloud data.
+    this.deleteCursorLocalInSpanStmt = this.db.prepare(
+      `DELETE FROM events
+       WHERE user = $user AND source = 'cursor_local' AND messageType = 'assistant'
+         AND timestamp BETWEEN $min AND $max`,
     );
     this.countStmt = this.db.prepare<{ c: number }, []>("SELECT COUNT(*) AS c FROM events");
     // Token-aggregation queries restrict to messageType='assistant': user
@@ -988,6 +1000,24 @@ export class Store {
     const now = Date.now();
     let inserted = 0;
     const tx = this.db.transaction((batch: TokenEvent[]) => {
+      // Per-user [min, max] timestamp span of this batch's cloud `cursor`
+      // events. Reconcile deletes the user's overlapping cursor_local rows
+      // before the inserts below, so the transition off the local fallback
+      // doesn't double-count.
+      const reconcileSpans = new Map<string, { min: number; max: number }>();
+      for (const e of batch) {
+        if (e.source !== "cursor") continue;
+        const span = reconcileSpans.get(e.user);
+        if (!span) {
+          reconcileSpans.set(e.user, { min: e.timestamp, max: e.timestamp });
+        } else {
+          if (e.timestamp < span.min) span.min = e.timestamp;
+          if (e.timestamp > span.max) span.max = e.timestamp;
+        }
+      }
+      for (const [user, span] of reconcileSpans) {
+        this.deleteCursorLocalInSpanStmt.run({ $user: user, $min: span.min, $max: span.max });
+      }
       for (const e of batch) {
         const res = this.insertStmt.run({
           $user: e.user,

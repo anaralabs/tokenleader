@@ -2,9 +2,10 @@
 
 A single compiled binary per teammate Mac, installed by your server's
 `/install` script, kept current by its own auto-updater. It parses the local
-session logs of Claude Code (`~/.claude/projects/`) and Codex CLI
-(`~/.codex/sessions/`) and POSTs **token counts, model names, and timestamps —
-never message content** — to your server every 5 minutes.
+session logs of Claude Code (`~/.claude/projects/`), Codex CLI
+(`~/.codex/sessions/`), and Cursor personal usage (read-only parse of
+`state.vscdb` under Cursor's `globalStorage`) and POSTs **token counts, model
+names, and timestamps — never message content** — to your server every 5 minutes.
 
 ## Install
 
@@ -47,8 +48,41 @@ continues under the same handle.
 | `~/.local/share/tokenleader/` | state dir: `secret` (TOFU identity), `state.json` (per-file read offsets), optional `endpoint` (server-migration override) |
 | `~/Library/Logs/tokenleader/` | structured logs (`daemon.jsonl`, rotated at 5 MB ×3) |
 
-Nothing else: it reads `~/.claude/projects/` and `~/.codex/sessions/`, writes
-only the four locations above.
+Nothing else: it reads `~/.claude/projects/`, `~/.codex/sessions/`, Cursor's
+local SQLite store (`state.vscdb`), and agent transcript JSONL files under
+`~/.cursor/projects/*/agent-transcripts/`, writes only the four locations above.
+
+Local Cursor parsing is on by default. Disable with `TOKENLEADER_CURSOR_LOCAL=0`
+in the LaunchAgent env. Override the DB location with `CURSOR_DATA_DIR` pointing
+at Cursor's `User/globalStorage` directory (same shape as `CLAUDE_CONFIG_DIR`).
+
+### Cursor cloud sync (recommended)
+
+For accurate models, token counts, and costs, authenticate against Cursor's
+dashboard API instead of relying on local heuristics:
+
+```bash
+# macOS — reads your signed-in Cursor IDE session automatically
+tokenleader login-cursor --auto
+
+# manual fallback (any platform with a browser session cookie)
+tokenleader login-cursor '<WorkosCursorSessionToken>'
+
+# backfill ALL dashboard history immediately (optional — see below)
+tokenleader sync-cursor
+```
+
+`login-cursor --auto` saves credentials to `<stateDir>/cursor_credentials.json`
+(session token, refresh token, machine id) and `cursor_token`, then posts the
+**current month** right away for instant feedback. Requires the server build that
+accepts `source: "cursor"` on `/ingest` — deploy server and daemon together.
+
+Once a token is saved, the daemon backfills your **full** dashboard history
+automatically in the background: until the one-time all-time backfill finishes it
+pulls history in bounded chunks (~2,500 events per tick) so a large back-catalogue
+never blocks a tick, then settles into a cheap incremental window. `sync-cursor`
+just does that same full backfill immediately in the foreground — handy if you
+don't want to wait for the daemon to drain it across a few ticks.
 
 ## Identity: how TOFU works
 

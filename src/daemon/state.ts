@@ -48,6 +48,23 @@ function isDaemonState(value: unknown): value is DaemonState {
   if (typeof v.lastFlushAt !== "number") return false;
   if (!v.files || typeof v.files !== "object") return false;
   if (v.rescanGeneration !== undefined && typeof v.rescanGeneration !== "number") return false;
+  if (v.cursorLocal !== undefined) {
+    if (!v.cursorLocal || typeof v.cursorLocal !== "object") return false;
+    const c = v.cursorLocal as Record<string, unknown>;
+    if (typeof c.dbPath !== "string") return false;
+    if (typeof c.lastRowid !== "number") return false;
+  }
+  if (v.cursorCloud !== undefined) {
+    if (!v.cursorCloud || typeof v.cursorCloud !== "object") return false;
+    const c = v.cursorCloud as Record<string, unknown>;
+    if (typeof c.lastSyncAt !== "number") return false;
+    if (c.lastEventTimestamp !== undefined && typeof c.lastEventTimestamp !== "number") {
+      return false;
+    }
+    if (c.fullSyncDone !== undefined && typeof c.fullSyncDone !== "boolean") return false;
+    if (c.resumePage !== undefined && typeof c.resumePage !== "number") return false;
+    if (c.resumeStartDate !== undefined && typeof c.resumeStartDate !== "number") return false;
+  }
   for (const fs of Object.values(v.files as Record<string, unknown>)) {
     if (!fs || typeof fs !== "object") return false;
     const f = fs as Record<string, unknown>;

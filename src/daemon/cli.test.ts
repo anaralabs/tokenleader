@@ -5,7 +5,9 @@ import { describe, expect, test } from "bun:test";
 import { promises as fsp } from "node:fs";
 import { join } from "node:path";
 import { makeTmpDir } from "../test-helpers.ts";
+import { CURSOR_USAGE_SUMMARY_API } from "../parser/cursor-api.ts";
 import { type CliDeps, parsePlistEnv, runCliCommand } from "./cli.ts";
+import { CURSOR_TOKEN_FILENAME, CURSOR_CREDENTIALS_FILENAME } from "./cursor-token.ts";
 import { deviceLabelFromHost, ensureCliSymlink } from "./main.ts";
 
 const PLIST = `<?xml version="1.0" encoding="UTF-8"?>
@@ -83,7 +85,7 @@ describe("ensureCliSymlink", () => {
       const bin = join(dir, "bun");
       await fsp.writeFile(bin, "");
       await ensureCliSymlink(bin);
-      expect(fsp.lstat(join(dir, "tokenleader"))).rejects.toThrow();
+      await expect(fsp.lstat(join(dir, "tokenleader"))).rejects.toThrow();
     } finally {
       await cleanup();
     }
@@ -295,6 +297,262 @@ describe("runCliCommand", () => {
       });
       expect(await runCliCommand("link", [], deps)).toBe(1);
       expect(err.join("\n")).toContain("secret mismatch");
+    });
+  });
+
+  test("login-cursor --auto: extracts, validates, saves credentials, and syncs month", async () => {
+    await withSecretDir(async (stateDir) => {
+      const calls: StubCall[] = [];
+      const { deps, out } = makeDeps({
+        stateDir,
+        calls,
+        responses: [{ status: 200, json: { inserted: 2, duplicates: 0 } }],
+      });
+      deps.extractCursorSession = async () => ({
+        sessionToken: "user_abc::jwt-token",
+        email: "alice@example.com",
+        machineId: "machine-abc",
+        auth: {
+          accessToken: "jwt-token",
+          refreshToken: "refresh",
+          cachedEmail: "alice@example.com",
+          serviceMachineId: null,
+        },
+      });
+      expect(await runCliCommand("login-cursor", ["--auto"], deps)).toBe(0);
+      const saved = (await fsp.readFile(join(stateDir, CURSOR_TOKEN_FILENAME), "utf8")).trim();
+      expect(saved).toBe("user_abc::jwt-token");
+      const creds = JSON.parse(
+        await fsp.readFile(join(stateDir, CURSOR_CREDENTIALS_FILENAME), "utf8"),
+      );
+      expect(creds.refreshToken).toBe("refresh");
+      expect(creds.machineId).toBe("machine-abc");
+      expect(out.join("\n")).toContain("Authenticated as: alice@example.com");
+      expect(out.join("\n")).toContain("Synced");
+      expect(calls.length).toBe(1);
+    });
+  });
+
+  test("login-cursor --auto: warns but succeeds when month sync cannot post", async () => {
+    await withSecretDir(async (stateDir) => {
+      const ingestCalls: unknown[][] = [];
+      const out: string[] = [];
+      const err: string[] = [];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: stateDir },
+        readPlist: async () => PLIST,
+        extractCursorSession: async () => ({
+          sessionToken: "user_abc::jwt-token",
+          email: "alice@example.com",
+          machineId: "machine-abc",
+          auth: {
+            accessToken: "jwt-token",
+            refreshToken: "refresh",
+            cachedEmail: "alice@example.com",
+            serviceMachineId: null,
+          },
+        }),
+        fetchImpl: (async (input: unknown, init?: RequestInit) => {
+          const url = String(input);
+          if (url.includes("cursor.com")) {
+            return new Response(
+              JSON.stringify({
+                usageEventsDisplay: [
+                  {
+                    timestamp: "1704067200000",
+                    model: "claude-4.5-sonnet",
+                    tokenUsage: { inputTokens: 10, outputTokens: 5, totalCents: 1.0 },
+                  },
+                ],
+              }),
+              { headers: { "Content-Type": "application/json" } },
+            );
+          }
+          const req = new Request(url, init);
+          ingestCalls.push((await req.json()) as unknown[]);
+          return new Response(JSON.stringify({ error: "down" }), { status: 403 });
+        }) as unknown as typeof fetch,
+        print: (l) => out.push(l),
+        printErr: (l) => err.push(l),
+      };
+      expect(await runCliCommand("login-cursor", ["--auto"], deps)).toBe(0);
+      expect(out.join("\n")).toContain("Authenticated as: alice@example.com");
+      expect(out.join("\n")).toContain("Warning: could not post");
+      expect(ingestCalls.length).toBeGreaterThan(0);
+    });
+  });
+
+  test("login-cursor: validates token, saves cursor_token with 0o600", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-cli-cursor-");
+    try {
+      const calls: Array<{ url: string; method: string; cookie: string | null }> = [];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: dir },
+        fetchImpl: (async (_input: unknown, init?: RequestInit) => {
+          const req = new Request(CURSOR_USAGE_SUMMARY_API, init);
+          calls.push({
+            url: req.url,
+            method: req.method,
+            cookie: req.headers.get("Cookie"),
+          });
+          return new Response(JSON.stringify({ membershipType: "pro" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as unknown as typeof fetch,
+        print: () => {},
+        printErr: () => {},
+      };
+      expect(await runCliCommand("login-cursor", ["session-token-abc"], deps)).toBe(0);
+      expect(calls[0]!.method).toBe("GET");
+      expect(calls[0]!.cookie).toBe("WorkosCursorSessionToken=session-token-abc");
+      const saved = (await fsp.readFile(join(dir, CURSOR_TOKEN_FILENAME), "utf8")).trim();
+      expect(saved).toBe("session-token-abc");
+      const st = await fsp.stat(join(dir, CURSOR_TOKEN_FILENAME));
+      expect(st.mode & 0o777).toBe(0o600);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("login-cursor: rejects invalid token without writing cursor_token", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-cli-cursor-bad-");
+    try {
+      const err: string[] = [];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: dir },
+        fetchImpl: (async () =>
+          new Response("unauthorized", { status: 401 })) as unknown as typeof fetch,
+        print: () => {},
+        printErr: (l) => err.push(l),
+      };
+      expect(await runCliCommand("login-cursor", ["bad-token"], deps)).toBe(1);
+      expect(err.join("\n")).toContain("session token rejected");
+      await expect(fsp.readFile(join(dir, CURSOR_TOKEN_FILENAME), "utf8")).rejects.toThrow();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("login-cursor: missing token arg is a usage error", async () => {
+    const { dir, cleanup } = await makeTmpDir("tokenleader-cli-cursor-usage-");
+    try {
+      const err: string[] = [];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: dir },
+        print: () => {},
+        printErr: (l) => err.push(l),
+      };
+      expect(await runCliCommand("login-cursor", [], deps)).toBe(1);
+      expect(err.join("\n")).toContain("usage: tokenleader login-cursor");
+      expect(err.join("\n")).toContain("--auto");
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("sync-cursor: full backfill posts events and saves cursorCloud state", async () => {
+    await withSecretDir(async (stateDir) => {
+      await fsp.writeFile(join(stateDir, "cursor_token"), "session-token\n", { mode: 0o600 });
+      const ingestCalls: unknown[][] = [];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: stateDir },
+        // Inject the fixture plist so resolveCliContext doesn't read the host's
+        // real LaunchAgent (USER/ENDPOINT) — otherwise this passes only on a
+        // machine with the daemon installed and fails on a clean CI runner.
+        readPlist: async () => PLIST,
+        fetchImpl: (async (input: unknown, init?: RequestInit) => {
+          const url = String(input);
+          if (url.includes("cursor.com")) {
+            return new Response(
+              JSON.stringify({
+                totalUsageEventsCount: 1,
+                usageEventsDisplay: [
+                  {
+                    timestamp: "1704067200000",
+                    model: "claude-4.5-sonnet",
+                    tokenUsage: { inputTokens: 10, outputTokens: 5, totalCents: 1.0 },
+                  },
+                ],
+              }),
+              { headers: { "Content-Type": "application/json" } },
+            );
+          }
+          const req = new Request(url, init);
+          ingestCalls.push((await req.json()) as unknown[]);
+          return new Response(JSON.stringify({ inserted: 1, duplicates: 0 }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }) as unknown as typeof fetch,
+        print: () => {},
+        printErr: (l) => err.push(l),
+      };
+      const err: string[] = [];
+      expect(await runCliCommand("sync-cursor", [], deps)).toBe(0);
+      expect(ingestCalls.length).toBe(1);
+      const state = JSON.parse(await fsp.readFile(join(stateDir, "state.json"), "utf8"));
+      expect(state.cursorCloud.fullSyncDone).toBe(true);
+      expect(state.cursorCloud.lastSyncAt).toBeGreaterThan(0);
+    });
+  });
+
+  test("login-cursor -: reads the token from stdin (keeps it out of argv)", async () => {
+    await withSecretDir(async (stateDir) => {
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: stateDir },
+        readStdin: async () => "  piped-session-token\n",
+        fetchImpl: (async () =>
+          new Response("{}", {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          })) as unknown as typeof fetch,
+        print: () => {},
+        printErr: () => {},
+      };
+      expect(await runCliCommand("login-cursor", ["-"], deps)).toBe(0);
+      const saved = await fsp.readFile(join(stateDir, CURSOR_TOKEN_FILENAME), "utf8");
+      expect(saved.trim()).toBe("piped-session-token");
+    });
+  });
+
+  test("sync-cursor: drains a truncated backfill across passes until complete", async () => {
+    await withSecretDir(async (stateDir) => {
+      await fsp.writeFile(join(stateDir, CURSOR_TOKEN_FILENAME), "session-token\n", {
+        mode: 0o600,
+      });
+      let passes = 0;
+      const runSync = (async (o: { state: Record<string, unknown> }) => {
+        passes += 1;
+        const complete = passes >= 3;
+        return {
+          state: {
+            ...o.state,
+            cursorCloud: complete
+              ? { lastSyncAt: passes, fullSyncDone: true }
+              : { lastSyncAt: passes, resumePage: passes + 1, resumeStartDate: 0 },
+          },
+          eventsFetched: 10,
+          eventsPosted: 10,
+          inserted: 10,
+          duplicates: 0,
+          posted: true,
+          skipped: false,
+          complete,
+          ...(complete ? {} : { nextPage: passes + 1 }),
+        };
+      }) as unknown as CliDeps["runCursorCloudSync"];
+      const deps: CliDeps = {
+        env: { TOKENLEADER_STATE_DIR: stateDir },
+        readPlist: async () => PLIST,
+        runCursorCloudSync: runSync,
+        print: () => {},
+        printErr: () => {},
+      };
+      expect(await runCliCommand("sync-cursor", [], deps)).toBe(0);
+      expect(passes).toBe(3);
+      const state = JSON.parse(await fsp.readFile(join(stateDir, "state.json"), "utf8"));
+      expect(state.cursorCloud.fullSyncDone).toBe(true);
     });
   });
 });
