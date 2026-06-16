@@ -57,6 +57,31 @@ describe("parseClaudeCodeFile (synthetic)", () => {
     expect(r.seenDedupKeys).toEqual(["msg-001:req-1", "msg-002:req-2"]);
   });
 
+  it("stamps a custom source (claude_cowork) on every event when asked", async () => {
+    const path = await makeTempJsonl([
+      JSON.stringify({ type: "user", uuid: "u-1", message: { content: "hi" } }),
+      JSON.stringify(baseAssistant),
+    ]);
+    const r = await parseClaudeCodeFile({
+      path,
+      byteOffset: 0,
+      user: "k",
+      source: "claude_cowork",
+    });
+    expect(r.events.length).toBe(2);
+    expect(r.events.every((e) => e.source === "claude_cowork")).toBe(true);
+    // Token math is unchanged — same parser, different tag only.
+    const asst = r.events.find((e) => e.messageType === "assistant")!;
+    expect(asst.inputTokens).toBe(10);
+    expect(asst.outputTokens).toBe(20);
+  });
+
+  it("defaults source to claude_code when none is passed", async () => {
+    const path = await makeTempJsonl([JSON.stringify(baseAssistant)]);
+    const r = await parseClaudeCodeFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events[0]!.source).toBe("claude_code");
+  });
+
   it("dedupes within a single read", async () => {
     const path = await makeTempJsonl([
       JSON.stringify(baseAssistant),

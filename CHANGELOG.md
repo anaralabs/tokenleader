@@ -9,6 +9,15 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [Unreleased]
+
+### Added
+- Claude Cowork support: the daemon also parses Claude Desktop "local agent
+  mode" sessions (byte-identical JSONL under the Desktop data dir), tagged
+  `claude_cowork` so they report separately from CLI usage. On by default;
+  `TOKENLEADER_CLAUDE_COWORK=0` disables. Cloud/remote Cowork runs server-side
+  and leaves nothing on disk, so it is out of scope.
+
 ## [0.3.0] - 2026-06-17
 
 Cursor cloud sync, contributed by @octavi42 (#2).
@@ -102,6 +111,7 @@ never message content.
 - Docs set: self-hosting, configuration reference, daemon guide, API
   reference, update/rollback runbook.
 
+[Unreleased]: https://github.com/anaralabs/tokenleader/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/anaralabs/tokenleader/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/anaralabs/tokenleader/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/anaralabs/tokenleader/compare/v0.2.0...v0.2.1

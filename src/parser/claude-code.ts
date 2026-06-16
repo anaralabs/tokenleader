@@ -1,10 +1,13 @@
-import type { TokenEvent } from "../types.ts";
+import type { Source, TokenEvent } from "../types.ts";
 import { readNewlineLines } from "./read-slice.ts";
 
 export interface ParseClaudeCodeOptions {
   path: string;
   byteOffset: number;
   user: string;
+  /** Source tag for emitted events; defaults to "claude_code". Cowork passes
+   *  "claude_cowork" since its JSONL is the same format. */
+  source?: Source;
 }
 
 export interface ParseClaudeCodeResult {
@@ -62,6 +65,7 @@ export async function parseClaudeCodeFile(
   opts: ParseClaudeCodeOptions,
 ): Promise<ParseClaudeCodeResult> {
   const { path, byteOffset, user } = opts;
+  const source: Source = opts.source ?? "claude_code";
 
   const file = Bun.file(path);
   const totalSize = file.size;
@@ -122,7 +126,7 @@ export async function parseClaudeCodeFile(
       localSeen.add(dedupKey);
       events.push({
         user,
-        source: "claude_code",
+        source,
         sessionId,
         messageId: raw.uuid,
         requestId: null,
@@ -162,7 +166,7 @@ export async function parseClaudeCodeFile(
 
     events.push({
       user,
-      source: "claude_code",
+      source,
       sessionId,
       messageId: msg.id,
       requestId,

@@ -111,6 +111,8 @@ Out-of-range numerics clamp; truthy flags accept `1`, `true`, `yes`, `on`.
 | `TOKENLEADER_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
 | `TOKENLEADER_LOG_DIR` | `~/Library/Logs/tokenleader` | Structured JSONL log location (`daemon.jsonl`, rotated at 5 MB, 3 rotations kept). |
 | `TOKENLEADER_LOG_FILE_DISABLED` | off | `1` skips the file sink entirely (logs to stdout/stderr only). |
+| `TOKENLEADER_CLAUDE_COWORK` | on | Parse Claude Cowork (Claude Desktop "local agent mode") sessions, tagged `claude_cowork`. Set `0` to disable. Cloud/remote Cowork runs server-side and leaves nothing on disk, so it is never tracked regardless. |
+| `TOKENLEADER_CLAUDE_COWORK_DIR` | macOS: `~/Library/Application Support/Claude` · Linux: `~/.config/Claude` · Windows: `%APPDATA%/Claude` | Claude Desktop data dir scanned for Cowork session transcripts. Override for non-default installs. |
 | `TOKENLEADER_TOKEN` | unset | **Legacy.** A historical shared bearer token. Parsed so old plists don't crash, never sent — the per-user TOFU secret replaced it. |
 
 ## Installer / uninstaller

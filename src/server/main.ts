@@ -31,6 +31,7 @@ const MAX_EVENTS_PER_REQUEST = 1000;
 const MAX_COST_USD_MICROS = 100_000_000;
 const VALID_SOURCES: ReadonlySet<Source> = new Set([
   "claude_code",
+  "claude_cowork",
   "codex",
   "cursor",
   "cursor_local",
@@ -65,7 +66,7 @@ function validateEvent(raw: unknown, idx: number): TokenEvent | string {
   if (typeof e.user !== "string" || !/^[a-z0-9._-]{1,64}$/.test(e.user))
     return `events[${idx}].user must match /^[a-z0-9._-]{1,64}$/`;
   if (typeof e.source !== "string" || !VALID_SOURCES.has(e.source as Source))
-    return `events[${idx}].source must be 'claude_code' | 'codex' | 'cursor' | 'cursor_local'`;
+    return `events[${idx}].source must be 'claude_code' | 'claude_cowork' | 'codex' | 'cursor' | 'cursor_local'`;
   if (typeof e.sessionId !== "string" || e.sessionId.length === 0)
     return `events[${idx}].sessionId must be non-empty string`;
   if (typeof e.messageId !== "string" || e.messageId.length === 0)
