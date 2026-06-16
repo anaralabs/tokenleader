@@ -1,4 +1,4 @@
-export type Source = "claude_code" | "codex" | "cursor" | "cursor_local";
+export type Source = "claude_code" | "claude_cowork" | "codex" | "cursor" | "cursor_local";
 
 export type MessageType = "user" | "assistant";
 

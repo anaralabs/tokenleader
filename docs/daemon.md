@@ -2,10 +2,11 @@
 
 A single compiled binary per teammate Mac, installed by your server's
 `/install` script, kept current by its own auto-updater. It parses the local
-session logs of Claude Code (`~/.claude/projects/`), Codex CLI
-(`~/.codex/sessions/`), and Cursor personal usage (read-only parse of
-`state.vscdb` under Cursor's `globalStorage`) and POSTs **token counts, model
-names, and timestamps — never message content** — to your server every 5 minutes.
+session logs of Claude Code (`~/.claude/projects/`), Claude Cowork (the Claude
+Desktop app's local agent-mode sessions), Codex CLI (`~/.codex/sessions/`), and
+Cursor personal usage (read-only parse of `state.vscdb` under Cursor's
+`globalStorage`) and POSTs **token counts, model names, and timestamps — never
+message content** — to your server every 5 minutes.
 
 ## Install
 
@@ -48,13 +49,23 @@ continues under the same handle.
 | `~/.local/share/tokenleader/` | state dir: `secret` (TOFU identity), `state.json` (per-file read offsets), optional `endpoint` (server-migration override) |
 | `~/Library/Logs/tokenleader/` | structured logs (`daemon.jsonl`, rotated at 5 MB ×3) |
 
-Nothing else: it reads `~/.claude/projects/`, `~/.codex/sessions/`, Cursor's
-local SQLite store (`state.vscdb`), and agent transcript JSONL files under
-`~/.cursor/projects/*/agent-transcripts/`, writes only the four locations above.
+Nothing else: it reads `~/.claude/projects/`, the Claude Desktop app's Cowork
+session tree (`~/Library/Application Support/Claude/{local-agent-mode-sessions,claude-code-sessions}/**/.claude/projects/`),
+`~/.codex/sessions/`, Cursor's local SQLite store (`state.vscdb`), and agent
+transcript JSONL files under `~/.cursor/projects/*/agent-transcripts/`, writes
+only the four locations above.
 
 Local Cursor parsing is on by default. Disable with `TOKENLEADER_CURSOR_LOCAL=0`
 in the LaunchAgent env. Override the DB location with `CURSOR_DATA_DIR` pointing
 at Cursor's `User/globalStorage` directory (same shape as `CLAUDE_CONFIG_DIR`).
+
+Claude Cowork parsing is on by default. Cowork "local agent mode" sessions run
+in a local sandbox and write byte-identical session JSONL, which the daemon
+tags `claude_cowork` so it reports separately from CLI usage. Cloud/remote
+Cowork sessions execute on Anthropic's servers and leave nothing on disk, so
+they cannot be tracked locally. Disable with `TOKENLEADER_CLAUDE_COWORK=0`, or
+point `TOKENLEADER_CLAUDE_COWORK_DIR` at the Claude Desktop data dir on non-mac
+platforms (Linux `~/.config/Claude`, Windows `%APPDATA%/Claude`).
 
 ### Cursor cloud sync (recommended)
 

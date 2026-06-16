@@ -273,6 +273,20 @@ describe("server", () => {
     expect(await res.json()).toEqual({ inserted: 1, duplicates: 0 });
   });
 
+  test("/ingest accepts claude_cowork source events", async () => {
+    const events = [
+      makeEvent({
+        messageId: "cowork-a1",
+        user: "alice",
+        source: "claude_cowork",
+        model: "claude-opus-4-6",
+      }),
+    ];
+    const res = await app.request(ingestReq(events, ALICE_SECRET));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ inserted: 1, duplicates: 0 });
+  });
+
   test("/ingest accepts cursor cloud events with costUsdMicros", async () => {
     const events = [
       makeEvent({

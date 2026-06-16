@@ -484,6 +484,44 @@ describe("tick", () => {
     expect(onDisk.files["/a.jsonl"]).toEqual(out.state.files["/a.jsonl"]!);
   });
 
+  test("parses cowork files with the same parser but tags them claude_cowork", async () => {
+    const dir = await makeTmpDir();
+    const initial = emptyState();
+    const posted: TokenEvent[] = [];
+    const sourceByPath: Record<string, string | undefined> = {};
+    const out = await tick(
+      initial,
+      mkTickDeps(dir, {
+        listClaudeCodeFiles: async () => ["/cli.jsonl"],
+        listClaudeCoworkFiles: async () => ["/cowork.jsonl"],
+        statFile: async () => ({ mtimeMs: 100 }),
+        // One shared parser; tick decides the source by the file's kind.
+        parseClaudeCodeFile: async (input) => {
+          sourceByPath[input.path] = input.source;
+          const src = input.source ?? "claude_code";
+          return {
+            events: [makeEvent({ messageId: `m-${src}`, source: src })],
+            newOffset: 10,
+            seenDedupKeys: [`m-${src}:r1`],
+          };
+        },
+        postEvents: async (evs) => {
+          for (const e of evs) posted.push(e);
+          return { ok: true, inserted: evs.length, duplicates: 0 };
+        },
+      }),
+    );
+    expect(out.result.posted).toBe(true);
+    // tick routed the source per file kind...
+    expect(sourceByPath["/cli.jsonl"]).toBe("claude_code");
+    expect(sourceByPath["/cowork.jsonl"]).toBe("claude_cowork");
+    // ...and the posted events carry those tags.
+    const tags = posted.map((e) => e.source).sort();
+    expect(tags).toEqual(["claude_code", "claude_cowork"]);
+    // The cowork file gets its own tracked byte offset.
+    expect(out.state.files["/cowork.jsonl"]?.byteOffset).toBe(10);
+  });
+
   test("does not advance state on POST failure", async () => {
     const dir = await makeTmpDir();
     const initial = emptyState();
@@ -1051,6 +1089,7 @@ function mkTickDeps(stateDir: string, over: Partial<TickDeps>): TickDeps {
       secret: "test-secret",
     },
     listClaudeCodeFiles: async () => [],
+    listClaudeCoworkFiles: async () => [],
     listCodexFiles: async () => [],
     listCursorTranscriptFiles: async () => [],
     parseClaudeCodeFile: async (input) => ({

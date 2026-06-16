@@ -25,8 +25,13 @@ The dashboard shows who's burning the most tokens, what it costs, and which mode
 tokenleader ships **token counts, model names, and timestamps — never message content.**
 
 - The daemon reads only the local session logs of your coding tools
-  (`~/.claude/projects/`, `~/.codex/sessions/`, and Cursor's local `state.vscdb`). No
-  keylogger, no clipboard, no network sniffing.
+  (`~/.claude/projects/`, `~/.codex/sessions/`, Cursor's local `state.vscdb`, and the
+  Claude Desktop app's Cowork sessions). No keylogger, no clipboard, no network sniffing.
+- Claude Cowork ("local agent mode") sessions run in a local sandbox and write the same
+  JSONL the CLI does, just under the Desktop app's data dir; the daemon parses them and
+  tags them `claude_cowork` so they show up separately from CLI usage. Cloud/remote Cowork
+  sessions run on Anthropic's servers and leave nothing on disk, so they are not tracked.
+  Disable Cowork parsing with `TOKENLEADER_CLAUDE_COWORK=0`.
 - The one outbound call beyond your server is opt-in: if you run `tokenleader
   login-cursor`, the daemon fetches your own usage totals from Cursor's dashboard API
   (token counts and costs, not message content) and forwards them on.

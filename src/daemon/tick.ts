@@ -13,6 +13,7 @@ import { postEvents, type TransportOpts } from "./transport";
 
 import {
   listClaudeCodeFiles,
+  listClaudeCoworkFiles,
   listCodexFiles,
   listCursorTranscriptFiles,
   getCursorStateDbPath,
@@ -31,6 +32,7 @@ export interface TickDeps {
 
   // Test seams. Real callers leave these undefined.
   listClaudeCodeFiles?: typeof listClaudeCodeFiles;
+  listClaudeCoworkFiles?: typeof listClaudeCoworkFiles;
   listCodexFiles?: typeof listCodexFiles;
   listCursorTranscriptFiles?: typeof listCursorTranscriptFiles;
   parseClaudeCodeFile?: typeof parseClaudeCodeFile;
@@ -112,6 +114,7 @@ export async function tick(
   deps: TickDeps,
 ): Promise<{ state: DaemonState; result: TickResult }> {
   const listCC = deps.listClaudeCodeFiles ?? listClaudeCodeFiles;
+  const listCW = deps.listClaudeCoworkFiles ?? listClaudeCoworkFiles;
   const listCx = deps.listCodexFiles ?? listCodexFiles;
   const listCurTx = deps.listCursorTranscriptFiles ?? listCursorTranscriptFiles;
   const parseCC = deps.parseClaudeCodeFile ?? parseClaudeCodeFile;
@@ -154,14 +157,16 @@ export async function tick(
   // List cursor_transcript paths whenever local Cursor is env-enabled, even when
   // we end up using cloud — keeping them in presentSet preserves byte offsets
   // so a cloud→local fallback doesn't re-ingest history from byte 0.
-  const [ccPaths, cxPaths, curTxPaths] = await Promise.all([
+  const [ccPaths, cwPaths, cxPaths, curTxPaths] = await Promise.all([
     safeList(listCC, "claude_code"),
+    safeList(listCW, "claude_cowork"),
     safeList(listCx, "codex"),
     cursorEnabled ? safeList(listCurTx, "cursor_transcript") : Promise.resolve([]),
   ]);
 
   const allPaths = [
     ...ccPaths.map((p) => ({ path: p, kind: "claude_code" as const })),
+    ...cwPaths.map((p) => ({ path: p, kind: "claude_cowork" as const })),
     ...cxPaths.map((p) => ({ path: p, kind: "codex" as const })),
     ...curTxPaths.map((p) => ({ path: p, kind: "cursor_transcript" as const })),
   ];
@@ -266,11 +271,14 @@ export async function tick(
     const byteOffset = prev?.byteOffset ?? 0;
 
     try {
-      if (item.kind === "claude_code") {
+      if (item.kind === "claude_code" || item.kind === "claude_cowork") {
+        // Cowork transcripts are byte-identical to CLI ones; same parser,
+        // distinct source tag so the two stay separable downstream.
         const r = await parseCC({
           path: item.path,
           byteOffset,
           user: deps.user,
+          source: item.kind,
         });
         collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
         if (r.oversizeSkipped) {

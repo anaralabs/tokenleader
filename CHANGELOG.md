@@ -32,6 +32,11 @@ never message content.
   auth.
 - Per-user TOFU ingest identity, plus an optional join code
   (`TOKENLEADER_JOIN_TOKEN`) gating first claims of new leaderboard names.
+- Claude Cowork support: the daemon also parses Claude Desktop "local agent
+  mode" sessions (byte-identical JSONL under the Desktop data dir), tagged
+  `claude_cowork` so they report separately from CLI usage. On by default;
+  `TOKENLEADER_CLAUDE_COWORK=0` disables. Cloud/remote Cowork runs server-side
+  and leaves nothing on disk, so it is out of scope.
 - Optional Cursor mirror: server-side usage import via the Cursor Teams Admin
   API (off by default; requires an explicit email→handle map).
 - GitHub-release binary mirror: the server caches daemon binaries and
