@@ -1,16 +1,17 @@
 import { fetchFilteredUsageEvents } from "../parser/cursor-api";
 import type { DaemonState, TokenEvent } from "../types";
 import {
+  loadCursorCloudAuth,
   loadCursorCredentials,
-  loadCursorToken,
   saveCursorCredentials,
-  type CursorCredentials,
+  saveCursorToken,
+  type loadCursorToken,
 } from "./cursor-token";
 import { log } from "./log";
 import { postEvents, type TransportOpts } from "./transport";
 
 /** Re-fetch this much overlap on incremental syncs to catch late-arriving rows. */
-export const CURSOR_SYNC_OVERLAP_MS = 60 * 60 * 1000;
+export const CURSOR_SYNC_OVERLAP_MS = 5 * 60 * 1000;
 /** Default incremental window when no prior cloud sync exists. */
 export const CURSOR_SYNC_DEFAULT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 /** Incremental daemon ticks — small page cap keeps each tick fast. */
@@ -27,7 +28,7 @@ export interface FetchCursorCloudOpts {
   mode: CursorSyncMode;
   signal?: AbortSignal;
   loadCursorToken?: typeof loadCursorToken;
-  loadCursorCredentials?: typeof loadCursorCredentials;
+  loadCursorCloudAuth?: typeof loadCursorCloudAuth;
   saveCursorCredentials?: typeof saveCursorCredentials;
   fetchFilteredUsageEvents?: typeof fetchFilteredUsageEvents;
   fetchImpl?: typeof fetch;
@@ -80,6 +81,9 @@ export function computeCursorSyncStartDate(
   if (mode === "full") return 0;
   if (mode === "month") return currentMonthStartMs(now);
   const cloud = state.cursorCloud;
+  if (cloud?.lastEventTimestamp && cloud.lastEventTimestamp > 0) {
+    return Math.max(0, cloud.lastEventTimestamp - CURSOR_SYNC_OVERLAP_MS);
+  }
   if (cloud?.lastSyncAt && cloud.lastSyncAt > 0) {
     return Math.max(0, cloud.lastSyncAt - CURSOR_SYNC_OVERLAP_MS);
   }
@@ -127,15 +131,14 @@ export function nextCursorCloudState(
 export async function fetchCursorCloudEvents(
   opts: FetchCursorCloudOpts,
 ): Promise<FetchCursorCloudResult> {
-  const loadToken = opts.loadCursorToken ?? loadCursorToken;
-  const loadCreds = opts.loadCursorCredentials ?? loadCursorCredentials;
+  const loadAuth = opts.loadCursorCloudAuth ?? loadCursorCloudAuth;
   const saveCreds = opts.saveCursorCredentials ?? saveCursorCredentials;
   const fetchEvents = opts.fetchFilteredUsageEvents ?? fetchFilteredUsageEvents;
-  const now = opts.now ?? Date.now;
+  const nowFn = opts.now ?? Date.now;
+  const syncNow = nowFn();
 
-  const creds = await loadCreds(opts.stateDir);
-  const token = creds?.sessionToken ?? (await loadToken(opts.stateDir));
-  if (!token) {
+  const auth = await loadAuth(opts.stateDir);
+  if (!auth) {
     return {
       skipped: true,
       startDate: 0,
@@ -146,27 +149,31 @@ export async function fetchCursorCloudEvents(
     };
   }
 
-  const startDate = computeCursorSyncStartDate(opts.state, opts.mode, now());
-  const endDate = computeCursorSyncEndDate(opts.mode, now());
+  const startDate = computeCursorSyncStartDate(opts.state, opts.mode, syncNow);
+  const endDate = computeCursorSyncEndDate(opts.mode, syncNow);
   const maxPages =
     opts.mode === "full" || opts.mode === "month"
       ? CURSOR_SYNC_FULL_MAX_PAGES
       : CURSOR_SYNC_INCREMENTAL_MAX_PAGES;
 
   const r = await fetchEvents(opts.user, {
-    token,
+    token: auth.sessionToken,
     startDate,
     ...(endDate !== undefined ? { endDate } : {}),
     maxPages,
     signal: opts.signal,
-    ...(creds?.refreshToken ? { refreshToken: creds.refreshToken } : {}),
-    ...(creds?.machineId ? { machineId: creds.machineId } : {}),
+    ...(auth.refreshToken ? { refreshToken: auth.refreshToken } : {}),
+    ...(auth.machineId ? { machineId: auth.machineId } : {}),
     ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
   });
 
-  if (r.refreshedSessionToken && creds) {
-    const updated: CursorCredentials = { ...creds, sessionToken: r.refreshedSessionToken };
-    await saveCreds(opts.stateDir, updated);
+  if (r.refreshedSessionToken) {
+    const creds = await loadCursorCredentials(opts.stateDir);
+    if (creds) {
+      await saveCreds(opts.stateDir, { ...creds, sessionToken: r.refreshedSessionToken });
+    } else {
+      await saveCursorToken(opts.stateDir, r.refreshedSessionToken);
+    }
   }
 
   log.info("cursor_cloud_fetched", {
@@ -241,7 +248,7 @@ export async function runCursorCloudSync(
       return {
         state: opts.state,
         eventsFetched: fetched.events.length,
-        eventsPosted: fetched.events.length,
+        eventsPosted: 0,
         inserted: 0,
         duplicates: 0,
         posted: false,

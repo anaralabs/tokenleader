@@ -12,21 +12,20 @@ export interface CursorCredentials {
 }
 
 /**
- * Load the Cursor dashboard session token from `<stateDir>/cursor_token`.
- * Returns null when the file is missing or empty.
+ * Load the Cursor dashboard session token. `cursor_token` wins when present;
+ * otherwise falls back to `cursor_credentials.json`.
  */
 export async function loadCursorToken(stateDir: string): Promise<string | null> {
-  const creds = await loadCursorCredentials(stateDir);
-  if (creds) return creds.sessionToken;
-
   try {
     const token = (await fs.readFile(path.join(stateDir, CURSOR_TOKEN_FILENAME), "utf8")).trim();
-    return token.length > 0 ? token : null;
+    if (token.length > 0) return token;
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "ENOENT") return null;
-    throw err;
+    if (code !== "ENOENT") throw err;
   }
+
+  const creds = await loadCursorCredentials(stateDir);
+  return creds?.sessionToken ?? null;
 }
 
 export async function loadCursorCredentials(
@@ -50,9 +49,45 @@ export async function loadCursorCredentials(
   }
 }
 
+/** Auth material for cloud API calls — session token plus refresh/machine when creds match. */
+export async function loadCursorCloudAuth(
+  stateDir: string,
+): Promise<{ sessionToken: string; refreshToken?: string; machineId?: string } | null> {
+  const sessionToken = await loadCursorToken(stateDir);
+  if (!sessionToken) return null;
+
+  const creds = await loadCursorCredentials(stateDir);
+  if (!creds || creds.sessionToken !== sessionToken) {
+    return { sessionToken };
+  }
+  return {
+    sessionToken,
+    refreshToken: creds.refreshToken,
+    machineId: creds.machineId,
+  };
+}
+
+async function writeSecureFile(filePath: string, contents: string): Promise<void> {
+  const tmp = `${filePath}.tmp.${process.pid}`;
+  await fs.writeFile(tmp, contents, { encoding: "utf8", mode: 0o600 });
+  await fs.chmod(tmp, 0o600);
+  await fs.rename(tmp, filePath);
+  await fs.chmod(filePath, 0o600);
+}
+
+async function removeCredentialsFile(stateDir: string): Promise<void> {
+  try {
+    await fs.unlink(path.join(stateDir, CURSOR_CREDENTIALS_FILENAME));
+  } catch (err: unknown) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== "ENOENT") throw err;
+  }
+}
+
 /**
  * Persist the Cursor dashboard session token with mode 0o600 — same posture
- * as `<stateDir>/secret`.
+ * as `<stateDir>/secret`. Removes stale auto-discovered credentials so a
+ * manual token update takes effect immediately.
  */
 export async function saveCursorToken(stateDir: string, token: string): Promise<void> {
   const trimmed = token.trim();
@@ -60,12 +95,8 @@ export async function saveCursorToken(stateDir: string, token: string): Promise<
     throw new Error("cursor session token must not be empty");
   }
   await fs.mkdir(stateDir, { recursive: true });
-  const p = path.join(stateDir, CURSOR_TOKEN_FILENAME);
-  const tmp = `${p}.tmp.${process.pid}`;
-  await fs.writeFile(tmp, trimmed, { encoding: "utf8", mode: 0o600 });
-  await fs.chmod(tmp, 0o600);
-  await fs.rename(tmp, p);
-  await fs.chmod(p, 0o600);
+  await writeSecureFile(path.join(stateDir, CURSOR_TOKEN_FILENAME), trimmed);
+  await removeCredentialsFile(stateDir);
 }
 
 export async function saveCursorCredentials(
@@ -79,8 +110,6 @@ export async function saveCursorCredentials(
     throw new Error("cursor credentials must include sessionToken, refreshToken, and machineId");
   }
 
-  await saveCursorToken(stateDir, sessionToken);
-
   const payload: CursorCredentials = {
     sessionToken,
     refreshToken,
@@ -89,10 +118,17 @@ export async function saveCursorCredentials(
   };
 
   await fs.mkdir(stateDir, { recursive: true });
-  const p = path.join(stateDir, CURSOR_CREDENTIALS_FILENAME);
-  const tmp = `${p}.tmp.${process.pid}`;
-  await fs.writeFile(tmp, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
-  await fs.chmod(tmp, 0o600);
-  await fs.rename(tmp, p);
-  await fs.chmod(p, 0o600);
+  const credsPath = path.join(stateDir, CURSOR_CREDENTIALS_FILENAME);
+  const tokenPath = path.join(stateDir, CURSOR_TOKEN_FILENAME);
+  const credsTmp = `${credsPath}.tmp.${process.pid}`;
+  const tokenTmp = `${tokenPath}.tmp.${process.pid}`;
+
+  await fs.writeFile(credsTmp, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
+  await fs.chmod(credsTmp, 0o600);
+  await fs.writeFile(tokenTmp, sessionToken, { encoding: "utf8", mode: 0o600 });
+  await fs.chmod(tokenTmp, 0o600);
+  await fs.rename(credsTmp, credsPath);
+  await fs.rename(tokenTmp, tokenPath);
+  await fs.chmod(credsPath, 0o600);
+  await fs.chmod(tokenPath, 0o600);
 }

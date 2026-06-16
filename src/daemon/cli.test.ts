@@ -85,7 +85,7 @@ describe("ensureCliSymlink", () => {
       const bin = join(dir, "bun");
       await fsp.writeFile(bin, "");
       await ensureCliSymlink(bin);
-      expect(fsp.lstat(join(dir, "tokenleader"))).rejects.toThrow();
+      await expect(fsp.lstat(join(dir, "tokenleader"))).rejects.toThrow();
     } finally {
       await cleanup();
     }
@@ -428,7 +428,7 @@ describe("runCliCommand", () => {
       };
       expect(await runCliCommand("login-cursor", ["bad-token"], deps)).toBe(1);
       expect(err.join("\n")).toContain("session token rejected");
-      expect(fsp.readFile(join(dir, CURSOR_TOKEN_FILENAME), "utf8")).rejects.toThrow();
+      await expect(fsp.readFile(join(dir, CURSOR_TOKEN_FILENAME), "utf8")).rejects.toThrow();
     } finally {
       await cleanup();
     }

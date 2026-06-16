@@ -702,6 +702,36 @@ describe("tick", () => {
     expect(out.state.cursorLocal).toEqual({ dbPath, lastRowid: 42 });
   });
 
+  test("cursor cloud fetch failure does not block local Claude events", async () => {
+    const dir = await makeTmpDir();
+    const ccEv = makeEvent({ messageId: "cc1", source: "claude_code" });
+    const out = await tick(
+      emptyState(),
+      mkTickDeps(dir, {
+        listClaudeCodeFiles: async () => ["/good.jsonl"],
+        listCodexFiles: async () => [],
+        loadCursorToken: async () => "cursor-session",
+        statFile: async () => ({ mtimeMs: 1 }),
+        parseClaudeCodeFile: async () => ({
+          events: [ccEv],
+          newOffset: 100,
+          seenDedupKeys: ["cc1:r1"],
+        }),
+        fetchCursorCloudEvents: async () => {
+          throw new Error("cursor api 503");
+        },
+        postEvents: async (evs) => ({
+          ok: true,
+          inserted: evs.length,
+          duplicates: 0,
+        }),
+      }),
+    );
+    expect(out.result.posted).toBe(true);
+    expect(out.result.eventsPosted).toBe(1);
+    expect(out.state.files["/good.jsonl"]?.byteOffset).toBe(100);
+  });
+
   test("parser exception on one file does not poison others", async () => {
     const dir = await makeTmpDir();
     const out = await tick(
@@ -788,6 +818,7 @@ function mkTickDeps(stateDir: string, over: Partial<TickDeps>): TickDeps {
       events: [],
       newOffset: input.byteOffset,
       seenDedupKeys: [],
+      nextLineIndex: input.startingLineIndex ?? 0,
     }),
     getCursorStateDbPath: () => "/tmp/cursor/state.vscdb",
     isCursorLocalEnabled: () => false,

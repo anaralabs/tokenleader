@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { estimateTranscriptTextLength, parseCursorTranscriptFile } from "./cursor-jsonl.ts";
+import {
+  estimateTranscriptTextLength,
+  parseCursorTranscriptFile,
+  stableTranscriptMessageId,
+} from "./cursor-jsonl.ts";
 
 const tmpDirs: string[] = [];
 
@@ -48,13 +52,17 @@ describe("parseCursorTranscriptFile", () => {
     expect(r.events[0]!.messageType).toBe("user");
     expect(r.events[0]!.timestamp).toBe(mtimeMs);
     expect(r.events[0]!.sessionId).toBe(sessionId);
-    expect(r.events[0]!.messageId).toBe(`transcript:${sessionId}:1`);
+    expect(r.events[0]!.messageId).toBe(stableTranscriptMessageId(path, 1));
     expect(r.events[1]!.messageType).toBe("assistant");
     expect(r.events[1]!.outputTokens).toBe(Math.ceil(32 / 4));
-    expect(r.seenDedupKeys).toEqual([`transcript:${sessionId}:1:`, `transcript:${sessionId}:2:`]);
+    expect(r.nextLineIndex).toBe(2);
+    expect(r.seenDedupKeys).toEqual([
+      `${stableTranscriptMessageId(path, 1)}:`,
+      `${stableTranscriptMessageId(path, 2)}:`,
+    ]);
   });
 
-  it("respects byte offsets across reads", async () => {
+  it("keeps stable line ids across incremental reads", async () => {
     const { path, mtimeMs } = makeTranscriptFile([
       JSON.stringify({ role: "user", message: { content: [{ type: "text", text: "one" }] } }),
       JSON.stringify({ role: "user", message: { content: [{ type: "text", text: "two" }] } }),
@@ -67,14 +75,23 @@ describe("parseCursorTranscriptFile", () => {
       fileMtimeMs: mtimeMs,
     });
     expect(first.events.length).toBe(2);
+    expect(first.nextLineIndex).toBe(2);
+
+    appendFileSync(
+      path,
+      `${JSON.stringify({ role: "user", message: { content: [{ type: "text", text: "three" }] } })}\n`,
+    );
 
     const second = await parseCursorTranscriptFile({
       path,
       byteOffset: first.newOffset,
       user: "bob",
       fileMtimeMs: mtimeMs,
+      startingLineIndex: first.nextLineIndex,
     });
-    expect(second.events.length).toBe(0);
+    expect(second.events.length).toBe(1);
+    expect(second.events[0]!.messageId).toBe(stableTranscriptMessageId(path, 3));
+    expect(second.nextLineIndex).toBe(3);
   });
 });
 

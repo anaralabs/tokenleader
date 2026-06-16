@@ -17,7 +17,17 @@ describe("computeCursorSyncStartDate", () => {
     expect(computeCursorSyncStartDate(emptyState(), "full", 2_000_000)).toBe(0);
   });
 
-  test("incremental uses lastSyncAt minus overlap", () => {
+  test("incremental uses lastEventTimestamp minus overlap", () => {
+    const state = {
+      ...emptyState(),
+      cursorCloud: { lastSyncAt: 10_000_000, lastEventTimestamp: 9_500_000 },
+    };
+    expect(computeCursorSyncStartDate(state, "incremental", 20_000_000)).toBe(
+      9_500_000 - CURSOR_SYNC_OVERLAP_MS,
+    );
+  });
+
+  test("incremental falls back to lastSyncAt when no event watermark exists", () => {
     const state = {
       ...emptyState(),
       cursorCloud: { lastSyncAt: 10_000_000 },
@@ -48,7 +58,7 @@ describe("fetchCursorCloudEvents", () => {
       stateDir: "/no/token/dir",
       state: emptyState(),
       mode: "incremental",
-      loadCursorToken: async () => null,
+      loadCursorCloudAuth: async () => null,
     });
     expect(r.skipped).toBe(true);
     expect(r.events).toEqual([]);
@@ -74,7 +84,7 @@ describe("fetchCursorCloudEvents", () => {
       stateDir: "/tmp",
       state: emptyState(),
       mode: "full",
-      loadCursorToken: async () => "tok",
+      loadCursorCloudAuth: async () => ({ sessionToken: "tok" }),
       fetchImpl,
     });
     expect(r.skipped).toBe(false);
@@ -102,7 +112,7 @@ describe("runCursorCloudSync", () => {
       state: emptyState(),
       mode: "full",
       transport: { endpoint: "https://x", secret: "s" },
-      loadCursorToken: async () => "tok",
+      loadCursorCloudAuth: async () => ({ sessionToken: "tok" }),
       fetchFilteredUsageEvents: async () => ({
         events,
         totalCount: 1,

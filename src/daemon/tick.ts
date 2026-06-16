@@ -96,7 +96,14 @@ export async function tick(
   const now = deps.now ?? Date.now;
 
   const cursorEnabled = cursorEnabledFn();
-  const cursorToken = await loadToken(deps.stateDir);
+  let cursorToken: string | null = null;
+  try {
+    cursorToken = await loadToken(deps.stateDir);
+  } catch (err: unknown) {
+    log.error("cursor_token_load_failed", {
+      err: String((err as Error)?.message ?? err),
+    });
+  }
   const useCloudCursor = cursorToken !== null;
   const cursorLocalEnabled = cursorEnabled && !useCloudCursor;
 
@@ -183,6 +190,7 @@ export async function tick(
           byteOffset,
           user: deps.user,
           fileMtimeMs: st.mtimeMs,
+          startingLineIndex: prev?.transcriptLineIndex ?? 0,
         });
         const accepted: TokenEvent[] = [];
         for (let i = 0; i < r.events.length; i++) {
@@ -204,6 +212,7 @@ export async function tick(
           path: item.path,
           mtimeMs: st.mtimeMs,
           byteOffset: r.newOffset,
+          transcriptLineIndex: r.nextLineIndex,
         });
       } else {
         const prevTotals = toCodexTotals(prev?.lastSessionTotals);
@@ -308,18 +317,6 @@ export async function tick(
       log.error("cursor_cloud_fetch_failed", {
         err: String((err as Error)?.message ?? err),
       });
-      return {
-        state: initial,
-        result: {
-          scannedFiles: allPaths.length,
-          eligibleFiles: eligible,
-          eventsPosted: 0,
-          inserted: 0,
-          duplicates: 0,
-          posted: false,
-          newFiles,
-        },
-      };
     }
   }
 

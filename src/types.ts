@@ -43,6 +43,8 @@ export interface FileState {
   path: string;
   mtimeMs: number;
   byteOffset: number;
+  /** Lines fully parsed in a Cursor transcript JSONL (stable message ids). */
+  transcriptLineIndex?: number;
   lastSessionTotals?: {
     sessionId: string;
     inputTokens: number;

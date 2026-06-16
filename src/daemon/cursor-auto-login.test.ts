@@ -104,7 +104,7 @@ describe("cursor-auto-login network flow", () => {
     const storageDir = mkdtempSync(join(tmpdir(), "tokenleader-storage-"));
     const storagePath = join(storageDir, "storage.json");
     const machineId = "289aedcf3ccf5d3814ed682c26c4076833600e42e397cd1c50d918a335a531a8";
-    Bun.write(storagePath, JSON.stringify({ "telemetry.machineId": machineId }));
+    await Bun.write(storagePath, JSON.stringify({ "telemetry.machineId": machineId }));
 
     const authCalls: string[] = [];
     const fetchImpl = (async (input: unknown, init?: RequestInit) => {

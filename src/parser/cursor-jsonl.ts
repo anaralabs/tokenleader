@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename, dirname } from "node:path";
 import type { MessageType, TokenEvent } from "../types.ts";
 import { readNewlineLines } from "./read-slice.ts";
@@ -9,12 +10,16 @@ export interface ParseCursorTranscriptOptions {
   user: string;
   /** File mtime used as event timestamp for newly read lines. */
   fileMtimeMs: number;
+  /** Absolute 0-based line index already ingested from this file. */
+  startingLineIndex?: number;
 }
 
 export interface ParseCursorTranscriptResult {
   events: TokenEvent[];
   newOffset: number;
   seenDedupKeys: string[];
+  /** Next absolute line index after this parse (persist in FileState). */
+  nextLineIndex: number;
   oversizeSkipped?: number;
 }
 
@@ -61,6 +66,11 @@ function sessionIdFromPath(path: string): string {
   return parent.length > 0 ? parent : file;
 }
 
+/** Stable per-line id that survives incremental byte-offset reads. */
+export function stableTranscriptMessageId(filePath: string, lineIndex: number): string {
+  return createHash("sha256").update(`${filePath}:${lineIndex}`).digest("hex").slice(0, 24);
+}
+
 /**
  * Parse Cursor agent transcript JSONL files under
  * ~/.cursor/projects/.../agent-transcripts/. These survive SQLite pruning.
@@ -72,7 +82,8 @@ export async function parseCursorTranscriptFile(
   const file = Bun.file(path);
   const totalSize = file.size;
   if (byteOffset >= totalSize) {
-    return { events: [], newOffset: totalSize, seenDedupKeys: [] };
+    const lineIndex = opts.startingLineIndex ?? 0;
+    return { events: [], newOffset: totalSize, seenDedupKeys: [], nextLineIndex: lineIndex };
   }
 
   const sessionId = sessionIdFromPath(path);
@@ -83,7 +94,7 @@ export async function parseCursorTranscriptFile(
   const localSeen = new Set<string>();
   let newOffset = byteOffset;
   let oversizeSkipped = 0;
-  let lineIndex = 0;
+  let lineIndex = opts.startingLineIndex ?? 0;
 
   for await (const part of readNewlineLines(file, byteOffset)) {
     newOffset = part.newOffset;
@@ -104,7 +115,7 @@ export async function parseCursorTranscriptFile(
     const messageType = messageTypeForRole(raw.role);
     if (!messageType) continue;
 
-    const messageId = `transcript:${sessionId}:${lineIndex}`;
+    const messageId = stableTranscriptMessageId(path, lineIndex);
     const dedupKey = `${messageId}:`;
     if (localSeen.has(dedupKey)) continue;
     localSeen.add(dedupKey);
@@ -139,6 +150,7 @@ export async function parseCursorTranscriptFile(
     events,
     newOffset,
     seenDedupKeys,
+    nextLineIndex: lineIndex,
     ...(oversizeSkipped > 0 ? { oversizeSkipped } : {}),
   };
 }

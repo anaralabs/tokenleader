@@ -216,11 +216,11 @@ async function runLoginCursorAuto(deps: CliDeps): Promise<{
   refreshToken: string;
   machineId: string;
 }> {
-  if (process.platform !== "darwin") {
-    throw new Error("login-cursor --auto is supported on macOS only");
-  }
   const fetchImpl = deps.fetchImpl ?? fetch;
   const extract = deps.extractCursorSession ?? extractCursorSessionToken;
+  if (!deps.extractCursorSession && process.platform !== "darwin") {
+    throw new Error("login-cursor --auto is supported on macOS only");
+  }
   const { sessionToken, email, machineId, auth } = await extract({ fetchImpl });
   return {
     sessionToken,
