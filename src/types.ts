@@ -64,8 +64,12 @@ export interface CursorCloudState {
   lastSyncAt: number;
   /** Highest event timestamp seen from the dashboard API. */
   lastEventTimestamp?: number;
-  /** Set after a successful `sync-cursor` full backfill. */
+  /** Set once an all-time `full` backfill walk has completed. */
   fullSyncDone?: boolean;
+  /** 1-based page to resume from when a fetch stopped at the page cap. */
+  resumePage?: number;
+  /** startDate the pending `resumePage` belongs to (guards cross-window reuse). */
+  resumeStartDate?: number;
 }
 
 export interface DaemonState {

@@ -46,10 +46,7 @@ export async function verifyCursorAccessToken(
   });
   if (res.status === 401 || res.status === 403) return false;
   if (!res.ok) {
-    const detail = (await res.text()).slice(0, 200);
-    throw new Error(
-      `cursor auth verification failed (${res.status})${detail ? `: ${detail}` : ""}`,
-    );
+    throw new Error(`cursor auth verification failed (${res.status})`);
   }
   return true;
 }
@@ -92,7 +89,9 @@ export async function refreshCursorAccessToken(
 
   const accessToken = typeof json.access_token === "string" ? json.access_token.trim() : "";
   if (accessToken.length === 0) {
-    throw new Error("cursor token refresh returned an empty access token — sign in to Cursor again");
+    throw new Error(
+      "cursor token refresh returned an empty access token — sign in to Cursor again",
+    );
   }
   return accessToken;
 }
@@ -117,8 +116,7 @@ export async function fetchCursorUserEmail(
     throw new Error("cursor session token rejected (expired or invalid)");
   }
   if (!res.ok) {
-    const detail = (await res.text()).slice(0, 200);
-    throw new Error(`cursor user API returned ${res.status}${detail ? `: ${detail}` : ""}`);
+    throw new Error(`cursor user API returned ${res.status}`);
   }
 
   let json: { email?: unknown };

@@ -335,6 +335,102 @@ describe("server", () => {
     expect(cloud?.costUsd).toBeCloseTo(0.05, 5);
   });
 
+  test("/ingest cursor events reconcile cursor_local rows across the span (not byte-equal)", async () => {
+    const user = "spanuser";
+    const secret = "span-secret";
+    // Local (composer createdAt / DB-mtime) timestamps; cloud (per-request
+    // epoch-ms) timestamps are derived independently and never byte-equal.
+    const localInSpanTs = Date.UTC(2026, 5, 10, 12, 7, 31);
+    const localOutOfSpanTs = Date.UTC(2026, 5, 10, 9, 0, 0);
+    const cloudMinTs = Date.UTC(2026, 5, 10, 12, 0, 4);
+    const cloudMaxTs = Date.UTC(2026, 5, 10, 12, 15, 22);
+    await app.request(
+      ingestReq(
+        [
+          makeEvent({
+            user,
+            source: "cursor_local",
+            messageId: "local-in-span",
+            timestamp: localInSpanTs,
+            model: "cursor",
+            inputTokens: 777,
+            outputTokens: 777,
+          }),
+          makeEvent({
+            user,
+            source: "cursor_local",
+            messageId: "local-out-of-span",
+            timestamp: localOutOfSpanTs,
+            model: "cursor",
+            inputTokens: 123,
+            outputTokens: 456,
+          }),
+        ],
+        secret,
+      ),
+    );
+    await app.request(
+      ingestReq(
+        [
+          makeEvent({
+            user,
+            source: "cursor",
+            messageId: "cloud-lo",
+            timestamp: cloudMinTs,
+            model: "claude-4.5-sonnet",
+            inputTokens: 100,
+            outputTokens: 50,
+            costUsdMicros: 40_000,
+          }),
+          makeEvent({
+            user,
+            source: "cursor",
+            messageId: "cloud-hi",
+            timestamp: cloudMaxTs,
+            model: "claude-4.5-sonnet",
+            inputTokens: 200,
+            outputTokens: 80,
+            costUsdMicros: 60_000,
+          }),
+        ],
+        secret,
+      ),
+    );
+    const stats = await jsonOf(await app.request(new Request(`http://x/stats?user=${user}`)));
+    // The local row inside the cloud span is removed; the one before the span
+    // survives — so the surviving `cursor` model carries only its tokens.
+    const local = stats.byModel.find((m: { model: string }) => m.model === "cursor");
+    expect(local?.input).toBe(123);
+    expect(local?.output).toBe(456);
+    const cloud = stats.byModel.find((m: { model: string }) => m.model === "claude-4.5-sonnet");
+    expect(cloud?.input).toBe(300);
+  });
+
+  test("/ingest rejects costUsdMicros above the per-event ceiling", async () => {
+    const over = makeEvent({
+      user: "alice",
+      messageId: "cost-over",
+      source: "cursor",
+      model: "claude-4.5-sonnet",
+      costUsdMicros: 100_000_001,
+    });
+    const res = await app.request(ingestReq([over], ALICE_SECRET));
+    expect(res.status).toBe(400);
+    const body = await jsonOf(res);
+    expect(body.error).toContain("costUsdMicros exceeds maximum");
+
+    const ok = makeEvent({
+      user: "alice",
+      messageId: "cost-at-cap",
+      source: "cursor",
+      model: "claude-4.5-sonnet",
+      costUsdMicros: 100_000_000,
+    });
+    const okRes = await app.request(ingestReq([ok], ALICE_SECRET));
+    expect(okRes.status).toBe(200);
+    expect(await okRes.json()).toEqual({ inserted: 1, duplicates: 0 });
+  });
+
   test("/stats reports unknown models in unknownModels", async () => {
     const ev: TokenEvent = makeEvent({
       user: "carol",

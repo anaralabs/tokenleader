@@ -68,14 +68,21 @@ tokenleader login-cursor --auto
 # manual fallback (any platform with a browser session cookie)
 tokenleader login-cursor '<WorkosCursorSessionToken>'
 
-# backfill all dashboard history (or wait for the daemon's incremental sync)
+# backfill ALL dashboard history immediately (optional — see below)
 tokenleader sync-cursor
 ```
 
 `login-cursor --auto` saves credentials to `<stateDir>/cursor_credentials.json`
-(session token, refresh token, machine id) and `cursor_token`, then syncs the
-current month. Requires the server build that accepts `source: "cursor"` on
-`/ingest` — deploy server and daemon together.
+(session token, refresh token, machine id) and `cursor_token`, then posts the
+**current month** right away for instant feedback. Requires the server build that
+accepts `source: "cursor"` on `/ingest` — deploy server and daemon together.
+
+Once a token is saved, the daemon backfills your **full** dashboard history
+automatically in the background: until the one-time all-time backfill finishes it
+pulls history in bounded chunks (~2,500 events per tick) so a large back-catalogue
+never blocks a tick, then settles into a cheap incremental window. `sync-cursor`
+just does that same full backfill immediately in the foreground — handy if you
+don't want to wait for the daemon to drain it across a few ticks.
 
 ## Identity: how TOFU works
 

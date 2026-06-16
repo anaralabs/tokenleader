@@ -336,6 +336,8 @@ describe("runCliCommand", () => {
   test("login-cursor --auto: warns but succeeds when month sync cannot post", async () => {
     await withSecretDir(async (stateDir) => {
       const ingestCalls: unknown[][] = [];
+      const out: string[] = [];
+      const err: string[] = [];
       const deps: CliDeps = {
         env: { TOKENLEADER_STATE_DIR: stateDir },
         readPlist: async () => PLIST,
@@ -373,8 +375,6 @@ describe("runCliCommand", () => {
         print: (l) => out.push(l),
         printErr: (l) => err.push(l),
       };
-      const out: string[] = [];
-      const err: string[] = [];
       expect(await runCliCommand("login-cursor", ["--auto"], deps)).toBe(0);
       expect(out.join("\n")).toContain("Authenticated as: alice@example.com");
       expect(out.join("\n")).toContain("Warning: could not post");

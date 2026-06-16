@@ -136,10 +136,72 @@ describe("fetchFilteredUsageEvents", () => {
     });
     expect(r.events.length).toBe(150);
     expect(r.pagesFetched).toBe(2);
+    expect(r.complete).toBe(true);
+    expect(r.nextPage).toBeUndefined();
     expect(calls[0]!.body.pageSize).toBe(100);
     expect(calls[0]!.body.page).toBe(1);
     expect(r.events[0]!.user).toBe("alice");
     expect(r.events[0]!.source).toBe("cursor");
+  });
+
+  test("hitting the maxPages cap returns complete=false with the resume page", async () => {
+    // A fake that always returns a full page (hasNextPage omitted) so the
+    // loop never sees a termination signal and exhausts the cap.
+    const calls: Array<{ body: Record<string, unknown> }> = [];
+    const fetchImpl = (async (_input: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      calls.push({ body });
+      const pageSize = Number(body.pageSize ?? 100);
+      const page = Number(body.page ?? 1);
+      const pageEvents = Array.from({ length: pageSize }, (_, i) => ({
+        id: `evt-${page}-${i}`,
+        timestamp: String(1_700_000_000_000 + page * 1000 + i),
+        modelName: "claude-4.5-sonnet",
+        inputTokens: 1,
+        outputTokens: 1,
+        totalCents: 0.01,
+      }));
+      return new Response(JSON.stringify({ usageEventsDisplay: pageEvents }), {
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    const maxPages = 3;
+    const r = await fetchFilteredUsageEvents("alice", {
+      token: "tok",
+      pageSize: 100,
+      maxPages,
+      fetchImpl,
+    });
+    expect(r.complete).toBe(false);
+    expect(r.nextPage).toBe(maxPages + 1);
+    expect(r.pagesFetched).toBe(maxPages);
+    expect(calls).toHaveLength(maxPages);
+    expect(calls[0]!.body.page).toBe(1);
+    expect(calls[maxPages - 1]!.body.page).toBe(maxPages);
+  });
+
+  test("startPage resumes pagination from the given page", async () => {
+    const rows = Array.from({ length: 250 }, (_, i) => ({
+      id: `evt-${i}`,
+      timestamp: String(1_700_000_000_000 + i),
+      modelName: "claude-4.5-sonnet",
+      inputTokens: 1,
+      outputTokens: 1,
+      totalCents: 0.01,
+    }));
+    const { fetchImpl, calls } = fakeDashboardApi(rows);
+    const r = await fetchFilteredUsageEvents("alice", {
+      token: "tok",
+      pageSize: 100,
+      startPage: 3,
+      fetchImpl,
+    });
+    // Page 3 is the short final page (50 rows) → complete walk.
+    expect(calls[0]!.body.page).toBe(3);
+    expect(r.events.length).toBe(50);
+    expect(r.pagesFetched).toBe(1);
+    expect(r.complete).toBe(true);
   });
 
   test("sends Cookie header, Origin, and x-cursor-client-id to the dashboard endpoint", async () => {
@@ -167,8 +229,6 @@ describe("fetchFilteredUsageEvents", () => {
   });
 
   test("uses the bare-host dashboard URL", () => {
-    expect(CURSOR_DASHBOARD_API).toBe(
-      "https://cursor.com/api/dashboard/get-filtered-usage-events",
-    );
+    expect(CURSOR_DASHBOARD_API).toBe("https://cursor.com/api/dashboard/get-filtered-usage-events");
   });
 });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { centsToMicros, cursorMessageId, cursorSessionId } from "../parser/cursor-dedup.ts";
 import { CURSOR_WATERMARK_META_KEY } from "./db.ts";
 import type { Store } from "./db.ts";
 import type { TokenEvent } from "../types.ts";
@@ -355,22 +355,16 @@ export class CursorMirror {
 
     // Deterministic messageId → re-fetched events dedupe via events_dedup.
     // Token counts included so same-ms same-model events don't collide.
-    const h = createHash("sha256");
-    h.update(String(tsMs));
-    h.update(":");
-    h.update(ev.model);
-    h.update(":");
-    h.update(String(tu.inputTokens));
-    h.update(":");
-    h.update(String(tu.outputTokens));
-    h.update(":");
-    h.update(String(tu.cacheWriteTokens));
-    h.update(":");
-    h.update(String(tu.cacheReadTokens));
-    const messageId = h.digest("hex").slice(0, 24);
+    const messageId = cursorMessageId({
+      timestamp: tsMs,
+      model: ev.model,
+      inputTokens: tu.inputTokens,
+      outputTokens: tu.outputTokens,
+      cacheWriteTokens: tu.cacheWriteTokens,
+      cacheReadTokens: tu.cacheReadTokens,
+    });
 
-    // totalCents is fractional cents; 1 cent = 10_000 micros.
-    const costUsdMicros = Math.round((tu.totalCents ?? 0) * 10_000);
+    const costUsdMicros = centsToMicros(tu.totalCents ?? 0);
 
     return {
       user,
@@ -390,12 +384,4 @@ export class CursorMirror {
       costUsdMicros,
     };
   }
-}
-
-function cursorSessionId(user: string, tsMs: number): string {
-  const d = new Date(tsMs);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `cursor:${user}:${yyyy}-${mm}-${dd}`;
 }

@@ -28,9 +28,7 @@ export async function loadCursorToken(stateDir: string): Promise<string | null> 
   return creds?.sessionToken ?? null;
 }
 
-export async function loadCursorCredentials(
-  stateDir: string,
-): Promise<CursorCredentials | null> {
+export async function loadCursorCredentials(stateDir: string): Promise<CursorCredentials | null> {
   try {
     const raw = await fs.readFile(path.join(stateDir, CURSOR_CREDENTIALS_FILENAME), "utf8");
     const parsed = JSON.parse(raw) as Partial<CursorCredentials>;
@@ -118,17 +116,11 @@ export async function saveCursorCredentials(
   };
 
   await fs.mkdir(stateDir, { recursive: true });
-  const credsPath = path.join(stateDir, CURSOR_CREDENTIALS_FILENAME);
-  const tokenPath = path.join(stateDir, CURSOR_TOKEN_FILENAME);
-  const credsTmp = `${credsPath}.tmp.${process.pid}`;
-  const tokenTmp = `${tokenPath}.tmp.${process.pid}`;
-
-  await fs.writeFile(credsTmp, `${JSON.stringify(payload)}\n`, { encoding: "utf8", mode: 0o600 });
-  await fs.chmod(credsTmp, 0o600);
-  await fs.writeFile(tokenTmp, sessionToken, { encoding: "utf8", mode: 0o600 });
-  await fs.chmod(tokenTmp, 0o600);
-  await fs.rename(credsTmp, credsPath);
-  await fs.rename(tokenTmp, tokenPath);
-  await fs.chmod(credsPath, 0o600);
-  await fs.chmod(tokenPath, 0o600);
+  // `cursor_token` shadows creds in loadCursorToken, so refresh it first: a
+  // crash before the creds rename leaves a fresh token, never a stale one.
+  await writeSecureFile(path.join(stateDir, CURSOR_TOKEN_FILENAME), sessionToken);
+  await writeSecureFile(
+    path.join(stateDir, CURSOR_CREDENTIALS_FILENAME),
+    `${JSON.stringify(payload)}\n`,
+  );
 }

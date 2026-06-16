@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { basename, dirname } from "node:path";
 import type { MessageType, TokenEvent } from "../types.ts";
 import { readNewlineLines } from "./read-slice.ts";
-import { CURSOR_LOCAL_FALLBACK_MODEL, estimateCursorTokens } from "./cursor-local.ts";
+import { CURSOR_LOCAL_FALLBACK_MODEL } from "./cursor-local.ts";
 
 export interface ParseCursorTranscriptOptions {
   path: string;
@@ -121,10 +121,10 @@ export async function parseCursorTranscriptFile(
     localSeen.add(dedupKey);
 
     const textLen = estimateTranscriptTextLength(raw);
-    const pseudoBubble = { text: "x".repeat(textLen) };
-    const { inputTokens, outputTokens } = estimateCursorTokens(pseudoBubble, messageType);
+    const inputTokens = 0;
+    const outputTokens = messageType === "assistant" ? Math.ceil(textLen / 4) : 0;
 
-    if (messageType === "assistant" && inputTokens === 0 && outputTokens === 0) {
+    if (messageType === "assistant" && outputTokens === 0) {
       continue;
     }
 

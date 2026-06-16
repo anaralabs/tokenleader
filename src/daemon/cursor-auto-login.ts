@@ -12,20 +12,6 @@ import {
 } from "../parser/cursor-auth.ts";
 import { validateCursorToken } from "../parser/cursor-api.ts";
 
-export {
-  buildWorkosSessionToken,
-  CURSOR_AUTH_USAGE_API,
-  CURSOR_OAUTH_CLIENT_ID,
-  CURSOR_OAUTH_TOKEN_API,
-  CURSOR_USER_API,
-  fetchCursorUserEmail,
-  refreshCursorAccessToken,
-  userIdFromJwt,
-  verifyCursorAccessToken,
-} from "../parser/cursor-auth.ts";
-export { CURSOR_AUTH_KEYS } from "../parser/cursor-locator.ts";
-export type { CursorIdeAuth };
-
 export interface ExtractCursorSessionOptions {
   dbPath?: string;
   storageJsonPath?: string;
@@ -56,9 +42,7 @@ export async function extractCursorSessionToken(
   // Empty/whitespace counts as missing — `??` alone would let "" through.
   const dbMachineId = auth.serviceMachineId?.trim();
   const machineId =
-    dbMachineId && dbMachineId.length > 0
-      ? dbMachineId
-      : readCursorMachineId(opts.storageJsonPath);
+    dbMachineId && dbMachineId.length > 0 ? dbMachineId : readCursorMachineId(opts.storageJsonPath);
 
   let accessToken = auth.accessToken;
   const fetchImpl = opts.fetchImpl;

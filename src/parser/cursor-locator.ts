@@ -42,6 +42,12 @@ function withTempDbCopy<T>(sourcePath: string, fn: (copyPath: string) => T): T {
   const copyPath = path.join(dir, "state.vscdb");
   try {
     copyFileSync(sourcePath, copyPath);
+    // Copy the WAL/SHM sidecars too — without them sqlite3 reads only the
+    // committed main DB and misses writes Cursor just made to the WAL.
+    for (const suffix of ["-wal", "-shm"] as const) {
+      const sidecar = `${sourcePath}${suffix}`;
+      if (existsSync(sidecar)) copyFileSync(sidecar, `${copyPath}${suffix}`);
+    }
     return fn(copyPath);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -82,7 +88,9 @@ export function readCursorIdeAuth(
 ): CursorIdeAuth {
   requireSqlite3Cli();
   if (!existsSync(dbPath)) {
-    throw new Error(`Cursor state database not found at ${dbPath} — is Cursor installed and signed in?`);
+    throw new Error(
+      `Cursor state database not found at ${dbPath} — is Cursor installed and signed in?`,
+    );
   }
 
   if (opts.skipCopy) {

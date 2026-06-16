@@ -17,6 +17,12 @@ export const CURSOR_SYNC_DEFAULT_LOOKBACK_MS = 24 * 60 * 60 * 1000;
 export const CURSOR_SYNC_INCREMENTAL_MAX_PAGES = 10;
 /** Full backfill via `sync-cursor` — drains large histories across one run. */
 export const CURSOR_SYNC_FULL_MAX_PAGES = 500;
+/**
+ * Background first-run backfill: the daemon pulls all-time history in bounded
+ * chunks drained across ticks (resumePage continuation) so a large history
+ * never blocks a single tick. ~25 pages ≈ 2,500 events per tick.
+ */
+export const CURSOR_SYNC_BACKFILL_MAX_PAGES = 25;
 
 export type CursorSyncMode = "incremental" | "full" | "month";
 
@@ -25,9 +31,10 @@ export interface FetchCursorCloudOpts {
   stateDir: string;
   state: DaemonState;
   mode: CursorSyncMode;
+  /** Per-call page cap override (e.g. a bounded background-backfill chunk). */
+  maxPages?: number;
   signal?: AbortSignal;
   loadCursorCloudAuth?: typeof loadCursorCloudAuth;
-  saveCursorCredentials?: typeof saveCursorCredentials;
   fetchFilteredUsageEvents?: typeof fetchFilteredUsageEvents;
   fetchImpl?: typeof fetch;
   now?: () => number;
@@ -40,6 +47,10 @@ export interface FetchCursorCloudResult {
   events: TokenEvent[];
   totalCount: number;
   pagesFetched: number;
+  /** False when the fetch stopped at the page cap with more pages possible. */
+  complete: boolean;
+  /** 1-based page to resume from next call; present iff complete === false. */
+  nextPage?: number;
 }
 
 export interface CursorCloudSyncOpts {
@@ -50,7 +61,6 @@ export interface CursorCloudSyncOpts {
   mode: CursorSyncMode;
   signal?: AbortSignal;
   loadCursorCloudAuth?: typeof loadCursorCloudAuth;
-  saveCursorCredentials?: typeof saveCursorCredentials;
   fetchFilteredUsageEvents?: typeof fetchFilteredUsageEvents;
   fetchImpl?: typeof fetch;
   postEvents?: typeof postEvents;
@@ -65,6 +75,8 @@ export interface CursorCloudSyncResult {
   duplicates: number;
   posted: boolean;
   skipped: boolean;
+  complete: boolean;
+  nextPage?: number;
 }
 
 export function currentMonthStartMs(now: number): number {
@@ -107,18 +119,35 @@ export function nextCursorCloudState(
   mode: CursorSyncMode,
   events: TokenEvent[],
   now: number,
+  complete: boolean,
+  nextPage?: number,
+  startDate?: number,
 ): DaemonState {
   const prevCloud = state.cursorCloud;
-  const lastEventTimestamp = Math.max(
-    maxEventTimestamp(events),
-    prevCloud?.lastEventTimestamp ?? 0,
-  );
+  // Incremental derives its startDate from the watermark, so on a truncated
+  // (newest-first) run the watermark must NOT advance or the older tail is
+  // skipped. Full/month use a fixed startDate and can advance the running max
+  // freely, resuming the unfetched tail via resumePage.
+  const advance = mode === "incremental" ? complete : true;
+  const lastEventTimestamp = advance
+    ? Math.max(maxEventTimestamp(events), prevCloud?.lastEventTimestamp ?? 0)
+    : (prevCloud?.lastEventTimestamp ?? 0);
   return {
     ...state,
     cursorCloud: {
       lastSyncAt: now,
       ...(lastEventTimestamp > 0 ? { lastEventTimestamp } : {}),
-      ...(mode === "full" || prevCloud?.fullSyncDone ? { fullSyncDone: true } : {}),
+      // Latches only when an all-time `full` walk completes — never on a month
+      // window or a truncated chunk.
+      ...((mode === "full" && complete) || prevCloud?.fullSyncDone ? { fullSyncDone: true } : {}),
+      // resumeStartDate tags the window the resume belongs to, so a manual
+      // `sync-cursor` can't reuse an incremental resume marker (or vice versa).
+      ...(complete
+        ? {}
+        : {
+            resumePage: nextPage,
+            ...(startDate !== undefined ? { resumeStartDate: startDate } : {}),
+          }),
     },
   };
 }
@@ -131,7 +160,6 @@ export async function fetchCursorCloudEvents(
   opts: FetchCursorCloudOpts,
 ): Promise<FetchCursorCloudResult> {
   const loadAuth = opts.loadCursorCloudAuth ?? loadCursorCloudAuth;
-  const saveCreds = opts.saveCursorCredentials ?? saveCursorCredentials;
   const fetchEvents = opts.fetchFilteredUsageEvents ?? fetchFilteredUsageEvents;
   const nowFn = opts.now ?? Date.now;
   const syncNow = nowFn();
@@ -145,21 +173,29 @@ export async function fetchCursorCloudEvents(
       events: [],
       totalCount: 0,
       pagesFetched: 0,
+      complete: true,
     };
   }
 
   const startDate = computeCursorSyncStartDate(opts.state, opts.mode, syncNow);
   const endDate = computeCursorSyncEndDate(opts.mode, syncNow);
   const maxPages =
-    opts.mode === "full" || opts.mode === "month"
+    opts.maxPages ??
+    (opts.mode === "full" || opts.mode === "month"
       ? CURSOR_SYNC_FULL_MAX_PAGES
-      : CURSOR_SYNC_INCREMENTAL_MAX_PAGES;
+      : CURSOR_SYNC_INCREMENTAL_MAX_PAGES);
+  // Resume a truncated walk only when this call targets the same window that
+  // pinned resumePage; otherwise start fresh at page 1.
+  const cloud = opts.state.cursorCloud;
+  const startPage =
+    cloud?.resumePage !== undefined && cloud.resumeStartDate === startDate ? cloud.resumePage : 1;
 
   const r = await fetchEvents(opts.user, {
     token: auth.sessionToken,
     startDate,
     ...(endDate !== undefined ? { endDate } : {}),
     maxPages,
+    startPage,
     signal: opts.signal,
     ...(auth.refreshToken ? { refreshToken: auth.refreshToken } : {}),
     ...(auth.machineId ? { machineId: auth.machineId } : {}),
@@ -169,7 +205,10 @@ export async function fetchCursorCloudEvents(
   if (r.refreshedSessionToken) {
     const creds = await loadCursorCredentials(opts.stateDir);
     if (creds) {
-      await saveCreds(opts.stateDir, { ...creds, sessionToken: r.refreshedSessionToken });
+      await saveCursorCredentials(opts.stateDir, {
+        ...creds,
+        sessionToken: r.refreshedSessionToken,
+      });
     } else {
       await saveCursorToken(opts.stateDir, r.refreshedSessionToken);
     }
@@ -190,6 +229,8 @@ export async function fetchCursorCloudEvents(
     events: r.events,
     totalCount: r.totalCount,
     pagesFetched: r.pagesFetched,
+    complete: r.complete,
+    ...(r.complete ? {} : { nextPage: r.nextPage }),
   };
 }
 
@@ -219,6 +260,7 @@ export async function runCursorCloudSync(
       duplicates: 0,
       posted: false,
       skipped: false,
+      complete: false,
     };
   }
 
@@ -231,7 +273,15 @@ export async function runCursorCloudSync(
       duplicates: 0,
       posted: true,
       skipped: true,
+      complete: true,
     };
+  }
+
+  if (!fetched.complete) {
+    log.warn("cursor_cloud_truncated", {
+      pagesFetched: fetched.pagesFetched,
+      nextPage: fetched.nextPage,
+    });
   }
 
   let inserted = 0;
@@ -252,6 +302,8 @@ export async function runCursorCloudSync(
         duplicates: 0,
         posted: false,
         skipped: false,
+        complete: fetched.complete,
+        ...(fetched.complete ? {} : { nextPage: fetched.nextPage }),
       };
     }
     inserted = r.inserted;
@@ -259,12 +311,22 @@ export async function runCursorCloudSync(
   }
 
   return {
-    state: nextCursorCloudState(opts.state, opts.mode, fetched.events, now()),
+    state: nextCursorCloudState(
+      opts.state,
+      opts.mode,
+      fetched.events,
+      now(),
+      fetched.complete,
+      fetched.nextPage,
+      fetched.startDate,
+    ),
     eventsFetched: fetched.events.length,
     eventsPosted: fetched.events.length,
     inserted,
     duplicates,
     posted: true,
     skipped: false,
+    complete: fetched.complete,
+    ...(fetched.complete ? {} : { nextPage: fetched.nextPage }),
   };
 }

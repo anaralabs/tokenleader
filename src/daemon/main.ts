@@ -387,6 +387,7 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         stateDir: cfg.stateDir,
         transport,
         signal: ac.signal,
+        loadState: loadFn,
         saveState: saveFn,
       });
       state = out.state;

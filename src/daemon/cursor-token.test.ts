@@ -82,4 +82,29 @@ describe("cursor-token credential stores", () => {
       cleanup();
     }
   });
+
+  test("saveCursorCredentials refreshes the token store, never shadowing fresh creds", async () => {
+    const { dir, cleanup } = makeTmpDirSync("cursor-token-rotate-");
+    try {
+      await saveCursorCredentials(dir, {
+        sessionToken: "old-session",
+        refreshToken: "old-ref",
+        machineId: "mid",
+      });
+      await saveCursorCredentials(dir, {
+        sessionToken: "new-session",
+        refreshToken: "new-ref",
+        machineId: "mid",
+      });
+      // cursor_token shadows creds in loadCursorToken — it must track the
+      // newest session, and the creds store must agree so refresh material
+      // is still attached.
+      expect(await loadCursorToken(dir)).toBe("new-session");
+      const auth = await loadCursorCloudAuth(dir);
+      expect(auth?.sessionToken).toBe("new-session");
+      expect(auth?.refreshToken).toBe("new-ref");
+    } finally {
+      cleanup();
+    }
+  });
 });

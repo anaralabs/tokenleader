@@ -14,13 +14,7 @@ import { readEndpointOverride } from "./endpoint-override";
 import { loadState, saveState } from "./state";
 import { DEFAULT_BATCH_SIZE } from "./transport";
 
-export const CLI_COMMANDS = [
-  "link",
-  "devices",
-  "revoke",
-  "login-cursor",
-  "sync-cursor",
-] as const;
+export const CLI_COMMANDS = ["link", "devices", "revoke", "login-cursor", "sync-cursor"] as const;
 export type CliCommand = (typeof CLI_COMMANDS)[number];
 
 const FETCH_TIMEOUT_MS = 10_000;
@@ -288,7 +282,15 @@ async function runLoginCursor(deps: CliDeps, args: string[]): Promise<number> {
       );
       return 0;
     }
-    await saveFn(stateDir, r.state);
+    // Auth + POST already succeeded; a watermark-save failure is non-fatal
+    // (the next sync re-fetches with overlap), so warn and still return 0.
+    try {
+      await saveFn(stateDir, r.state);
+    } catch (err: unknown) {
+      print(
+        `Warning: synced Cursor usage but couldn't save local state (${String((err as Error)?.message ?? err)}).`,
+      );
+    }
     print(
       `Synced ${r.eventsFetched} Cursor events this month (${r.inserted} new, ${r.duplicates} already on server).`,
     );
@@ -306,7 +308,9 @@ async function runLoginCursor(deps: CliDeps, args: string[]): Promise<number> {
   const stateDir = resolveStateDir(env);
   await saveCursorToken(stateDir, token);
   print(`Cursor session token saved to ${path.join(stateDir, "cursor_token")}`);
-  print("Run `tokenleader sync-cursor` to backfill history, or wait for the daemon's next tick.");
+  print(
+    "The daemon backfills your full Cursor history automatically in the background; run `tokenleader sync-cursor` to do it now.",
+  );
   return 0;
 }
 

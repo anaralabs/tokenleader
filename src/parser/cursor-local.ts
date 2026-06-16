@@ -78,9 +78,12 @@ export function messageTypeForBubble(rec: Pick<BubbleRecord, "type" | "role">): 
 function readTokenCount(rec: BubbleRecord): { input: number; output: number } {
   const tc = rec.tokenCount;
   return {
-    input: typeof tc?.inputTokens === "number" && Number.isFinite(tc.inputTokens) ? tc.inputTokens : 0,
+    input:
+      typeof tc?.inputTokens === "number" && Number.isFinite(tc.inputTokens) ? tc.inputTokens : 0,
     output:
-      typeof tc?.outputTokens === "number" && Number.isFinite(tc.outputTokens) ? tc.outputTokens : 0,
+      typeof tc?.outputTokens === "number" && Number.isFinite(tc.outputTokens)
+        ? tc.outputTokens
+        : 0,
   };
 }
 
@@ -183,7 +186,11 @@ function loadAgentKvTimestamps(db: Database): Map<string, number> {
     if (composerId.length === 0 || composerId === "blob") continue;
     try {
       const raw = typeof row.value === "string" ? row.value : new TextDecoder().decode(row.value);
-      const parsed = JSON.parse(raw) as { createdAt?: number; lastUpdatedAt?: number; timestamp?: number };
+      const parsed = JSON.parse(raw) as {
+        createdAt?: number;
+        lastUpdatedAt?: number;
+        timestamp?: number;
+      };
       const ts = parsed.lastUpdatedAt ?? parsed.createdAt ?? parsed.timestamp;
       if (isNum(ts)) {
         const prev = map.get(composerId);

@@ -685,7 +685,7 @@ describe("tick", () => {
         listCodexFiles: async () => [],
         getCursorStateDbPath: () => dbPath,
         isCursorLocalEnabled: () => true,
-        statFile: async (path) => (path === dbPath ? { mtimeMs: 1 } : { mtimeMs: 1 }),
+        statFile: async () => ({ mtimeMs: 1 }),
         parseCursorLocal: (input) => ({
           events: [curEv],
           newRowid: 42,
@@ -719,10 +719,11 @@ describe("tick", () => {
         fetchCursorCloudEvents: async () => ({
           skipped: false,
           startDate: 0,
-          mode: "incremental",
+          mode: "month",
           events: [cloudEv],
           totalCount: 1,
           pagesFetched: 1,
+          complete: true,
         }),
         parseCursorTranscriptFile: async (input) => {
           transcriptParseCalls++;
@@ -751,7 +752,9 @@ describe("tick", () => {
     expect(transcriptParseCalls).toBe(0);
     expect(localCursorParseCalls).toBe(0);
     expect(out.result.eventsPosted).toBe(1);
-    expect(out.state.cursorCloud?.fullSyncDone).toBeUndefined();
+    // First cloud run (no completed backfill yet) does a full all-time backfill;
+    // a completed walk flips fullSyncDone so later ticks switch to incremental.
+    expect(out.state.cursorCloud?.fullSyncDone).toBe(true);
     expect(out.state.cursorCloud?.lastSyncAt).toBe(42);
   });
 
@@ -774,6 +777,7 @@ describe("tick", () => {
           events: [],
           totalCount: 0,
           pagesFetched: 0,
+          complete: true,
         }),
         parseCursorTranscriptFile: async (input) => {
           transcriptParseCalls++;
@@ -879,6 +883,162 @@ describe("tick", () => {
       mtimeMs: 99,
       byteOffset: 256,
     });
+  });
+
+  test("first cloud run does a full backfill; once done a later run goes incremental", async () => {
+    const dir = await makeTmpDir();
+    const modes: string[] = [];
+    const cloudEv = makeEvent({ messageId: "cloud1", source: "cursor", model: "cursor" });
+    const cloudStub: TickDeps["fetchCursorCloudEvents"] = async (o) => {
+      modes.push(o.mode);
+      return {
+        skipped: false,
+        startDate: 0,
+        mode: o.mode,
+        events: [cloudEv],
+        totalCount: 1,
+        pagesFetched: 1,
+        complete: true,
+      };
+    };
+
+    const first = await tick(
+      emptyState(),
+      mkTickDeps(dir, {
+        loadCursorToken: async () => "cursor-session",
+        fetchCursorCloudEvents: cloudStub,
+        postEvents: async (evs) => ({ ok: true, inserted: evs.length, duplicates: 0 }),
+      }),
+    );
+    expect(first.state.cursorCloud?.fullSyncDone).toBe(true);
+
+    // Second tick carries the persisted fullSyncDone forward → incremental.
+    await tick(
+      first.state,
+      mkTickDeps(dir, {
+        loadCursorToken: async () => "cursor-session",
+        fetchCursorCloudEvents: cloudStub,
+        postEvents: async (evs) => ({ ok: true, inserted: evs.length, duplicates: 0 }),
+      }),
+    );
+    expect(modes).toEqual(["full", "incremental"]);
+  });
+
+  test("background backfill drains across ticks before switching to incremental", async () => {
+    const dir = await makeTmpDir();
+    const calls: { mode: string; maxPages?: number }[] = [];
+    // Truncate the first chunk, complete the second; the third tick (now
+    // fullSyncDone) must go incremental.
+    const scripted = [
+      { complete: false, nextPage: 26 },
+      { complete: true as const, nextPage: undefined },
+      { complete: true as const, nextPage: undefined },
+    ];
+    let i = 0;
+    const cloudStub: TickDeps["fetchCursorCloudEvents"] = async (o) => {
+      const step = scripted[i++]!;
+      calls.push({ mode: o.mode, maxPages: o.maxPages });
+      return {
+        skipped: false,
+        startDate: 0,
+        mode: o.mode,
+        events: [makeEvent({ messageId: `cloud${i}`, source: "cursor", model: "cursor" })],
+        totalCount: 99,
+        pagesFetched: 25,
+        complete: step.complete,
+        ...(step.nextPage !== undefined ? { nextPage: step.nextPage } : {}),
+      };
+    };
+    const deps = () =>
+      mkTickDeps(dir, {
+        loadCursorToken: async () => "cursor-session",
+        fetchCursorCloudEvents: cloudStub,
+        postEvents: async (evs) => ({ ok: true, inserted: evs.length, duplicates: 0 }),
+      });
+
+    const t1 = await tick(emptyState(), deps());
+    // Truncated full chunk: not done, resume pinned to its window.
+    expect(t1.state.cursorCloud?.fullSyncDone).toBeUndefined();
+    expect(t1.state.cursorCloud?.resumePage).toBe(26);
+    expect(t1.state.cursorCloud?.resumeStartDate).toBe(0);
+
+    const t2 = await tick(t1.state, deps());
+    expect(t2.state.cursorCloud?.fullSyncDone).toBe(true);
+    expect(t2.state.cursorCloud?.resumePage).toBeUndefined();
+
+    await tick(t2.state, deps());
+    expect(calls.map((c) => c.mode)).toEqual(["full", "full", "incremental"]);
+    // Backfill chunks carry the bounded page cap; the incremental tick doesn't.
+    expect(calls[0]!.maxPages).toBe(25);
+    expect(calls[2]!.maxPages).toBeUndefined();
+  });
+
+  test("re-reads state.json so a concurrent CLI cursorCloud write isn't clobbered", async () => {
+    const dir = await makeTmpDir();
+    // The CLI wrote a fresh watermark to disk after the daemon loaded state.
+    await saveState(dir, {
+      ...emptyState(),
+      cursorCloud: { lastSyncAt: 5, lastEventTimestamp: 9_000, fullSyncDone: true },
+    });
+    let seenState: DaemonState | null = null;
+    const out = await tick(
+      emptyState(), // stale in-memory copy with no cursorCloud
+      mkTickDeps(dir, {
+        loadCursorToken: async () => "cursor-session",
+        fetchCursorCloudEvents: async (o) => {
+          seenState = o.state;
+          return {
+            skipped: false,
+            startDate: 0,
+            mode: o.mode,
+            events: [],
+            totalCount: 0,
+            pagesFetched: 1,
+            complete: true,
+          };
+        },
+        postEvents: async (evs) => ({ ok: true, inserted: evs.length, duplicates: 0 }),
+      }),
+    );
+    // The merged state the fetch saw carries the disk watermark, not emptyState.
+    expect(seenState!.cursorCloud?.lastEventTimestamp).toBe(9_000);
+    expect(out.state.cursorCloud?.fullSyncDone).toBe(true);
+    expect(out.state.cursorCloud?.lastEventTimestamp).toBe(9_000);
+  });
+
+  test("truncated cloud fetch pins resumePage and freezes the watermark", async () => {
+    const dir = await makeTmpDir();
+    await saveState(dir, {
+      ...emptyState(),
+      cursorCloud: { lastSyncAt: 5, lastEventTimestamp: 8_000, fullSyncDone: true },
+    });
+    const cloudEv = makeEvent({
+      messageId: "cloud1",
+      source: "cursor",
+      model: "cursor",
+      timestamp: 50_000,
+    });
+    const out = await tick(
+      emptyState(),
+      mkTickDeps(dir, {
+        loadCursorToken: async () => "cursor-session",
+        fetchCursorCloudEvents: async (o) => ({
+          skipped: false,
+          startDate: 0,
+          mode: o.mode,
+          events: [cloudEv],
+          totalCount: 99,
+          pagesFetched: 10,
+          complete: false,
+          nextPage: 11,
+        }),
+        postEvents: async (evs) => ({ ok: true, inserted: evs.length, duplicates: 0 }),
+      }),
+    );
+    expect(out.result.eventsPosted).toBe(1);
+    expect(out.state.cursorCloud?.resumePage).toBe(11);
+    // Watermark stays put on truncation (pages are newest-first).
+    expect(out.state.cursorCloud?.lastEventTimestamp).toBe(8_000);
   });
 });
 

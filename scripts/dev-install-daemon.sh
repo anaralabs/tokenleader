@@ -34,6 +34,7 @@ echo "Stopping LaunchAgent (if running)..."
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 
 tmp="${BIN_DST}.tmp.$$"
+trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
 cp "$BIN_SRC" "$tmp"
 chmod +x "$tmp"
 xattr -cr "$tmp" 2>/dev/null || true

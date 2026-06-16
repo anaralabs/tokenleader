@@ -53,13 +53,37 @@ describe("parseCursorTranscriptFile", () => {
     expect(r.events[0]!.timestamp).toBe(mtimeMs);
     expect(r.events[0]!.sessionId).toBe(sessionId);
     expect(r.events[0]!.messageId).toBe(stableTranscriptMessageId(path, 1));
+    expect(r.events[0]!.inputTokens).toBe(0);
+    expect(r.events[0]!.outputTokens).toBe(0);
     expect(r.events[1]!.messageType).toBe("assistant");
+    expect(r.events[1]!.inputTokens).toBe(0);
     expect(r.events[1]!.outputTokens).toBe(Math.ceil(32 / 4));
     expect(r.nextLineIndex).toBe(2);
     expect(r.seenDedupKeys).toEqual([
       `${stableTranscriptMessageId(path, 1)}:`,
       `${stableTranscriptMessageId(path, 2)}:`,
     ]);
+  });
+
+  it("drops assistant lines with no estimable output tokens", async () => {
+    const { path, mtimeMs } = makeTranscriptFile([
+      JSON.stringify({
+        role: "assistant",
+        message: { content: [{ type: "tool_use", text: "x" }] },
+      }),
+      JSON.stringify({ role: "user", message: { content: [{ type: "text", text: "hi" }] } }),
+    ]);
+
+    const r = await parseCursorTranscriptFile({
+      path,
+      byteOffset: 0,
+      user: "carol",
+      fileMtimeMs: mtimeMs,
+    });
+
+    expect(r.events.length).toBe(1);
+    expect(r.events[0]!.messageType).toBe("user");
+    expect(r.nextLineIndex).toBe(2);
   });
 
   it("keeps stable line ids across incremental reads", async () => {

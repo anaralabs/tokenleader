@@ -1,15 +1,11 @@
-import { createHash } from "node:crypto";
-import {
-  buildWorkosSessionToken,
-  refreshCursorAccessToken,
-} from "./cursor-auth.ts";
+import { buildWorkosSessionToken, refreshCursorAccessToken } from "./cursor-auth.ts";
+import { centsToMicros, cursorMessageId, cursorSessionId } from "./cursor-dedup.ts";
 import type { TokenEvent } from "../types.ts";
 
 /** Bare-host canonical URL — www redirects and POST CSRF checks expect this. */
 export const CURSOR_ORIGIN = "https://cursor.com";
 
-export const CURSOR_DASHBOARD_API =
-  `${CURSOR_ORIGIN}/api/dashboard/get-filtered-usage-events`;
+export const CURSOR_DASHBOARD_API = `${CURSOR_ORIGIN}/api/dashboard/get-filtered-usage-events`;
 
 export const CURSOR_USAGE_SUMMARY_API = `${CURSOR_ORIGIN}/api/usage-summary`;
 
@@ -101,6 +97,8 @@ export interface FetchFilteredUsageEventsOptions {
   pageSize?: number;
   /** Max pages to fetch this call (safety cap). Default 100. */
   maxPages?: number;
+  /** 1-based page to start at (resume across truncated calls). Default 1. */
+  startPage?: number;
   fetchImpl?: typeof fetch;
   signal?: AbortSignal;
 }
@@ -109,6 +107,13 @@ export interface FetchFilteredUsageEventsResult {
   events: TokenEvent[];
   totalCount: number;
   pagesFetched: number;
+  /**
+   * True iff the loop stopped because the API signalled no more data. False
+   * iff it stopped at the maxPages cap with more pages possibly remaining.
+   */
+  complete: boolean;
+  /** Present iff `complete === false`: 1-based page to resume from next call. */
+  nextPage?: number;
   /** Set when a 401 triggered a token refresh during the fetch. */
   refreshedSessionToken?: string;
 }
@@ -171,8 +176,7 @@ function readTokenFields(ev: CursorDashboardUsageEvent): {
       : typeof tu?.outputTokens === "number"
         ? tu.outputTokens
         : 0;
-  const cacheCreationTokens =
-    typeof tu?.cacheWriteTokens === "number" ? tu.cacheWriteTokens : 0;
+  const cacheCreationTokens = typeof tu?.cacheWriteTokens === "number" ? tu.cacheWriteTokens : 0;
   const cacheReadTokens = typeof tu?.cacheReadTokens === "number" ? tu.cacheReadTokens : 0;
   const totalCents =
     typeof ev.totalCents === "number"
@@ -187,14 +191,6 @@ function readTokenFields(ev: CursorDashboardUsageEvent): {
     cacheReadTokens,
     totalCents,
   };
-}
-
-function cursorSessionId(user: string, tsMs: number): string {
-  const d = new Date(tsMs);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `cursor:${user}:${yyyy}-${mm}-${dd}`;
 }
 
 /**
@@ -221,23 +217,16 @@ export function mapCursorDashboardEvent(
   // Deterministic messageId when the dashboard omits id — matches team mirror.
   const messageId =
     id ??
-    createHash("sha256")
-      .update(String(timestamp))
-      .update(":")
-      .update(model)
-      .update(":")
-      .update(String(tokens.inputTokens))
-      .update(":")
-      .update(String(tokens.outputTokens))
-      .update(":")
-      .update(String(tokens.cacheCreationTokens))
-      .update(":")
-      .update(String(tokens.cacheReadTokens))
-      .digest("hex")
-      .slice(0, 24);
+    cursorMessageId({
+      timestamp,
+      model,
+      inputTokens: tokens.inputTokens,
+      outputTokens: tokens.outputTokens,
+      cacheWriteTokens: tokens.cacheCreationTokens,
+      cacheReadTokens: tokens.cacheReadTokens,
+    });
 
-  // totalCents is fractional cents; 1 cent = 10_000 micros.
-  const costUsdMicros = Math.round(tokens.totalCents * 10_000);
+  const costUsdMicros = centsToMicros(tokens.totalCents);
 
   return {
     user,
@@ -299,10 +288,6 @@ export async function validateCursorToken(
       continue;
     }
 
-    if (res.status === 401 || res.status === 403) {
-      const detail = await readCursorApiError(res);
-      throw new Error(authFailureMessage(res.status, detail));
-    }
     if (!res.ok) {
       const detail = await readCursorApiError(res);
       throw new Error(authFailureMessage(res.status, detail));
@@ -337,11 +322,16 @@ export async function fetchFilteredUsageEvents(
   };
   let refreshedSessionToken: string | undefined;
 
+  const startPage = opts.startPage ?? 1;
+  const lastPageCap = startPage + maxPages - 1;
+
   const events: TokenEvent[] = [];
   let totalCount = 0;
   let pagesFetched = 0;
+  let complete = false;
+  let lastPage = startPage - 1;
 
-  for (let page = 1; page <= maxPages; page++) {
+  for (let page = startPage; page <= lastPageCap; page++) {
     const body: Record<string, unknown> = {
       pageSize,
       page,
@@ -372,22 +362,44 @@ export async function fetchFilteredUsageEvents(
       throw new Error(authFailureMessage(res.status, detail));
     }
 
-    const json = (await res.json()) as CursorDashboardUsageResponse;
+    let json: CursorDashboardUsageResponse;
+    try {
+      json = (await res.json()) as CursorDashboardUsageResponse;
+    } catch {
+      throw new Error("cursor dashboard API returned a non-JSON response");
+    }
     pagesFetched += 1;
+    lastPage = page;
     totalCount = json.totalUsageEventsCount ?? totalCount;
 
-    for (const raw of eventsFromResponse(json)) {
+    const pageEvents = eventsFromResponse(json);
+    for (const raw of pageEvents) {
       const mapped = mapCursorDashboardEvent(raw, user);
       if (mapped) events.push(mapped);
     }
 
-    const pageEvents = eventsFromResponse(json);
-    if (pageEvents.length === 0) break;
-    if (json.pagination?.hasNextPage === false) break;
+    if (pageEvents.length === 0) {
+      complete = true;
+      break;
+    }
+    if (json.pagination?.hasNextPage === false) {
+      complete = true;
+      break;
+    }
     // Personal dashboard responses often omit pagination; keep going while
     // pages come back full.
-    if (json.pagination?.hasNextPage !== true && pageEvents.length < pageSize) break;
+    if (json.pagination?.hasNextPage !== true && pageEvents.length < pageSize) {
+      complete = true;
+      break;
+    }
   }
 
-  return { events, totalCount, pagesFetched, refreshedSessionToken };
+  return {
+    events,
+    totalCount,
+    pagesFetched,
+    complete,
+    ...(complete ? {} : { nextPage: lastPage + 1 }),
+    refreshedSessionToken,
+  };
 }

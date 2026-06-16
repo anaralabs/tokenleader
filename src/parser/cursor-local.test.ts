@@ -11,7 +11,12 @@ import {
   parseCursorLocal,
   resolveCursorTimestamp,
 } from "./cursor-local.ts";
-import { getCursorGlobalStorageDir, getCursorProjectsDir, getCursorStateDbPath, isCursorLocalEnabled } from "./index.ts";
+import {
+  getCursorGlobalStorageDir,
+  getCursorProjectsDir,
+  getCursorStateDbPath,
+  isCursorLocalEnabled,
+} from "./index.ts";
 
 const tmpDirs: string[] = [];
 
@@ -21,9 +26,10 @@ afterEach(() => {
   }
 });
 
-function makeCursorDb(
-  rows: Array<{ key: string; value: unknown }>,
-): { dbPath: string; dir: string } {
+function makeCursorDb(rows: Array<{ key: string; value: unknown }>): {
+  dbPath: string;
+  dir: string;
+} {
   const dir = mkdtempSync(join(tmpdir(), "cursor-local-test-"));
   tmpDirs.push(dir);
   const dbPath = join(dir, "state.vscdb");
@@ -59,7 +65,12 @@ describe("parseCursorLocal", () => {
       },
     ]);
 
-    const r = parseCursorLocal({ dbPath, lastRowid: 0, user: "alice", dbMtimeMs: 1_780_000_000_000 });
+    const r = parseCursorLocal({
+      dbPath,
+      lastRowid: 0,
+      user: "alice",
+      dbMtimeMs: 1_780_000_000_000,
+    });
     expect(r.events.length).toBe(1);
     expect(r.events[0]).toEqual({
       user: "alice",
@@ -98,7 +109,12 @@ describe("parseCursorLocal", () => {
       },
     ]);
 
-    const r = parseCursorLocal({ dbPath, lastRowid: 0, user: "alice", dbMtimeMs: 1_780_000_000_000 });
+    const r = parseCursorLocal({
+      dbPath,
+      lastRowid: 0,
+      user: "alice",
+      dbMtimeMs: 1_780_000_000_000,
+    });
     expect(r.events[0]!.timestamp).toBe(1_780_500_000_000);
   });
 
@@ -193,7 +209,12 @@ describe("parseCursorLocal", () => {
       },
     ]);
 
-    const r = parseCursorLocal({ dbPath, lastRowid: 0, user: "carol", dbMtimeMs: 1_780_000_000_000 });
+    const r = parseCursorLocal({
+      dbPath,
+      lastRowid: 0,
+      user: "carol",
+      dbMtimeMs: 1_780_000_000_000,
+    });
     expect(r.events.length).toBe(1);
     expect(r.events[0]!.messageType).toBe("user");
     expect(r.events[0]!.inputTokens).toBe(0);

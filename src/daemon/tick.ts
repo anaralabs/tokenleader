@@ -1,12 +1,23 @@
 import { promises as fsp } from "node:fs";
 import type { DaemonState, FileState, TokenEvent } from "../types";
-import { fetchCursorCloudEvents, nextCursorCloudState } from "./cursor-sync";
+import {
+  CURSOR_SYNC_BACKFILL_MAX_PAGES,
+  type CursorSyncMode,
+  fetchCursorCloudEvents,
+  nextCursorCloudState,
+} from "./cursor-sync";
 import { loadCursorToken } from "./cursor-token";
 import { log } from "./log";
-import { pruneMissingFiles, saveState } from "./state";
+import { loadState, pruneMissingFiles, saveState } from "./state";
 import { postEvents, type TransportOpts } from "./transport";
 
-import { listClaudeCodeFiles, listCodexFiles, listCursorTranscriptFiles, getCursorStateDbPath, isCursorLocalEnabled } from "../parser/index";
+import {
+  listClaudeCodeFiles,
+  listCodexFiles,
+  listCursorTranscriptFiles,
+  getCursorStateDbPath,
+  isCursorLocalEnabled,
+} from "../parser/index";
 import { parseClaudeCodeFile } from "../parser/claude-code";
 import { parseCodexFile, type CodexSessionTotals } from "../parser/codex";
 import { parseCursorLocal } from "../parser/cursor-local";
@@ -33,6 +44,7 @@ export interface TickDeps {
   postEvents?: typeof postEvents;
   // stat returns mtimeMs. We override in tests.
   statFile?: (path: string) => Promise<{ mtimeMs: number } | null>;
+  loadState?: typeof loadState;
   saveState?: typeof saveState;
   now?: () => number;
 }
@@ -65,6 +77,26 @@ function dedupKey(ev: TokenEvent): string {
 }
 
 /**
+ * Append events to `collected`, rejecting any whose dedup key was already
+ * seen this tick. `seenKeys[i]` overrides the synthesized key for source i
+ * (CC / Cursor parsers report their own); fall back to `dedupKey`.
+ */
+function collectDeduped(
+  events: TokenEvent[],
+  collected: TokenEvent[],
+  seenThisTick: Set<string>,
+  seenKeys?: ReadonlyArray<string | undefined>,
+): void {
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    const k = seenKeys?.[i] ?? dedupKey(ev);
+    if (seenThisTick.has(k)) continue;
+    seenThisTick.add(k);
+    collected.push(ev);
+  }
+}
+
+/**
  * One poll iteration:
  *   1. List all current Claude Code + Codex files.
  *   2. For each, if mtime > recorded mtime (or unknown), parse from offset.
@@ -76,7 +108,7 @@ function dedupKey(ev: TokenEvent): string {
  * Mutates nothing; takes a state in, returns a new state out.
  */
 export async function tick(
-  initial: DaemonState,
+  inMemory: DaemonState,
   deps: TickDeps,
 ): Promise<{ state: DaemonState; result: TickResult }> {
   const listCC = deps.listClaudeCodeFiles ?? listClaudeCodeFiles;
@@ -92,8 +124,21 @@ export async function tick(
   const fetchCloud = deps.fetchCursorCloudEvents ?? fetchCursorCloudEvents;
   const post = deps.postEvents ?? postEvents;
   const stat = deps.statFile ?? defaultStat;
+  const load = deps.loadState ?? loadState;
   const persist = deps.saveState ?? saveState;
   const now = deps.now ?? Date.now;
+
+  // The CLI (`sync-cursor`, `login-cursor --auto`) writes cursorCloud /
+  // cursorLocal watermarks to state.json out-of-band. We hold file offsets in
+  // memory but those Cursor watermarks live only on disk, so re-read and merge
+  // them before computing this tick — otherwise our in-memory copy clobbers a
+  // concurrent CLI write. A corrupt/missing file yields emptyState (no-op merge).
+  const onDisk = await load(deps.stateDir);
+  const initial: DaemonState = {
+    ...inMemory,
+    ...(onDisk.cursorCloud ? { cursorCloud: onDisk.cursorCloud } : {}),
+    ...(onDisk.cursorLocal ? { cursorLocal: onDisk.cursorLocal } : {}),
+  };
 
   const cursorEnabled = cursorEnabledFn();
   let cursorToken: string | null = null;
@@ -131,8 +176,21 @@ export async function tick(
   const pendingUpdates: FileState[] = [];
   let pendingCursorLocal: DaemonState["cursorLocal"] | undefined;
   let pendingCursorCloud:
-    | { mode: "incremental"; events: TokenEvent[] }
+    | {
+        mode: CursorSyncMode;
+        startDate: number;
+        events: TokenEvent[];
+        complete: boolean;
+        nextPage?: number;
+      }
     | undefined;
+
+  // Until the one-time all-time backfill completes (fullSyncDone), pull full
+  // history in bounded chunks drained across ticks via resumePage — so a large
+  // back-catalogue lands automatically in the background without ever blocking
+  // a tick. Once done, switch to the cheap incremental window.
+  const cloudNeedsBackfill = !initial.cursorCloud?.fullSyncDone;
+  const cloudMode: CursorSyncMode = cloudNeedsBackfill ? "full" : "incremental";
 
   // Run cloud Cursor fetch up front: its outcome decides whether to parse
   // local Cursor sources this tick (avoids double-counting the same usage
@@ -144,19 +202,29 @@ export async function tick(
         user: deps.user,
         stateDir: deps.stateDir,
         state: initial,
-        mode: "incremental",
+        mode: cloudMode,
         signal: deps.signal,
         now,
+        ...(cloudNeedsBackfill ? { maxPages: CURSOR_SYNC_BACKFILL_MAX_PAGES } : {}),
       });
       if (!cloud.skipped) {
         cloudReady = true;
-        pendingCursorCloud = { mode: "incremental", events: cloud.events };
-        for (const ev of cloud.events) {
-          const k = dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          collected.push(ev);
+        pendingCursorCloud = {
+          mode: cloudMode,
+          startDate: cloud.startDate,
+          events: cloud.events,
+          complete: cloud.complete,
+          ...(cloud.complete ? {} : { nextPage: cloud.nextPage }),
+        };
+        if (!cloud.complete) {
+          // Backfill chunking is expected progress (info); an incremental
+          // truncation is an anomaly worth a warning.
+          const evt = cloudNeedsBackfill ? "cursor_cloud_backfill" : "cursor_cloud_truncated";
+          const fields = { pagesFetched: cloud.pagesFetched, nextPage: cloud.nextPage };
+          if (cloudNeedsBackfill) log.info(evt, fields);
+          else log.warn(evt, fields);
         }
+        collectDeduped(cloud.events, collected, seenThisTick);
       }
     } catch (err: unknown) {
       log.error("cursor_cloud_fetch_failed", {
@@ -204,15 +272,7 @@ export async function tick(
           byteOffset,
           user: deps.user,
         });
-        const accepted: TokenEvent[] = [];
-        for (let i = 0; i < r.events.length; i++) {
-          const ev = r.events[i]!;
-          const k = r.seenDedupKeys[i] ?? dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          accepted.push(ev);
-        }
-        for (const ev of accepted) collected.push(ev);
+        collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
         if (r.oversizeSkipped) {
           log.warn("oversize_record_skipped", {
             path: item.path,
@@ -234,15 +294,7 @@ export async function tick(
           fileMtimeMs: st.mtimeMs,
           startingLineIndex: prev?.transcriptLineIndex ?? 0,
         });
-        const accepted: TokenEvent[] = [];
-        for (let i = 0; i < r.events.length; i++) {
-          const ev = r.events[i]!;
-          const k = r.seenDedupKeys[i] ?? dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          accepted.push(ev);
-        }
-        for (const ev of accepted) collected.push(ev);
+        collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
         if (r.oversizeSkipped) {
           log.warn("oversize_record_skipped", {
             path: item.path,
@@ -264,12 +316,7 @@ export async function tick(
           user: deps.user,
           ...(prevTotals ? { prevSessionTotals: prevTotals } : {}),
         });
-        for (const ev of r.events) {
-          const k = dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          collected.push(ev);
-        }
+        collectDeduped(r.events, collected, seenThisTick);
         if (r.oversizeSkipped) {
           log.warn("oversize_record_skipped", {
             path: item.path,
@@ -304,8 +351,7 @@ export async function tick(
     if (dbStat) {
       eligible++;
       const prevCursor = initial.cursorLocal;
-      const lastRowid =
-        prevCursor?.dbPath === cursorDbPath ? (prevCursor.lastRowid ?? 0) : 0;
+      const lastRowid = prevCursor?.dbPath === cursorDbPath ? (prevCursor.lastRowid ?? 0) : 0;
       try {
         const r = parseCur({
           dbPath: cursorDbPath,
@@ -313,13 +359,7 @@ export async function tick(
           user: deps.user,
           dbMtimeMs: dbStat.mtimeMs,
         });
-        for (let i = 0; i < r.events.length; i++) {
-          const ev = r.events[i]!;
-          const k = r.seenDedupKeys[i] ?? dedupKey(ev);
-          if (seenThisTick.has(k)) continue;
-          seenThisTick.add(k);
-          collected.push(ev);
-        }
+        collectDeduped(r.events, collected, seenThisTick, r.seenDedupKeys);
         pendingCursorLocal = { dbPath: cursorDbPath, lastRowid: r.newRowid };
       } catch (err: unknown) {
         log.error("parse_failed", {
@@ -360,11 +400,17 @@ export async function tick(
   if (posted) {
     let merged = initial;
     if (pendingCursorCloud) {
+      // `full` mode latches fullSyncDone only when the all-time walk completes;
+      // an unfinished backfill keeps fullSyncDone false and pins resumePage so
+      // the next tick continues the chunked drain.
       merged = nextCursorCloudState(
         merged,
         pendingCursorCloud.mode,
         pendingCursorCloud.events,
         now(),
+        pendingCursorCloud.complete,
+        pendingCursorCloud.nextPage,
+        pendingCursorCloud.startDate,
       );
     }
     for (const u of pendingUpdates) {

@@ -157,7 +157,7 @@ cleanup_spinner() {
   fi
   SPINNER_PID=""
 }
-trap 'cleanup_spinner; tput cnorm 2>/dev/null || true' EXIT INT TERM
+trap 'cleanup_spinner; tput cnorm 2>/dev/null || true; rm -f "${tmp:-}" 2>/dev/null || true' EXIT INT TERM
 
 step_start() {
   CUR_STEP_N="$1"

@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import {
   CURSOR_AUTH_KEYS,
@@ -15,13 +16,10 @@ function makeTestVscdb(values: Record<string, string>): string {
   const dbPath = join(dir, "state.vscdb");
   execFileSync("sqlite3", [dbPath, "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);"]);
   for (const [key, value] of Object.entries(values)) {
-    execFileSync(
-      "sqlite3",
-      [
-        dbPath,
-        `INSERT INTO ItemTable (key, value) VALUES ('${key.replace(/'/g, "''")}', '${value.replace(/'/g, "''")}');`,
-      ],
-    );
+    execFileSync("sqlite3", [
+      dbPath,
+      `INSERT INTO ItemTable (key, value) VALUES ('${key.replace(/'/g, "''")}', '${value.replace(/'/g, "''")}');`,
+    ]);
   }
   return dbPath;
 }
@@ -46,14 +44,34 @@ describe("cursor-locator", () => {
     }
   });
 
+  test("readCursorIdeAuth copies WAL sidecars so it reads uncommitted writes", () => {
+    // Leave a WAL-mode connection open with autocheckpoint off so the rows
+    // live only in state.vscdb-wal — copying state.vscdb alone would miss them.
+    const dir = mkdtempSync(join(tmpdir(), "tokenleader-vscdb-wal-"));
+    const dbPath = join(dir, "state.vscdb");
+    const db = new Database(dbPath, { create: true });
+    db.run("PRAGMA journal_mode=WAL");
+    db.run("PRAGMA wal_autocheckpoint=0");
+    db.run("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)");
+    const jwt = "eyJhbGciOiJub25lIn0.eyJzdWIiOiJhdXRoMHx1c2VyX2xvY2FsIn0.sig";
+    const insert = db.query("INSERT INTO ItemTable (key, value) VALUES ($k, $v)");
+    insert.run({ $k: CURSOR_AUTH_KEYS.accessToken, $v: jwt });
+    insert.run({ $k: CURSOR_AUTH_KEYS.refreshToken, $v: "refresh-abc" });
+    try {
+      const auth = readCursorIdeAuth(dbPath);
+      expect(auth.accessToken).toBe(jwt);
+      expect(auth.refreshToken).toBe("refresh-abc");
+    } finally {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("readCursorMachineId reads telemetry.machineId from storage.json", () => {
     const dir = mkdtempSync(join(tmpdir(), "tokenleader-storage-"));
     const storagePath = join(dir, "storage.json");
     const machineId = "289aedcf3ccf5d3814ed682c26c4076833600e42e397cd1c50d918a335a531a8";
-    Bun.write(
-      storagePath,
-      JSON.stringify({ [CURSOR_STORAGE_MACHINE_ID_KEY]: machineId }),
-    );
+    Bun.write(storagePath, JSON.stringify({ [CURSOR_STORAGE_MACHINE_ID_KEY]: machineId }));
     try {
       expect(readCursorMachineId(storagePath)).toBe(machineId);
     } finally {

@@ -1,39 +1,45 @@
 #!/usr/bin/env bash
 # End-to-end production simulation (local server + real daemon/CLI).
-# Temporarily repoints the daemon at http://localhost:8787 via the same
-# endpoint-override file production migrations use.
+# Runs against an ISOLATED state dir so it never touches the user's real
+# daemon state. Cursor credentials are copied in read-only; the localhost
+# endpoint override is written into the throwaway dir and discarded on exit.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-STATE_DIR="${TOKENLEADER_STATE_DIR:-$HOME/.local/share/anara-leaderboard}"
+REAL_STATE_DIR="${TOKENLEADER_STATE_DIR:-$HOME/.local/share/anara-leaderboard}"
 E2E_DB="${E2E_DB:-/tmp/tokenleader-e2e-prod/db.sqlite}"
 SERVER_PORT="${SERVER_PORT:-8787}"
 SERVER_PID=""
-ENDPOINT_BACKUP=""
+
+# Isolated state dir — exported so the daemon/CLI never read or write the real
+# one ($HOME/.local/share/anara-leaderboard).
+STATE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tokenleader-e2e.XXXXXX")"
+export TOKENLEADER_STATE_DIR="$STATE_DIR"
+# Same user for sync-cursor, the tick, and the verify query.
+export TOKENLEADER_USER="${TOKENLEADER_USER:-tavi}"
 
 cleanup() {
   if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
   fi
-  if [[ -n "$ENDPOINT_BACKUP" ]]; then
-    if [[ -f "$ENDPOINT_BACKUP" ]]; then
-      mv "$ENDPOINT_BACKUP" "$STATE_DIR/endpoint"
-    elif [[ -f "$STATE_DIR/endpoint" ]]; then
-      rm -f "$STATE_DIR/endpoint"
-    fi
-  fi
+  rm -rf "$STATE_DIR"
 }
 trap cleanup EXIT
 
 mkdir -p "$(dirname "$E2E_DB")"
 rm -f "$E2E_DB"
 
-# Save / replace endpoint override (must be http://localhost — daemon security rule).
-if [[ -f "$STATE_DIR/endpoint" ]]; then
-  ENDPOINT_BACKUP="$STATE_DIR/endpoint.e2e-backup.$$"
-  mv "$STATE_DIR/endpoint" "$ENDPOINT_BACKUP"
-fi
+# Seed Cursor credentials from the real state dir (read-only copy) so
+# sync-cursor can authenticate without us touching the real dir.
+for f in cursor_token cursor_credentials.json; do
+  if [[ -f "$REAL_STATE_DIR/$f" ]]; then
+    cp "$REAL_STATE_DIR/$f" "$STATE_DIR/$f"
+  fi
+done
+
+# Endpoint override (must be http://localhost — daemon security rule). Lives in
+# the throwaway dir, so the real daemon is never repointed.
 printf 'http://localhost:%s\n' "$SERVER_PORT" > "$STATE_DIR/endpoint"
 
 echo "==> Starting production-like server on http://localhost:${SERVER_PORT}"
@@ -47,8 +53,8 @@ for _ in $(seq 1 30); do
 done
 curl -sf "http://localhost:${SERVER_PORT}/health" >/dev/null
 
-if [[ ! -f "$STATE_DIR/cursor_token" ]]; then
-  echo "ERROR: no cursor_token — run: tokenleader login-cursor '<token>'"
+if [[ ! -f "$STATE_DIR/cursor_token" && ! -f "$STATE_DIR/cursor_credentials.json" ]]; then
+  echo "ERROR: no Cursor credentials in $REAL_STATE_DIR — run: tokenleader login-cursor --auto (macOS) or tokenleader login-cursor '<token>'"
   exit 1
 fi
 
@@ -62,19 +68,17 @@ echo "==> Full backfill (sync-cursor)"
 "$BIN" sync-cursor
 
 echo "==> Daemon single tick (TOKENLEADER_RUN_ONCE=1)"
-TOKENLEADER_USER="${TOKENLEADER_USER:-tavi}" \
-TOKENLEADER_ENDPOINT="https://tokenleader-production.up.railway.app" \
-TOKENLEADER_STATE_DIR="$STATE_DIR" \
+TOKENLEADER_ENDPOINT="http://localhost:${SERVER_PORT}" \
 TOKENLEADER_RUN_ONCE=1 \
 "$BIN"
 
 echo ""
 echo "==> Dashboard: http://localhost:${SERVER_PORT}/"
-curl -sf "http://localhost:${SERVER_PORT}/stats?user=${TOKENLEADER_USER:-tavi}" | bun -e "
+curl -sf "http://localhost:${SERVER_PORT}/stats?user=${TOKENLEADER_USER}" | bun -e "
 const j = await Bun.stdin.json();
 console.log('User:', j.user);
 console.log('Events:', (j.byModel||[]).reduce((s,r)=>s+r.count,0));
 console.log('Total cost: \$' + (j.totalCostUsd?.toFixed(2) ?? '0'));
 "
 echo ""
-echo "Done. Endpoint override restored on exit."
+echo "Done. Isolated state dir removed on exit."

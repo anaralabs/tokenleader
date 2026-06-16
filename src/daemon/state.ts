@@ -62,6 +62,8 @@ function isDaemonState(value: unknown): value is DaemonState {
       return false;
     }
     if (c.fullSyncDone !== undefined && typeof c.fullSyncDone !== "boolean") return false;
+    if (c.resumePage !== undefined && typeof c.resumePage !== "number") return false;
+    if (c.resumeStartDate !== undefined && typeof c.resumeStartDate !== "number") return false;
   }
   for (const fs of Object.values(v.files as Record<string, unknown>)) {
     if (!fs || typeof fs !== "object") return false;

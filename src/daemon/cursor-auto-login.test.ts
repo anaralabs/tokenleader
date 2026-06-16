@@ -14,7 +14,6 @@ import {
   verifyCursorAccessToken,
 } from "../parser/cursor-auth.ts";
 import { CURSOR_AUTH_KEYS } from "../parser/cursor-locator.ts";
-import { readCursorIdeAuth } from "../parser/cursor-locator.ts";
 import { extractCursorSessionToken } from "./cursor-auto-login.ts";
 
 function makeJwt(sub: string): string {
@@ -28,13 +27,10 @@ function makeTestVscdb(values: Record<string, string>): string {
   const dbPath = join(dir, "state.vscdb");
   execFileSync("sqlite3", [dbPath, "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);"]);
   for (const [key, value] of Object.entries(values)) {
-    execFileSync(
-      "sqlite3",
-      [
-        dbPath,
-        `INSERT INTO ItemTable (key, value) VALUES ('${key.replace(/'/g, "''")}', '${value.replace(/'/g, "''")}');`,
-      ],
-    );
+    execFileSync("sqlite3", [
+      dbPath,
+      `INSERT INTO ItemTable (key, value) VALUES ('${key.replace(/'/g, "''")}', '${value.replace(/'/g, "''")}');`,
+    ]);
   }
   return dbPath;
 }
@@ -49,28 +45,12 @@ describe("cursor-auto-login helpers", () => {
     const jwt = makeJwt("auth0|user_test");
     expect(buildWorkosSessionToken(jwt)).toBe(`user_test::${jwt}`);
   });
-
-  test("readCursorIdeAuth reads ItemTable keys from a temp database", () => {
-    const jwt = makeJwt("auth0|user_local");
-    const dbPath = makeTestVscdb({
-      [CURSOR_AUTH_KEYS.accessToken]: jwt,
-      [CURSOR_AUTH_KEYS.refreshToken]: "refresh-abc",
-      [CURSOR_AUTH_KEYS.serviceMachineId]: "machine-1",
-    });
-    try {
-      const auth = readCursorIdeAuth(dbPath, { skipCopy: true });
-      expect(auth.accessToken).toBe(jwt);
-      expect(auth.refreshToken).toBe("refresh-abc");
-      expect(auth.serviceMachineId).toBe("machine-1");
-    } finally {
-      rmSync(join(dbPath, ".."), { recursive: true, force: true });
-    }
-  });
 });
 
 describe("cursor-auto-login network flow", () => {
   test("verifyCursorAccessToken returns false on 401", async () => {
-    const fetchImpl = (async () => new Response("nope", { status: 401 })) as unknown as typeof fetch;
+    const fetchImpl = (async () =>
+      new Response("nope", { status: 401 })) as unknown as typeof fetch;
     await expect(verifyCursorAccessToken("jwt", { fetchImpl })).resolves.toBe(false);
   });
 
@@ -138,7 +118,11 @@ describe("cursor-auto-login network flow", () => {
     }) as unknown as typeof fetch;
 
     try {
-      const { sessionToken, email, machineId: mid } = await extractCursorSessionToken({
+      const {
+        sessionToken,
+        email,
+        machineId: mid,
+      } = await extractCursorSessionToken({
         dbPath,
         storageJsonPath: storagePath,
         skipCopy: true,

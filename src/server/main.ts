@@ -24,6 +24,11 @@ import pkg from "../../package.json";
 export const SERVER_VERSION: string = process.env.TOKENLEADER_SERVER_VERSION?.trim() || pkg.version;
 
 const MAX_EVENTS_PER_REQUEST = 1000;
+// Ceiling on a single event's self-reported cost ($100). costUsdMicros is
+// authenticated but client-supplied; without a cap a daemon could inflate
+// leaderboard cost arbitrarily. No realistic single Cursor request approaches
+// this, so legitimate events are never rejected.
+const MAX_COST_USD_MICROS = 100_000_000;
 const VALID_SOURCES: ReadonlySet<Source> = new Set([
   "claude_code",
   "codex",
@@ -91,6 +96,8 @@ function validateEvent(raw: unknown, idx: number): TokenEvent | string {
   if (e.costUsdMicros !== undefined && e.costUsdMicros !== null) {
     if (!isNonNegInt(e.costUsdMicros))
       return `events[${idx}].costUsdMicros must be non-negative integer | null`;
+    if (e.costUsdMicros > MAX_COST_USD_MICROS)
+      return `events[${idx}].costUsdMicros exceeds maximum`;
     costUsdMicros = e.costUsdMicros;
   }
   return {
