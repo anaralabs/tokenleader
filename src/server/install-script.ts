@@ -521,15 +521,19 @@ do_download() {
     step_fail "couldn't fetch \$SERVER_URL/manifest.json (the server 503s until its binary mirror has fetched a release)"
   fi
 
-  # No jq dep: python3 ships on every supported macOS; sed is the fallback.
+  # No jq dep. python3 is the clean path WHEN PRESENT — but macOS has not
+  # shipped python3 by default since 12.3 (only with Xcode CLT), so the sed
+  # fallback below MUST stand on its own for non-developer Macs.
   local expected_sha=""
   if command -v python3 >/dev/null 2>&1; then
     expected_sha="\$(python3 -c "import json,sys; m=json.load(open(sys.argv[1])); print(m[sys.argv[2]]['sha256'])" "\$tmp_manifest" "\$ARCH_PATH" 2>/dev/null || true)"
   fi
   if [ -z "\$expected_sha" ]; then
     # BSD-sed-compatible: collapse to one line, extract our arch's sha256.
+    # [[:space:]]* around the colon tolerates a PRETTY-PRINTED manifest
+    # ("sha256": "…" with a space) as well as compact ("sha256":"…").
     expected_sha="\$(tr -d '\\n\\r' < "\$tmp_manifest" \\
-      | sed -E "s/.*\\"\$ARCH_PATH\\"[^}]*\\"sha256\\":\\"([0-9a-fA-F]{64})\\".*/\\1/" \\
+      | sed -E "s/.*\\"\$ARCH_PATH\\"[^}]*\\"sha256\\"[[:space:]]*:[[:space:]]*\\"([0-9a-fA-F]{64})\\".*/\\1/" \\
       | grep -E '^[0-9a-fA-F]{64}\$' || true)"
   fi
   if [ -z "\$expected_sha" ]; then

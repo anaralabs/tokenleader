@@ -82,6 +82,29 @@ describe("parseClaudeCodeFile (synthetic)", () => {
     expect(r.events[0]!.source).toBe("claude_code");
   });
 
+  it("never emits an empty sessionId or assistant model (server would reject)", async () => {
+    // A record missing sessionId / model must not yield "" — the ingest
+    // validator rejects empty sessionId and empty assistant model, which used
+    // to 400 a whole batch. Fall back to the filename sessionId + "unknown".
+    const path = await makeTempJsonl([
+      JSON.stringify({ type: "user", uuid: "u-nosess", message: { content: "hi" } }),
+      JSON.stringify({
+        type: "assistant",
+        message: { id: "a-nomodel", usage: { input_tokens: 5, output_tokens: 6 } },
+      }),
+    ]);
+    const r = await parseClaudeCodeFile({
+      path,
+      byteOffset: 0,
+      user: "k",
+      source: "claude_cowork",
+    });
+    expect(r.events.length).toBe(2);
+    expect(r.events.every((e) => e.sessionId.length > 0)).toBe(true);
+    const asst = r.events.find((e) => e.messageType === "assistant")!;
+    expect(asst.model.length).toBeGreaterThan(0);
+  });
+
   it("dedupes within a single read", async () => {
     const path = await makeTempJsonl([
       JSON.stringify(baseAssistant),

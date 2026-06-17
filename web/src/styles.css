@@ -384,6 +384,73 @@ tr.is-dimmed > td {
   font-weight: 600;
 }
 
+/* ---- categories (admin-defined, ?category=) ------------------------------- */
+/* The category color (--cat) drives the dot + the border/background tint ONLY,
+   never the text color: a user-picked near-white/near-black accent rendered as
+   text on a 12%-alpha same-color background would be unreadable, so the label
+   stays at --text-primary. A NULL color falls back to --text-secondary (a grey
+   accent), the intended "uncolored" look. */
+.category-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+  border: 1px solid color-mix(in srgb, var(--cat) 40%, transparent);
+  background: color-mix(in srgb, var(--cat) 12%, transparent);
+}
+.category-chip::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--cat);
+  flex: none;
+}
+/* Category filter row — clones .company-row / .company-pill. */
+.category-row {
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.category-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 12px;
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.category-pill:hover {
+  background: var(--hover-app);
+  color: var(--text-primary);
+}
+.category-pill .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--cat);
+  flex: none;
+}
+.category-pill.on {
+  background: var(--active-app);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
 /* ---- contribution grid ---------------------------------------------------- */
 /* The inner div (not the outer) is the scroll container so the focus-mode
    note can sit just above the grid without being clipped by overflow. */
@@ -949,6 +1016,93 @@ kbd {
 }
 .danger-status.bad {
   color: var(--destructive);
+}
+
+/* ---- categories admin + people assignment --------------------------------- */
+.card-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+.category-admin,
+.people-assign {
+  padding: 18px 20px;
+}
+.category-admin-list {
+  list-style: none;
+  margin: 12px 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.category-admin-row,
+.category-admin-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Override the full-width .admin-wrap input/select rule for the inline rows. */
+.category-admin-row input[type="text"],
+.category-admin-add input[type="text"] {
+  flex: 1 1 auto;
+  width: auto;
+}
+.category-admin-row input[type="color"],
+.category-admin-add input[type="color"] {
+  width: 32px;
+  flex: none;
+  padding: 2px;
+}
+.category-admin-count {
+  font-size: 11px;
+  flex: none;
+  min-width: 56px;
+  text-align: right;
+}
+.category-admin-row button,
+.category-admin-add button {
+  font: inherit;
+  font-size: 12px;
+  flex: none;
+  padding: 5px 12px;
+  border: 1px solid var(--border-primary);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.category-admin-row button:hover:not(:disabled),
+.category-admin-add button:hover:not(:disabled) {
+  background: var(--hover-app);
+  color: var(--text-primary);
+}
+.category-admin-row button:disabled,
+.category-admin-add button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.category-admin-delete {
+  color: var(--destructive);
+}
+.category-admin-add {
+  margin-top: 12px;
+}
+.people-assign-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 12px 0;
+}
+.people-assign-table th,
+.people-assign-table td {
+  text-align: left;
+  padding: 6px 8px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border-muted);
+}
+.people-assign-table select {
+  width: auto;
+  min-width: 180px;
 }
 
 /* ---- responsive (single ~720px breakpoint) ----------------------------------------- */

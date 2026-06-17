@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import type { LeaderboardRow } from "../api";
 import { fmtCompact, fmtInt, fmtUsd, relTime } from "../format";
 
@@ -119,6 +119,15 @@ export function LeaderboardTable({
               {u.company && (
                 <span className="company-chip" title={u.company}>
                   <CompanyFavicon domain={u.company} />
+                </span>
+              )}
+              {u.categoryName && (
+                <span
+                  className="category-chip"
+                  style={{ "--cat": u.categoryColor ?? "var(--text-secondary)" } as CSSProperties}
+                  title={u.categoryName}
+                >
+                  {u.categoryName}
                 </span>
               )}
               {u.user}

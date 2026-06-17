@@ -3,6 +3,7 @@ import type { UserStats } from "../src/api";
 import {
   dailyTimeseriesQuery,
   parseDashboardSearch,
+  toggleCategory,
   toggleCompany,
   toggleFocus,
   userModelsToRows,
@@ -96,6 +97,44 @@ describe("toggleCompany (filter chip semantics)", () => {
 
   test("clicking another company moves the filter", () => {
     expect(toggleCompany("anara.com", "linear.app")).toBe("linear.app");
+  });
+});
+
+describe("toggleCategory (filter pill semantics, over ids)", () => {
+  test("clicking with no filter selects", () => {
+    expect(toggleCategory(undefined, 3)).toBe(3);
+  });
+
+  test("clicking the active category clears", () => {
+    expect(toggleCategory(3, 3)).toBeUndefined();
+  });
+
+  test("clicking another category moves the filter", () => {
+    expect(toggleCategory(3, 7)).toBe(7);
+  });
+});
+
+describe("parseDashboardSearch (?category= validation)", () => {
+  test("keeps a valid positive-integer id (from string or number)", () => {
+    expect(parseDashboardSearch({ categoryId: "3" })).toEqual({ categoryId: 3 });
+    expect(parseDashboardSearch({ categoryId: 5 })).toEqual({ categoryId: 5 });
+  });
+
+  test("drops empty / non-numeric / zero / negative / non-integer / array", () => {
+    expect(parseDashboardSearch({ categoryId: "" })).toEqual({});
+    expect(parseDashboardSearch({ categoryId: "abc" })).toEqual({});
+    expect(parseDashboardSearch({ categoryId: "0" })).toEqual({});
+    expect(parseDashboardSearch({ categoryId: -1 })).toEqual({});
+    expect(parseDashboardSearch({ categoryId: 1.5 })).toEqual({});
+    expect(parseDashboardSearch({ categoryId: ["3"] })).toEqual({});
+  });
+
+  test("composes with user + range", () => {
+    expect(parseDashboardSearch({ user: "alice", range: "7", categoryId: "2" })).toEqual({
+      user: "alice",
+      range: "7",
+      categoryId: 2,
+    });
   });
 });
 

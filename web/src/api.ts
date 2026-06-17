@@ -37,6 +37,11 @@ export interface LeaderboardRow {
   /** Normalized company domain ("anara.com") from the daemon's
    *  TOKENLEADER_COMPANY env, or null when never reported. */
   company: string | null;
+  /** Assigned category (admin-defined). Optional/nullable so older server
+   *  payloads — which never carried these fields — still render. */
+  categoryId?: number | null;
+  categoryName?: string | null;
+  categoryColor?: string | null;
 }
 
 export interface ModelRow {
@@ -65,6 +70,25 @@ export interface UninstalledRow {
   uninstalledAt: number;
 }
 
+/** Admin-defined category (Engineering, Growth, …). `assignedCount` is the
+ *  live number of users assigned to it — the dashboard gates filter pills on
+ *  `assignedCount >= 1`. */
+export interface Category {
+  id: number;
+  name: string;
+  color: string | null;
+  sortOrder: number;
+  assignedCount: number;
+}
+
+/** A claimed user + their current category assignment, for the admin
+ *  assignment table (GET /admin/users). */
+export interface ClaimedUser {
+  username: string;
+  claimedAt: number;
+  categoryId: number | null;
+}
+
 export interface AdminStats {
   server: ServerInfo;
   messages: { userMessages: number; assistantMessages: number };
@@ -76,6 +100,9 @@ export interface AdminStats {
    *  never narrowed by &company= (the filter pills need the full list).
    *  Optional so older server payloads still render. */
   companies?: string[];
+  /** Admin-defined categories, always global (never narrowed by &category=).
+   *  Optional so older server payloads still render. */
+  categories?: Category[];
 }
 
 export interface FleetDevice {
@@ -186,8 +213,23 @@ export function withCompany(query: string, company?: string): string {
   return query ? `${query}&${c}` : `?${c}`;
 }
 
-export function fetchAdminStats(range: string, company?: string): Promise<AdminStats> {
-  return getJson<AdminStats>(`/stats/admin${withCompany(rangeQuery(range), company)}`);
+/** Append category=<id> to a query string ("" or "?..."). Pure (bun-testable).
+ *  Category and company are mutually exclusive in the UI, but both helpers
+ *  compose so callers don't special-case the empty-query base. */
+export function withCategory(query: string, categoryId?: number): string {
+  if (categoryId === undefined) return query;
+  const c = `category=${categoryId}`;
+  return query ? `${query}&${c}` : `?${c}`;
+}
+
+export function fetchAdminStats(
+  range: string,
+  company?: string,
+  categoryId?: number,
+): Promise<AdminStats> {
+  return getJson<AdminStats>(
+    `/stats/admin${withCategory(withCompany(rangeQuery(range), company), categoryId)}`,
+  );
 }
 
 export function fetchFleet(): Promise<FleetStats> {
@@ -256,4 +298,75 @@ export async function postAdminClear(
     );
   }
   return body as unknown as ClearResult;
+}
+
+// --- categories admin (all requireAdmin-gated → bearer header, NOT the
+// dashboard cookie, so these cannot use getJson; written like postAdminClear
+// and surfacing the same AdminClearError on a non-2xx). ----------------------
+
+/** Shared bearer fetch for the admin category/user routes. Throws
+ *  AdminClearError(status, body.error) on a non-2xx (401/403 → token problem,
+ *  409 → duplicate, 404 → unknown), so callers reuse the DangerZone handling. */
+async function adminFetch(
+  token: string,
+  path: string,
+  method: "GET" | "POST" | "PATCH" | "DELETE",
+  body?: unknown,
+): Promise<Record<string, unknown>> {
+  const res = await fetch(path, {
+    method,
+    headers: {
+      ...(body !== undefined ? { "content-type": "application/json" } : {}),
+      authorization: `Bearer ${token}`,
+    },
+    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+  });
+  const parsed = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!res.ok) {
+    throw new AdminClearError(
+      res.status,
+      typeof parsed.error === "string" ? parsed.error : "request failed",
+    );
+  }
+  return parsed;
+}
+
+export async function fetchCategories(token: string): Promise<Category[]> {
+  const body = await adminFetch(token, "/admin/categories", "GET");
+  return (body.categories as Category[]) ?? [];
+}
+
+export async function fetchClaimedUsers(token: string): Promise<ClaimedUser[]> {
+  const body = await adminFetch(token, "/admin/users", "GET");
+  return (body.users as ClaimedUser[]) ?? [];
+}
+
+export async function createCategory(
+  token: string,
+  name: string,
+  color: string | null,
+): Promise<{ id: number }> {
+  const body = await adminFetch(token, "/admin/categories", "POST", { name, color });
+  return { id: body.id as number };
+}
+
+export async function updateCategory(
+  token: string,
+  id: number,
+  name: string,
+  color: string | null,
+): Promise<void> {
+  await adminFetch(token, `/admin/categories/${id}`, "PATCH", { name, color });
+}
+
+export async function deleteCategoryApi(token: string, id: number): Promise<void> {
+  await adminFetch(token, `/admin/categories/${id}`, "DELETE");
+}
+
+export async function assignUserCategory(
+  token: string,
+  user: string,
+  categoryId: number | null,
+): Promise<void> {
+  await adminFetch(token, "/admin/users/category", "POST", { user, categoryId });
 }

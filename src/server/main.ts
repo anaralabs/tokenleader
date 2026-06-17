@@ -8,6 +8,7 @@ import type { MessageType, Source, TokenEvent } from "../types.ts";
 import { renderAdminHtml } from "./admin-html.ts";
 import { brandedTitle, defaultFaviconSvg, defaultLogoSvg, injectBranding } from "./branding.ts";
 import { mountApiV1 } from "./api-v1.ts";
+import { normalizeCategoryName, normalizeColor } from "./category.ts";
 import { normalizeCompany } from "./company.ts";
 import { BinaryMirror, normalizeArch } from "./binary-mirror.ts";
 import { ConfigError, echoConfig, parseServerConfig, type ServerConfig } from "./config.ts";
@@ -53,6 +54,20 @@ function isFiniteInt(v: unknown): v is number {
 
 function isNonNegInt(v: unknown): v is number {
   return isFiniteInt(v) && v >= 0;
+}
+
+/** Compact, content-free view of a raw event for reject logging. */
+function summarizeEvent(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return { _type: typeof raw };
+  const e = raw as Record<string, unknown>;
+  return {
+    source: e.source,
+    messageType: e.messageType,
+    model: e.model,
+    sessionId: e.sessionId,
+    messageId: e.messageId,
+    timestamp: e.timestamp,
+  };
 }
 
 function validateEvent(raw: unknown, idx: number): TokenEvent | string {
@@ -827,6 +842,24 @@ export function buildApp(opts: BuildOptions) {
     return { ok: true, company };
   };
 
+  // Optional `category=` filter for /stats/admin: a numeric category id.
+  // Absent/empty → no filter; non-integer or id <= 0 → 400. A valid-but-
+  // unknown id matches zero users → empty/zeroed aggregates, not an error
+  // (same posture as an unknown company). Category and company are mutually
+  // exclusive — the UI sends only one. (Timeseries category filtering is out
+  // of v1 scope, so this is /stats/admin-only.)
+  const parseCategoryParam = (
+    c: Context,
+  ): { ok: true; categoryId: number | undefined } | { ok: false; res: Response } => {
+    const raw = c.req.query("category");
+    if (raw === undefined || raw.length === 0) return { ok: true, categoryId: undefined };
+    const id = Number(raw);
+    if (!Number.isInteger(id) || id <= 0) {
+      return { ok: false, res: c.json({ error: "invalid category" }, 400) };
+    }
+    return { ok: true, categoryId: id };
+  };
+
   app.get("/stats/admin", (c) => {
     const range = parseStatsRange(new URL(c.req.url).searchParams, now());
     if ("error" in range) return c.json({ error: range.error }, 400);
@@ -834,16 +867,19 @@ export function buildApp(opts: BuildOptions) {
     const companyParam = parseCompanyParam(c);
     if (!companyParam.ok) return companyParam.res;
     const company = companyParam.company;
-    // Normalized company can't contain ":" (ports are stripped), so the
-    // delimited key is collision-free.
-    const cacheKey = `admin:${since}:${until}:${company ?? ""}`;
+    const categoryParam = parseCategoryParam(c);
+    if (!categoryParam.ok) return categoryParam.res;
+    const categoryId = categoryParam.categoryId;
+    // Normalized company can't contain ":" (ports are stripped) and the
+    // category id is a bare integer, so the delimited key is collision-free.
+    const cacheKey = `admin:${since}:${until}:${company ?? ""}:${categoryId ?? ""}`;
     const cached = readStatsCache(cacheKey);
     if (cached !== null) {
       return new Response(cached, {
         headers: { "content-type": "application/json; charset=UTF-8" },
       });
     }
-    const leaderRows = store.adminLeaderboard(since, until, company);
+    const leaderRows = store.adminLeaderboard(since, until, company, categoryId);
     // Per-user cost walks the user's per-model breakdown over the same
     // [since, until) window — token sums and cost must describe the same
     // range. Fine for small/medium teams.
@@ -868,7 +904,7 @@ export function buildApp(opts: BuildOptions) {
       // of truth.
       .sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0));
 
-    const modelRows = store.adminByModel(since, until, company);
+    const modelRows = store.adminByModel(since, until, company, categoryId);
     const byModel = modelRows.map((m) => {
       let costUsd = 0;
       let unknownPrice = false;
@@ -905,7 +941,7 @@ export function buildApp(opts: BuildOptions) {
       };
     });
 
-    const recent = store.adminRecent(50, company);
+    const recent = store.adminRecent(50, company, categoryId);
 
     // Summed server-side so /stats/admin is the single source of truth for
     // the "Messages" total.
@@ -939,6 +975,13 @@ export function buildApp(opts: BuildOptions) {
       // every distinct company, never narrowed by an active company filter
       // (the pills would vanish the moment one is selected).
       companies: store.listCompanies(),
+      // Admin-defined categories, always global (never narrowed by the active
+      // category filter — same reason as companies). Carries assignedCount so
+      // the dashboard can gate filter pills on >= 1 assignment. NOTE: this
+      // (names + colors + per-row category fields) is visible to every
+      // dashboard viewer, since /stats/admin is dashboard-gated, not
+      // admin-gated — do not put sensitive labels in category names.
+      categories: store.listCategories(),
       // Always lifetime, regardless of the active date-range pill.
       uninstalled: store.listUninstalledUsers(),
     };
@@ -1222,11 +1265,27 @@ export function buildApp(opts: BuildOptions) {
     if (rawEvents.length === 0) return c.json({ inserted: 0, duplicates: 0 });
     if (rawEvents.length > MAX_EVENTS_PER_REQUEST)
       return c.json({ error: `too many events (max ${MAX_EVENTS_PER_REQUEST})` }, 413);
+    // Per-row tolerant: validate each event, INSERT the valid ones, and skip
+    // + log the invalid ones — never 400 the whole batch on one bad row. A
+    // single malformed event (e.g. an empty sessionId) used to reject all
+    // 1000 events in the batch, freezing the daemon in a permanent retry loop.
     const validated: TokenEvent[] = [];
+    const rejected: { idx: number; reason: string }[] = [];
     for (let i = 0; i < rawEvents.length; i++) {
       const r = validateEvent(rawEvents[i], i);
-      if (typeof r === "string") return c.json({ error: r }, 400);
+      if (typeof r === "string") {
+        rejected.push({ idx: i, reason: r });
+        continue;
+      }
       validated.push(r);
+    }
+    // Whole batch invalid → keep the strict 400 (preserves the validation
+    // contract and never acks unauthenticated garbage). The per-row tolerance
+    // is specifically for a MIX: one bad row must not sink the good ones. A
+    // real daemon's batch is overwhelmingly valid, so the all-invalid case is
+    // pathological — and the parser fix removes the empty-field root cause.
+    if (validated.length === 0) {
+      return c.json({ error: rejected[0]!.reason }, 400);
     }
 
     // Defense in depth: all events in a single request must share the same
@@ -1337,9 +1396,25 @@ export function buildApp(opts: BuildOptions) {
       // company affiliation is non-critical; never block an ingest on it
     }
 
+    // Authenticated: surface skipped events in the server log so a bad row is
+    // diagnosable here instead of by spelunking each daemon. Events are
+    // token-count metadata (never message content), so this is privacy-safe;
+    // bounded to a 5-event sample so a misbehaving client can't bloat logs.
+    if (rejected.length > 0) {
+      console.warn(
+        `[tokenleader] ingest skipped ${rejected.length}/${rawEvents.length} invalid event(s) from user '${firstUser}': ${JSON.stringify(
+          rejected
+            .slice(0, 5)
+            .map((x) => ({ reason: x.reason, event: summarizeEvent(rawEvents[x.idx]) })),
+        )}`,
+      );
+    }
+
     const result = store.insertMany(validated);
     if (result.inserted > 0) invalidateStatsCache();
-    return c.json(result);
+    // Only surface `skipped` when some row was dropped — an all-valid batch
+    // keeps the exact {inserted, duplicates} shape older daemons expect.
+    return c.json(rejected.length > 0 ? { ...result, skipped: rejected.length } : result);
   });
 
   // Called by the uninstall script BEFORE it removes local state (the
@@ -1490,6 +1565,113 @@ export function buildApp(opts: BuildOptions) {
       return c.json({ error: `unknown user '${user}' — a first install needs no link code` }, 404);
     }
     return linkCodeResponse(c, user);
+  });
+
+  // --- categories: admin-defined groups + per-user assignment --------------
+  // GATING: DASHBOARD_GATED = ["/", "/admin", "/stats", "/stats/*"] — "/admin"
+  // is an EXACT match (Hono does NOT treat it as a prefix), so it does NOT
+  // cover /admin/categories* or /admin/users*. These routes are therefore
+  // reached WITHOUT the dashboard cookie and are gated SOLELY by requireAdmin
+  // (the admin bearer, same as /admin/clear and /admin/link). Every route
+  // below — including the GET read routes — calls requireAdmin first, and
+  // every write calls invalidateStatsCache() (category names + assignments are
+  // baked into the cached /stats/admin body). Do NOT add /admin/* to
+  // DASHBOARD_GATED — that would force the dashboard cookie onto /admin/clear
+  // and break the admin SPA's bearer flow.
+
+  // List categories. Also exposed publicly via /stats/admin; this is an admin
+  // convenience for the management UI.
+  app.get("/admin/categories", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    return c.json({ categories: store.listCategories() });
+  });
+
+  // Create. Body { name, color? }. 409 on a (NOCASE) duplicate name, 400 on a
+  // bad name or color.
+  app.post("/admin/categories", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid json body" }, 400);
+    }
+    const name = normalizeCategoryName(String((body as { name?: unknown })?.name ?? ""));
+    if (name === null) return c.json({ error: "invalid category name" }, 400);
+    const color = normalizeColor((body as { color?: unknown })?.color);
+    if (color === false) return c.json({ error: "invalid color (want #rrggbb)" }, 400);
+    const r = store.createCategory(name, color, Date.now());
+    if (!r.ok) return c.json({ error: "category name already exists" }, 409);
+    invalidateStatsCache();
+    return c.json({ id: r.id, name, color });
+  });
+
+  // Rename / recolor. PATCH /admin/categories/:id  Body { name, color? }.
+  app.patch("/admin/categories/:id", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ error: "invalid json body" }, 400);
+    }
+    const name = normalizeCategoryName(String((body as { name?: unknown })?.name ?? ""));
+    if (name === null) return c.json({ error: "invalid category name" }, 400);
+    const color = normalizeColor((body as { color?: unknown })?.color);
+    if (color === false) return c.json({ error: "invalid color (want #rrggbb)" }, 400);
+    if (!store.renameCategory(id, name, color)) return c.json({ error: "unknown category" }, 404);
+    invalidateStatsCache();
+    return c.json({ id, name, color });
+  });
+
+  // Delete. Nulls out every assignment (manual cleanup, in one transaction),
+  // then removes the row. 404 on an unknown id.
+  app.delete("/admin/categories/:id", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const id = Number(c.req.param("id"));
+    if (!Number.isInteger(id) || id <= 0) return c.json({ error: "invalid id" }, 400);
+    if (!store.deleteCategory(id)) return c.json({ error: "unknown category" }, 404);
+    invalidateStatsCache();
+    return c.json({ ok: true, id });
+  });
+
+  // Roster for the assignment table. requireAdmin-gated. Carries category_id
+  // (so the dropdown can seed its current value) and never selects secret_hash.
+  app.get("/admin/users", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    return c.json({ users: store.listClaimedUsersWithCategory() });
+  });
+
+  // Assign (or clear) a user's category. Body { user, categoryId: number|null }.
+  // UPDATE-only: 404s an unknown user (the user_secrets row must already exist).
+  app.post("/admin/users/category", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const parsed = await parseUserBody(c);
+    if (!parsed.ok) return parsed.res;
+    const user = parsed.body.user as string;
+    const cid = parsed.body.categoryId;
+    // Same id > 0 rule as parseCategoryParam and the PATCH/DELETE parsers, so
+    // the contract is uniform (null clears the assignment).
+    if (cid !== null && (typeof cid !== "number" || !Number.isInteger(cid) || cid <= 0)) {
+      return c.json({ error: "categoryId must be a positive integer or null" }, 400);
+    }
+    if (store.getUserSecretRow(user) === null) {
+      return c.json({ error: `unknown user '${user}'` }, 404);
+    }
+    if (cid !== null && !store.categoryExists(cid)) {
+      return c.json({ error: `unknown category ${cid}` }, 400);
+    }
+    store.setUserCategory(user, cid);
+    invalidateStatsCache();
+    return c.json({ ok: true, user, categoryId: cid });
   });
 
   app.get("/stats", (c) => {

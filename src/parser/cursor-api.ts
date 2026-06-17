@@ -1,5 +1,11 @@
 import { buildWorkosSessionToken, refreshCursorAccessToken } from "./cursor-auth.ts";
-import { centsToMicros, cursorMessageId, cursorSessionId } from "./cursor-dedup.ts";
+import {
+  centsToMicros,
+  clampCostMicros,
+  clampToken,
+  cursorMessageId,
+  cursorSessionId,
+} from "./cursor-dedup.ts";
 import { fetchSignal } from "./cursor-http.ts";
 import type { TokenEvent } from "../types.ts";
 
@@ -186,10 +192,10 @@ function readTokenFields(ev: CursorDashboardUsageEvent): {
         ? tu.totalCents
         : 0;
   return {
-    inputTokens,
-    outputTokens,
-    cacheCreationTokens,
-    cacheReadTokens,
+    inputTokens: clampToken(inputTokens),
+    outputTokens: clampToken(outputTokens),
+    cacheCreationTokens: clampToken(cacheCreationTokens),
+    cacheReadTokens: clampToken(cacheReadTokens),
     totalCents,
   };
 }
@@ -227,7 +233,7 @@ export function mapCursorDashboardEvent(
       cacheReadTokens: tokens.cacheReadTokens,
     });
 
-  const costUsdMicros = centsToMicros(tokens.totalCents);
+  const costUsdMicros = clampCostMicros(centsToMicros(tokens.totalCents));
 
   return {
     user,

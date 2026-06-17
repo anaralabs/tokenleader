@@ -48,6 +48,42 @@ describe("renderInstallScript", () => {
     expect(noComments).not.toContain("brew install gh");
   });
 
+  test("sed fallback parses a PRETTY-PRINTED manifest without python3 (Laia repro)", () => {
+    // Regression: macOS without Xcode CLT has no python3, so the install
+    // falls to the sed parse. The server serves a pretty-printed manifest
+    // ("sha256": "…" with a space), which the old compact-only regex missed,
+    // yielding "couldn't parse sha256 for arm64 out of manifest.json".
+    const body = renderInstallScript(SERVER_URL);
+    expect(body).toContain("[[:space:]]*:[[:space:]]*");
+
+    // Pull the actual sed expression the script ships and run it against a
+    // pretty-printed manifest, exactly as the python3-less path would.
+    const m = body.match(/\| sed -E "(.+?)" /);
+    expect(m).not.toBeNull();
+    const sedExpr = m![1]!;
+    const sha = "a".repeat(64);
+    const prettyManifest = JSON.stringify(
+      {
+        schemaVersion: 2,
+        version: "v9.9.9",
+        platforms: { "darwin-arm64": { sha256: sha } },
+        arm64: { sha256: sha },
+        x64: { sha256: "b".repeat(64) },
+      },
+      null,
+      2,
+    );
+    const mPath = join(tmpDir, "pretty-manifest.json");
+    writeFileSync(mPath, prettyManifest);
+    const harness =
+      "ARCH_PATH=arm64\n" +
+      `expected_sha="$(tr -d '\\n\\r' < "${mPath}" | sed -E "${sedExpr}" | grep -E '^[0-9a-fA-F]{64}$' || true)"\n` +
+      'printf "%s" "$expected_sha"';
+    const r = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe(sha);
+  });
+
   test("downloads the binary from the server's own /bin route via curl", () => {
     const body = renderInstallScript(SERVER_URL);
     expect(body).toContain('BINARY_BASE_URL="${TOKENLEADER_BINARY_URL:-$SERVER_URL/bin}"');
