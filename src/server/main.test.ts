@@ -287,6 +287,25 @@ describe("server", () => {
     expect(await res.json()).toEqual({ inserted: 1, duplicates: 0 });
   });
 
+  test("/ingest is per-row tolerant: lands valid events, skips invalid ones", async () => {
+    // The Andrew incident: one bad row (empty sessionId, as a cowork/cursor
+    // parser could emit) must NOT 400 the whole batch — the good events land.
+    const events = [
+      makeEvent({ messageId: "tol-good", user: "alice", sessionId: "s-ok" }),
+      makeEvent({ messageId: "tol-bad", user: "alice", sessionId: "" }),
+    ];
+    const res = await app.request(ingestReq(events, ALICE_SECRET));
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ inserted: 1, duplicates: 0, skipped: 1 });
+  });
+
+  test("/ingest still 400s when EVERY event is invalid (no valid rows)", async () => {
+    const events = [makeEvent({ messageId: "all-bad", user: "alice", sessionId: "" })];
+    const res = await app.request(ingestReq(events, ALICE_SECRET));
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toContain("sessionId");
+  });
+
   test("/ingest accepts cursor cloud events with costUsdMicros", async () => {
     const events = [
       makeEvent({

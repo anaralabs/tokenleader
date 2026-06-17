@@ -55,6 +55,20 @@ function isNonNegInt(v: unknown): v is number {
   return isFiniteInt(v) && v >= 0;
 }
 
+/** Compact, content-free view of a raw event for reject logging. */
+function summarizeEvent(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object") return { _type: typeof raw };
+  const e = raw as Record<string, unknown>;
+  return {
+    source: e.source,
+    messageType: e.messageType,
+    model: e.model,
+    sessionId: e.sessionId,
+    messageId: e.messageId,
+    timestamp: e.timestamp,
+  };
+}
+
 function validateEvent(raw: unknown, idx: number): TokenEvent | string {
   if (!raw || typeof raw !== "object") return `events[${idx}] not an object`;
   const e = raw as Record<string, unknown>;
@@ -1222,11 +1236,27 @@ export function buildApp(opts: BuildOptions) {
     if (rawEvents.length === 0) return c.json({ inserted: 0, duplicates: 0 });
     if (rawEvents.length > MAX_EVENTS_PER_REQUEST)
       return c.json({ error: `too many events (max ${MAX_EVENTS_PER_REQUEST})` }, 413);
+    // Per-row tolerant: validate each event, INSERT the valid ones, and skip
+    // + log the invalid ones — never 400 the whole batch on one bad row. A
+    // single malformed event (e.g. an empty sessionId) used to reject all
+    // 1000 events in the batch, freezing the daemon in a permanent retry loop.
     const validated: TokenEvent[] = [];
+    const rejected: { idx: number; reason: string }[] = [];
     for (let i = 0; i < rawEvents.length; i++) {
       const r = validateEvent(rawEvents[i], i);
-      if (typeof r === "string") return c.json({ error: r }, 400);
+      if (typeof r === "string") {
+        rejected.push({ idx: i, reason: r });
+        continue;
+      }
       validated.push(r);
+    }
+    // Whole batch invalid → keep the strict 400 (preserves the validation
+    // contract and never acks unauthenticated garbage). The per-row tolerance
+    // is specifically for a MIX: one bad row must not sink the good ones. A
+    // real daemon's batch is overwhelmingly valid, so the all-invalid case is
+    // pathological — and the parser fix removes the empty-field root cause.
+    if (validated.length === 0) {
+      return c.json({ error: rejected[0]!.reason }, 400);
     }
 
     // Defense in depth: all events in a single request must share the same
@@ -1337,9 +1367,23 @@ export function buildApp(opts: BuildOptions) {
       // company affiliation is non-critical; never block an ingest on it
     }
 
+    // Authenticated: surface skipped events in the server log so a bad row is
+    // diagnosable here instead of by spelunking each daemon. Events are
+    // token-count metadata (never message content), so this is privacy-safe;
+    // bounded to a 5-event sample so a misbehaving client can't bloat logs.
+    if (rejected.length > 0) {
+      console.warn(
+        `[tokenleader] ingest skipped ${rejected.length}/${rawEvents.length} invalid event(s) from user '${firstUser}': ${JSON.stringify(
+          rejected.slice(0, 5).map((x) => ({ reason: x.reason, event: summarizeEvent(rawEvents[x.idx]) })),
+        )}`,
+      );
+    }
+
     const result = store.insertMany(validated);
     if (result.inserted > 0) invalidateStatsCache();
-    return c.json(result);
+    // Only surface `skipped` when some row was dropped — an all-valid batch
+    // keeps the exact {inserted, duplicates} shape older daemons expect.
+    return c.json(rejected.length > 0 ? { ...result, skipped: rejected.length } : result);
   });
 
   // Called by the uninstall script BEFORE it removes local state (the
