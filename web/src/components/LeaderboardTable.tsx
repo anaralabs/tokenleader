@@ -123,7 +123,7 @@ export function LeaderboardTable({
               )}
               {u.user}
               {u.categoryName && (
-                <span className="category-tag">({u.categoryName.toLowerCase()})</span>
+                <span className="category-tag">{u.categoryName.toLowerCase()}</span>
               )}
             </span>
           </td>

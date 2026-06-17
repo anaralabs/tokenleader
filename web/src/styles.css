@@ -385,10 +385,10 @@ tr.is-dimmed > td {
 }
 
 /* ---- category tag (admin-defined group, display-only) --------------------- */
-/* A plain, uncolored, lowercase "(name)" after the user's name — light text,
-   no chip/pill/border. e.g. "andrew (engineering)". */
+/* A plain, uncolored, lowercase name after the user's name — light muted text,
+   no chip/pill/border/brackets. e.g. "andrew eng". */
 .category-tag {
-  color: var(--text-secondary);
+  color: var(--text-tertiary);
   font-weight: 400;
 }
 
