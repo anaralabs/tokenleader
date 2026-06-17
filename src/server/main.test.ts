@@ -303,7 +303,7 @@ describe("server", () => {
     const events = [makeEvent({ messageId: "all-bad", user: "alice", sessionId: "" })];
     const res = await app.request(ingestReq(events, ALICE_SECRET));
     expect(res.status).toBe(400);
-    expect((await res.json()).error).toContain("sessionId");
+    expect(((await res.json()) as { error: string }).error).toContain("sessionId");
   });
 
   test("/ingest accepts cursor cloud events with costUsdMicros", async () => {

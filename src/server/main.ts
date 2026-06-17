@@ -1374,7 +1374,9 @@ export function buildApp(opts: BuildOptions) {
     if (rejected.length > 0) {
       console.warn(
         `[tokenleader] ingest skipped ${rejected.length}/${rawEvents.length} invalid event(s) from user '${firstUser}': ${JSON.stringify(
-          rejected.slice(0, 5).map((x) => ({ reason: x.reason, event: summarizeEvent(rawEvents[x.idx]) })),
+          rejected
+            .slice(0, 5)
+            .map((x) => ({ reason: x.reason, event: summarizeEvent(rawEvents[x.idx]) })),
         )}`,
       );
     }
