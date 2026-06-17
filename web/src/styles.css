@@ -989,12 +989,6 @@ kbd {
   flex: 1 1 auto;
   width: auto;
 }
-.category-admin-row input[type="color"],
-.category-admin-add input[type="color"] {
-  width: 32px;
-  flex: none;
-  padding: 2px;
-}
 .category-admin-count {
   font-size: 11px;
   flex: none;

@@ -344,7 +344,7 @@ export async function fetchClaimedUsers(token: string): Promise<ClaimedUser[]> {
 export async function createCategory(
   token: string,
   name: string,
-  color: string | null,
+  color: string | null = null,
 ): Promise<{ id: number }> {
   const body = await adminFetch(token, "/admin/categories", "POST", { name, color });
   return { id: body.id as number };
@@ -354,7 +354,7 @@ export async function updateCategory(
   token: string,
   id: number,
   name: string,
-  color: string | null,
+  color: string | null = null,
 ): Promise<void> {
   await adminFetch(token, `/admin/categories/${id}`, "PATCH", { name, color });
 }
