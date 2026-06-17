@@ -384,71 +384,12 @@ tr.is-dimmed > td {
   font-weight: 600;
 }
 
-/* ---- categories (admin-defined, ?category=) ------------------------------- */
-/* The category color (--cat) drives the dot + the border/background tint ONLY,
-   never the text color: a user-picked near-white/near-black accent rendered as
-   text on a 12%-alpha same-color background would be unreadable, so the label
-   stays at --text-primary. A NULL color falls back to --text-secondary (a grey
-   accent), the intended "uncolored" look. */
-.category-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 1px 8px;
-  border-radius: 999px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-primary);
-  border: 1px solid color-mix(in srgb, var(--cat) 40%, transparent);
-  background: color-mix(in srgb, var(--cat) 12%, transparent);
-}
-.category-chip::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 999px;
-  background: var(--cat);
-  flex: none;
-}
-/* Category filter row — clones .company-row / .company-pill. */
-.category-row {
-  margin-top: 12px;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.category-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font: inherit;
-  font-family: var(--font-mono);
-  font-size: 12px;
-  font-weight: 500;
-  padding: 4px 12px;
-  background: transparent;
+/* ---- category tag (admin-defined group, display-only) --------------------- */
+/* A plain, uncolored, lowercase "(name)" after the user's name — light text,
+   no chip/pill/border. e.g. "andrew (engineering)". */
+.category-tag {
   color: var(--text-secondary);
-  border: 1px solid var(--border-primary);
-  border-radius: 999px;
-  cursor: pointer;
-}
-.category-pill:hover {
-  background: var(--hover-app);
-  color: var(--text-primary);
-}
-.category-pill .dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 999px;
-  background: var(--cat);
-  flex: none;
-}
-.category-pill.on {
-  background: var(--active-app);
-  color: var(--text-primary);
-  font-weight: 600;
+  font-weight: 400;
 }
 
 /* ---- contribution grid ---------------------------------------------------- */

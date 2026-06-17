@@ -1,6 +1,5 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import type { CSSProperties } from "react";
 import { useEffect, useMemo } from "react";
 import { fetchAdminStats, fetchFleet, fetchUserStats } from "../api";
 import { ContributionGrid } from "../components/ContributionGrid";
@@ -16,13 +15,7 @@ import { RangePills } from "../components/RangePills";
 import { StatsStrip } from "../components/StatsStrip";
 import { ThemeHint } from "../components/ThemeToggle";
 import { UninstalledList } from "../components/UninstalledList";
-import {
-  parseDashboardSearch,
-  toggleCategory,
-  toggleCompany,
-  toggleFocus,
-  userModelsToRows,
-} from "../focus";
+import { parseDashboardSearch, toggleCompany, toggleFocus, userModelsToRows } from "../focus";
 import { defaultRange, persistRange } from "../range";
 
 export const Route = createFileRoute("/")({
@@ -107,23 +100,13 @@ function Dashboard() {
     });
   };
 
-  // Category filter (?category=): same toggle semantics as company, over ids.
-  const onToggleCategory = (categoryId: number) => {
-    void navigate({
-      search: (prev) => ({ ...prev, categoryId: toggleCategory(activeCategory, categoryId) }),
-    });
-  };
-
-  // Pills read the server's always-global companies list (never narrowed
-  // by &company=) so the row survives an active filter; the scoped
-  // leaderboard would otherwise collapse it to one chip.
+  // Company pills read the server's always-global companies list (never
+  // narrowed by &company=) so the row survives an active filter.
   const companies = admin.data?.companies ?? [];
-  // Categories are also always-global; gate filter pills on assignedCount >= 1
-  // so a defined-but-unassigned category can't empty the board with no
-  // explanation (the company precedent never hits this — its chips are
-  // data-derived). The full list still drives the chip-render guard below.
+  // Category is display-only per row (a light "(name)" tag next to the user);
+  // no filter UI. The always-global list still drives the ?category=
+  // dangling-filter self-heal below (a stale URL param auto-clears).
   const categories = admin.data?.categories ?? [];
-  const pillCategories = categories.filter((cat) => cat.assignedCount >= 1);
 
   // Dangling-filter self-heal: if ?category= points at an id the server no
   // longer returns (deleted/unknown), the board would be empty with no
@@ -245,27 +228,6 @@ function Dashboard() {
                     >
                       <CompanyFavicon domain={company} />
                       {company}
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-            {pillCategories.length >= 1 && (
-              <div className="category-row" role="group" aria-label="Filter by category">
-                {pillCategories.map((cat) => {
-                  const on = activeCategory === cat.id;
-                  return (
-                    <button
-                      key={cat.id}
-                      type="button"
-                      className={`category-pill${on ? " on" : ""}`}
-                      style={{ "--cat": cat.color ?? "var(--text-secondary)" } as CSSProperties}
-                      aria-pressed={on}
-                      title={on ? "Clear category filter" : `Show only ${cat.name}`}
-                      onClick={() => onToggleCategory(cat.id)}
-                    >
-                      <span className="dot" aria-hidden="true" />
-                      {cat.name}
                     </button>
                   );
                 })}
