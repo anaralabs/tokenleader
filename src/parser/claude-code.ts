@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import type { Source, TokenEvent } from "../types.ts";
 import { readNewlineLines } from "./read-slice.ts";
 
@@ -66,6 +67,11 @@ export async function parseClaudeCodeFile(
 ): Promise<ParseClaudeCodeResult> {
   const { path, byteOffset, user } = opts;
   const source: Source = opts.source ?? "claude_code";
+  // CC/Cowork session files are named <sessionId>.jsonl, so the filename is a
+  // stable, meaningful fallback for any record that omits sessionId. The
+  // server rejects an empty sessionId, and skipping the event would drop real
+  // token usage — so never emit "".
+  const fallbackSessionId = basename(path, ".jsonl") || "unknown";
 
   const file = Bun.file(path);
   const totalSize = file.size;
@@ -105,7 +111,7 @@ export async function parseClaudeCodeFile(
     const requestId = isString(raw.requestId) ? raw.requestId : null;
     const tsMs = isString(raw.timestamp) ? Date.parse(raw.timestamp) : NaN;
     const timestamp = Number.isFinite(tsMs) ? tsMs : Date.now();
-    const sessionId = isString(raw.sessionId) ? raw.sessionId : "";
+    const sessionId = isString(raw.sessionId) ? raw.sessionId : fallbackSessionId;
 
     if (raw.type === "user") {
       // Human prompts only: user lines have no message.id, so key on the
@@ -171,7 +177,9 @@ export async function parseClaudeCodeFile(
       messageId: msg.id,
       requestId,
       timestamp,
-      model: isString(msg.model) ? msg.model : "",
+      // Assistant rows require a non-empty model server-side; "unknown" keeps
+      // the token usage rather than dropping it on the rare missing-model line.
+      model: isString(msg.model) ? msg.model : "unknown",
       messageType: "assistant",
       inputTokens,
       outputTokens,
