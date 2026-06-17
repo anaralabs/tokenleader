@@ -15,8 +15,6 @@ type Status =
   | { kind: "ok"; text: string }
   | { kind: "bad"; text: string };
 
-const DEFAULT_COLOR = "#6e56cf";
-
 function describeError(e: unknown): string {
   if (e instanceof AdminClearError) {
     const hint = e.status === 401 || e.status === 403 ? " — check the admin token" : "";
@@ -37,7 +35,6 @@ export function CategoryManager({ token }: { token: string }) {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const [newName, setNewName] = useState("");
-  const [newColor, setNewColor] = useState(DEFAULT_COLOR);
 
   const categories = useQuery({
     queryKey: ["admin", "categories"],
@@ -55,22 +52,21 @@ export function CategoryManager({ token }: { token: string }) {
     if (name.length === 0) return;
     setStatus({ kind: "working" });
     try {
-      await createCategory(token, name, newColor);
+      await createCategory(token, name);
       setStatus({ kind: "ok", text: `Created '${name}'.` });
       setNewName("");
-      setNewColor(DEFAULT_COLOR);
       refresh();
     } catch (e) {
       setStatus({ kind: "bad", text: describeError(e) });
     }
   };
 
-  const onSave = async (cat: Category, name: string, color: string) => {
+  const onSave = async (cat: Category, name: string) => {
     const trimmed = name.trim();
     if (trimmed.length === 0) return;
     setStatus({ kind: "working" });
     try {
-      await updateCategory(token, cat.id, trimmed, color);
+      await updateCategory(token, cat.id, trimmed);
       setStatus({ kind: "ok", text: `Saved '${trimmed}'.` });
       refresh();
     } catch (e) {
@@ -117,7 +113,7 @@ export function CategoryManager({ token }: { token: string }) {
               <CategoryRowEditor
                 key={cat.id}
                 cat={cat}
-                onSave={(name, color) => void onSave(cat, name, color)}
+                onSave={(name) => void onSave(cat, name)}
                 onDelete={() => void onDelete(cat)}
               />
             ))}
@@ -133,12 +129,6 @@ export function CategoryManager({ token }: { token: string }) {
             aria-label="New category name"
             value={newName}
             onChange={(e) => setNewName(e.target.value)}
-          />
-          <input
-            type="color"
-            aria-label="New category color"
-            value={newColor}
-            onChange={(e) => setNewColor(e.target.value)}
           />
           <button
             type="button"
@@ -170,21 +160,14 @@ function CategoryRowEditor({
   onDelete,
 }: {
   cat: Category;
-  onSave: (name: string, color: string) => void;
+  onSave: (name: string) => void;
   onDelete: () => void;
 }) {
   const [name, setName] = useState(cat.name);
-  const [color, setColor] = useState(cat.color ?? DEFAULT_COLOR);
-  const dirty = name.trim() !== cat.name || color !== (cat.color ?? DEFAULT_COLOR);
+  const dirty = name.trim() !== cat.name;
 
   return (
     <li className="category-admin-row">
-      <input
-        type="color"
-        aria-label={`Color for ${cat.name}`}
-        value={color}
-        onChange={(e) => setColor(e.target.value)}
-      />
       <input
         type="text"
         autoComplete="off"
@@ -196,7 +179,7 @@ function CategoryRowEditor({
       <span className="muted-2 category-admin-count">
         {cat.assignedCount} {cat.assignedCount === 1 ? "user" : "users"}
       </span>
-      <button type="button" onClick={() => onSave(name, color)} disabled={!dirty}>
+      <button type="button" onClick={() => onSave(name)} disabled={!dirty}>
         Save
       </button>
       <button type="button" className="category-admin-delete" onClick={onDelete}>
