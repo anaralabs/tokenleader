@@ -92,6 +92,29 @@ describe("mapCursorDashboardEvent", () => {
   test("returns null for missing timestamp", () => {
     expect(mapCursorDashboardEvent({ id: "x", modelName: "m" }, "alice")).toBeNull();
   });
+
+  test("clamps over-cap cost, refunds, and negative/fractional tokens to the validator's contract", () => {
+    const ev = mapCursorDashboardEvent(
+      {
+        id: "evt-clamp",
+        timestamp: 1_700_000_000_000,
+        modelName: "claude-4.5-sonnet",
+        inputTokens: -5, // negative → 0
+        outputTokens: 5.5, // fractional → 6
+        totalCents: 20_000, // $200 → over the $100 ceiling
+      },
+      "alice",
+    );
+    expect(ev!.inputTokens).toBe(0);
+    expect(ev!.outputTokens).toBe(6);
+    expect(ev!.costUsdMicros).toBe(100_000_000); // clamped to MAX_COST_USD_MICROS
+
+    const refund = mapCursorDashboardEvent(
+      { id: "evt-refund", timestamp: 1_700_000_000_000, modelName: "m", totalCents: -50 },
+      "alice",
+    );
+    expect(refund!.costUsdMicros).toBe(0); // negative cost → 0, not a rejected row
+  });
 });
 
 describe("validateCursorToken", () => {

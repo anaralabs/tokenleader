@@ -1,4 +1,10 @@
-import { centsToMicros, cursorMessageId, cursorSessionId } from "../parser/cursor-dedup.ts";
+import {
+  centsToMicros,
+  clampCostMicros,
+  clampToken,
+  cursorMessageId,
+  cursorSessionId,
+} from "../parser/cursor-dedup.ts";
 import { CURSOR_WATERMARK_META_KEY } from "./db.ts";
 import type { Store } from "./db.ts";
 import type { TokenEvent } from "../types.ts";
@@ -364,7 +370,7 @@ export class CursorMirror {
       cacheReadTokens: tu.cacheReadTokens,
     });
 
-    const costUsdMicros = centsToMicros(tu.totalCents ?? 0);
+    const costUsdMicros = clampCostMicros(centsToMicros(tu.totalCents ?? 0));
 
     return {
       user,
@@ -376,10 +382,10 @@ export class CursorMirror {
       timestamp: tsMs,
       model: ev.model,
       messageType: "assistant",
-      inputTokens: tu.inputTokens | 0,
-      outputTokens: tu.outputTokens | 0,
-      cacheCreationTokens: tu.cacheWriteTokens | 0,
-      cacheReadTokens: tu.cacheReadTokens | 0,
+      inputTokens: clampToken(tu.inputTokens),
+      outputTokens: clampToken(tu.outputTokens),
+      cacheCreationTokens: clampToken(tu.cacheWriteTokens),
+      cacheReadTokens: clampToken(tu.cacheReadTokens),
       reasoningTokens: null,
       costUsdMicros,
     };
