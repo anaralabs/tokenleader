@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { createTestApp, jsonOf, makeTmpDirSync, makeTokenEvent } from "../test-helpers.ts";
 import type { TokenEvent } from "../types.ts";
 import { BinaryMirror } from "./binary-mirror.ts";
+import { normalizeCategoryName, normalizeColor } from "./category.ts";
 import { normalizeCompany } from "./company.ts";
 import { Store } from "./db.ts";
 import { buildApp } from "./main.ts";
@@ -763,6 +764,9 @@ describe("server", () => {
       "lastEventAt",
       "modelCount",
       "company",
+      "categoryId",
+      "categoryName",
+      "categoryColor",
     ]) {
       expect(lbRow).toHaveProperty(k);
     }
@@ -805,6 +809,8 @@ describe("server", () => {
     for (let i = 1; i < body.recent.length; i++) {
       expect(body.recent[i - 1].id).toBeGreaterThan(body.recent[i].id);
     }
+    // categories pick-list (always present, possibly empty).
+    expect(Array.isArray(body.categories)).toBe(true);
   });
 
   test("/stats/admin accepts since/until range filter", async () => {
@@ -2752,6 +2758,487 @@ describe("company aliases (TOKENLEADER_COMPANY_ALIASES)", () => {
       expect(rows.find((r) => r.user === "viv")?.company).toBe("listener.com");
     } finally {
       await t.cleanup();
+    }
+  });
+});
+
+// ----- categories: validation (category.ts) --------------------------------
+
+describe("normalizeCategoryName", () => {
+  test("trims + collapses internal whitespace, preserves case", () => {
+    expect(normalizeCategoryName("  Engineering  ")).toBe("Engineering");
+    expect(normalizeCategoryName("A  B")).toBe("A B");
+    expect(normalizeCategoryName("Growth")).toBe("Growth"); // NOT lowercased
+  });
+
+  test("allowed charset: letters/digits/space/._-", () => {
+    expect(normalizeCategoryName("Team_1.2-3")).toBe("Team_1.2-3");
+  });
+
+  test("garbage / empty / too-long → null", () => {
+    expect(normalizeCategoryName("")).toBeNull();
+    expect(normalizeCategoryName("   ")).toBeNull();
+    expect(normalizeCategoryName("bad!name")).toBeNull();
+    expect(normalizeCategoryName("emoji 🚀")).toBeNull();
+    expect(normalizeCategoryName("a".repeat(65))).toBeNull();
+    expect(normalizeCategoryName("a".repeat(64))).toBe("a".repeat(64));
+  });
+});
+
+describe("normalizeColor", () => {
+  test("valid #rrggbb → lowercased canonical", () => {
+    expect(normalizeColor("#6E56CF")).toBe("#6e56cf");
+    expect(normalizeColor("#abcdef")).toBe("#abcdef");
+  });
+
+  test("absent/empty → null (store no color)", () => {
+    expect(normalizeColor(undefined)).toBeNull();
+    expect(normalizeColor(null)).toBeNull();
+    expect(normalizeColor("")).toBeNull();
+  });
+
+  test("present-but-malformed → false (→ 400)", () => {
+    expect(normalizeColor("red")).toBe(false);
+    expect(normalizeColor("#abc")).toBe(false); // 3-digit not allowed
+    expect(normalizeColor("#1234567")).toBe(false);
+    expect(normalizeColor(123)).toBe(false);
+  });
+});
+
+// ----- categories: DB layer (CRUD, assignment, lifecycle) ------------------
+
+describe("Store categories CRUD + assignment + lifecycle", () => {
+  function freshStore() {
+    const { dir, cleanup } = makeTmpDirSync("tokenleader-cat-test-");
+    return { store: new Store(join(dir, "tl.sqlite")), dir, cleanup };
+  }
+
+  // user_secrets rows only exist after a claim; insertMany doesn't create
+  // them, so claim via the device path used elsewhere in these tests.
+  function claim(s: Store, user: string, secret = `${user}-secret`) {
+    s.claimUserSecret(user, sha256Hex(secret), Date.now(), null);
+  }
+
+  test("create/list/rename/delete + assignedCount", () => {
+    const { store: s, cleanup } = freshStore();
+    try {
+      expect(s.listCategories()).toEqual([]);
+      const eng = s.createCategory("Engineering", "#6e56cf", Date.now());
+      expect(eng.ok).toBe(true);
+      const growth = s.createCategory("Growth", null, Date.now());
+      expect(growth.ok).toBe(true);
+
+      // Duplicate (NOCASE) → ok:false.
+      expect(s.createCategory("engineering", null, Date.now())).toEqual({
+        ok: false,
+        error: "duplicate",
+      });
+
+      const list = s.listCategories();
+      expect(list.map((c) => c.name).sort()).toEqual(["Engineering", "Growth"]);
+      const engRow = list.find((c) => c.name === "Engineering")!;
+      expect(engRow.color).toBe("#6e56cf");
+      expect(engRow.assignedCount).toBe(0);
+
+      // Assign two users to Engineering.
+      claim(s, "alice");
+      claim(s, "bob");
+      expect((eng as { ok: true; id: number }).ok).toBe(true);
+      const engId = (eng as { ok: true; id: number }).id;
+      expect(s.setUserCategory("alice", engId)).toBe(true);
+      expect(s.setUserCategory("bob", engId)).toBe(true);
+      expect(s.getUserCategory("alice")).toBe(engId);
+      expect(s.listCategories().find((c) => c.id === engId)!.assignedCount).toBe(2);
+
+      // setUserCategory on an unknown user → false (UPDATE-only, no upsert).
+      expect(s.setUserCategory("nobody", engId)).toBe(false);
+
+      // Rename + recolor.
+      expect(s.renameCategory(engId, "Eng", "#112233")).toBe(true);
+      const renamed = s.listCategories().find((c) => c.id === engId)!;
+      expect(renamed.name).toBe("Eng");
+      expect(renamed.color).toBe("#112233");
+      expect(s.renameCategory(99999, "X", null)).toBe(false); // unknown id
+
+      expect(s.categoryExists(engId)).toBe(true);
+      expect(s.categoryExists(99999)).toBe(false);
+
+      // Delete nulls assignments then removes (one transaction).
+      expect(s.deleteCategory(engId)).toBe(true);
+      expect(s.deleteCategory(engId)).toBe(false); // already gone
+      expect(s.categoryExists(engId)).toBe(false);
+      expect(s.getUserCategory("alice")).toBeNull();
+      expect(s.getUserCategory("bob")).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("listClaimedUsersWithCategory carries category_id, never secret_hash", () => {
+    const { store: s, cleanup } = freshStore();
+    try {
+      claim(s, "alice");
+      const cat = s.createCategory("Design", null, Date.now()) as { ok: true; id: number };
+      s.setUserCategory("alice", cat.id);
+      const roster = s.listClaimedUsersWithCategory();
+      const alice = roster.find((u) => u.username === "alice")!;
+      expect(alice.categoryId).toBe(cat.id);
+      expect(Object.keys(alice)).toEqual(["username", "claimedAt", "categoryId"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("clearFull wipes categories AND re-adds category_id (no 'no such column')", () => {
+    const { store: s, cleanup } = freshStore();
+    try {
+      claim(s, "alice");
+      const cat = s.createCategory("Founder", null, Date.now()) as { ok: true; id: number };
+      s.setUserCategory("alice", cat.id);
+
+      s.clearFull();
+
+      // Definitions wiped.
+      expect(s.listCategories()).toEqual([]);
+      // category_id re-migrated: these must NOT throw "no such column".
+      expect(() => s.setUserCategory("alice", null)).not.toThrow();
+      expect(() => s.adminLeaderboard(0, Date.now() + 1)).not.toThrow();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("category definition + assignment survive a Store reopen", () => {
+    const { dir, cleanup } = makeTmpDirSync("tokenleader-cat-reopen-");
+    const dbPath = join(dir, "tl.sqlite");
+    try {
+      const s1 = new Store(dbPath);
+      s1.claimUserSecret("alice", sha256Hex("alice-secret"), Date.now(), null);
+      const cat = s1.createCategory("Engineering", "#6e56cf", Date.now()) as {
+        ok: true;
+        id: number;
+      };
+      s1.setUserCategory("alice", cat.id);
+      s1.close();
+
+      const s2 = new Store(dbPath);
+      expect(s2.listCategories().map((c) => c.name)).toEqual(["Engineering"]);
+      expect(s2.getUserCategory("alice")).toBe(cat.id);
+      s2.close();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("deleteCategory leaves adminLeaderboard rows with null category fields", () => {
+    const { store: s, cleanup } = freshStore();
+    try {
+      s.claimUserSecret("alice", sha256Hex("a"), Date.now(), null);
+      s.insertMany([makeTokenEvent({ user: "alice", messageId: "cat-del-1" })]);
+      const cat = s.createCategory("Eng", "#111111", Date.now()) as { ok: true; id: number };
+      s.setUserCategory("alice", cat.id);
+      let row = s.adminLeaderboard(0, Date.now() + 1).find((r) => r.user === "alice")!;
+      expect(row.categoryName).toBe("Eng");
+
+      s.deleteCategory(cat.id);
+      row = s.adminLeaderboard(0, Date.now() + 1).find((r) => r.user === "alice")!;
+      expect(row.categoryId).toBeNull();
+      expect(row.categoryName).toBeNull();
+      expect(row.categoryColor).toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+});
+
+// ----- categories: admin CRUD endpoints + gating + assignment --------------
+
+const ADMIN = "topsecret-xyz";
+const adminHeaders = { "content-type": "application/json", authorization: `Bearer ${ADMIN}` };
+
+describe("category admin endpoints: requireAdmin gating", () => {
+  // Mirrors /admin/clear gating — explicitly covers the GET read routes too,
+  // since DASHBOARD_GATED's "/admin" exact-match does NOT cover /admin/*.
+  const routes: Array<{ method: string; path: string; body?: unknown }> = [
+    { method: "GET", path: "/admin/categories" },
+    { method: "POST", path: "/admin/categories", body: { name: "X" } },
+    { method: "PATCH", path: "/admin/categories/1", body: { name: "X" } },
+    { method: "DELETE", path: "/admin/categories/1" },
+    { method: "GET", path: "/admin/users" },
+    { method: "POST", path: "/admin/users/category", body: { user: "u", categoryId: null } },
+  ];
+
+  function req(path: string, method: string, headers: Record<string, string>, body?: unknown) {
+    return new Request(`http://x${path}`, {
+      method,
+      headers,
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+  }
+
+  test("503 when admin token unset", async () => {
+    const { app: a, cleanup } = createTestApp();
+    try {
+      for (const r of routes) {
+        const res = await a.request(
+          req(r.path, r.method, { "content-type": "application/json" }, r.body),
+        );
+        expect(res.status).toBe(503);
+      }
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("401 without bearer, 403 wrong bearer, 2xx with correct bearer", async () => {
+    const { app: a, cleanup } = createTestApp({ adminToken: ADMIN });
+    try {
+      for (const r of routes) {
+        const noBearer = await a.request(
+          req(r.path, r.method, { "content-type": "application/json" }, r.body),
+        );
+        expect(noBearer.status).toBe(401);
+        const wrong = await a.request(
+          req(
+            r.path,
+            r.method,
+            { "content-type": "application/json", authorization: "Bearer nope" },
+            r.body,
+          ),
+        );
+        expect(wrong.status).toBe(403);
+      }
+      // GET reads succeed with the right bearer.
+      expect((await a.request(req("/admin/categories", "GET", adminHeaders))).status).toBe(200);
+      expect((await a.request(req("/admin/users", "GET", adminHeaders))).status).toBe(200);
+    } finally {
+      await cleanup();
+    }
+  });
+});
+
+describe("category admin CRUD + validation", () => {
+  let built: ReturnType<typeof createTestApp>;
+  beforeAll(() => {
+    built = createTestApp({ adminToken: ADMIN });
+  });
+  afterAll(async () => {
+    await built.cleanup();
+  });
+
+  const post = (path: string, body: unknown) =>
+    built.app.request(
+      new Request(`http://x${path}`, {
+        method: "POST",
+        headers: adminHeaders,
+        body: JSON.stringify(body),
+      }),
+    );
+
+  test("create → 200; duplicate (NOCASE) → 409; bad name/color → 400", async () => {
+    const created = await post("/admin/categories", { name: "Engineering", color: "#6E56CF" });
+    expect(created.status).toBe(200);
+    const body = await jsonOf<{ id: number; color: string }>(created);
+    expect(typeof body.id).toBe("number");
+    expect(body.color).toBe("#6e56cf");
+
+    // Duplicate differing only by case → 409 (proves COLLATE NOCASE).
+    expect((await post("/admin/categories", { name: "engineering" })).status).toBe(409);
+    // Bad name / color → 400.
+    expect((await post("/admin/categories", { name: "bad!name" })).status).toBe(400);
+    expect((await post("/admin/categories", { name: "OK", color: "red" })).status).toBe(400);
+  });
+
+  test("PATCH unknown id → 404; valid → 200", async () => {
+    const created = await jsonOf<{ id: number }>(
+      await post("/admin/categories", { name: "Growth" }),
+    );
+    const ok = await built.app.request(
+      new Request(`http://x/admin/categories/${created.id}`, {
+        method: "PATCH",
+        headers: adminHeaders,
+        body: JSON.stringify({ name: "Growth2", color: "#001122" }),
+      }),
+    );
+    expect(ok.status).toBe(200);
+    const missing = await built.app.request(
+      new Request("http://x/admin/categories/999999", {
+        method: "PATCH",
+        headers: adminHeaders,
+        body: JSON.stringify({ name: "Nope" }),
+      }),
+    );
+    expect(missing.status).toBe(404);
+    // Invalid id in path → 400.
+    const badId = await built.app.request(
+      new Request("http://x/admin/categories/0", {
+        method: "PATCH",
+        headers: adminHeaders,
+        body: JSON.stringify({ name: "Nope" }),
+      }),
+    );
+    expect(badId.status).toBe(400);
+  });
+
+  test("DELETE unknown id → 404; valid → 200", async () => {
+    const created = await jsonOf<{ id: number }>(await post("/admin/categories", { name: "Temp" }));
+    const del = await built.app.request(
+      new Request(`http://x/admin/categories/${created.id}`, {
+        method: "DELETE",
+        headers: adminHeaders,
+      }),
+    );
+    expect(del.status).toBe(200);
+    const again = await built.app.request(
+      new Request(`http://x/admin/categories/${created.id}`, {
+        method: "DELETE",
+        headers: adminHeaders,
+      }),
+    );
+    expect(again.status).toBe(404);
+  });
+
+  test("assignment: unknown user → 404; bad categoryId → 400; happy path round-trips", async () => {
+    // Seed a claimed user + a category.
+    await built.app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tokenleader-secret": "kim-secret" },
+        body: JSON.stringify({ events: [makeEvent({ user: "kim", messageId: "cat-kim-1" })] }),
+      }),
+    );
+    const cat = await jsonOf<{ id: number }>(await post("/admin/categories", { name: "Design" }));
+
+    // Unknown user → 404.
+    expect(
+      (await post("/admin/users/category", { user: "ghost", categoryId: cat.id })).status,
+    ).toBe(404);
+    // Bad categoryId (0 / negative / non-int) → 400.
+    expect((await post("/admin/users/category", { user: "kim", categoryId: 0 })).status).toBe(400);
+    expect((await post("/admin/users/category", { user: "kim", categoryId: -3 })).status).toBe(400);
+    // Unknown category id → 400.
+    expect((await post("/admin/users/category", { user: "kim", categoryId: 999999 })).status).toBe(
+      400,
+    );
+
+    // Happy path: assign, then /stats/admin row carries the fields.
+    const assigned = await post("/admin/users/category", { user: "kim", categoryId: cat.id });
+    expect(assigned.status).toBe(200);
+    const admin = await jsonOf<{
+      leaderboard: Array<{ user: string; categoryId: number | null; categoryName: string | null }>;
+      categories: Array<{ id: number; assignedCount: number }>;
+    }>(await built.app.request(new Request("http://x/stats/admin")));
+    const row = admin.leaderboard.find((r) => r.user === "kim")!;
+    expect(row.categoryId).toBe(cat.id);
+    expect(row.categoryName).toBe("Design");
+    // categories pick-list reflects the assignment count.
+    expect(admin.categories.find((c) => c.id === cat.id)!.assignedCount).toBe(1);
+
+    // Clearing (categoryId:null) is allowed.
+    const cleared = await post("/admin/users/category", { user: "kim", categoryId: null });
+    expect(cleared.status).toBe(200);
+  });
+});
+
+// ----- categories: ?category= filter on /stats/admin -----------------------
+
+describe("category filter (?category=)", () => {
+  let built: ReturnType<typeof createTestApp>;
+  let engId: number;
+  let growthId: number;
+
+  beforeAll(async () => {
+    built = createTestApp({ adminToken: ADMIN });
+    const ingest = (events: TokenEvent[], secret: string) =>
+      built.app.request(
+        new Request("http://x/ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-tokenleader-secret": secret },
+          body: JSON.stringify({ events }),
+        }),
+      );
+    await ingest(
+      [makeEvent({ user: "ed", messageId: "ce-1", timestamp: Date.UTC(2026, 5, 1) })],
+      "ed-secret",
+    );
+    await ingest(
+      [
+        makeEvent({
+          user: "fi",
+          messageId: "cf-1",
+          model: "gpt-5",
+          timestamp: Date.UTC(2026, 5, 2),
+        }),
+      ],
+      "fi-secret",
+    );
+    await ingest(
+      [makeEvent({ user: "gus", messageId: "cg-1", timestamp: Date.UTC(2026, 5, 3) })],
+      "gus-secret",
+    );
+
+    const mk = async (name: string) =>
+      (
+        await jsonOf<{ id: number }>(
+          await built.app.request(
+            new Request("http://x/admin/categories", {
+              method: "POST",
+              headers: adminHeaders,
+              body: JSON.stringify({ name }),
+            }),
+          ),
+        )
+      ).id;
+    engId = await mk("Engineering");
+    growthId = await mk("Growth");
+
+    const assign = (user: string, categoryId: number) =>
+      built.app.request(
+        new Request("http://x/admin/users/category", {
+          method: "POST",
+          headers: adminHeaders,
+          body: JSON.stringify({ user, categoryId }),
+        }),
+      );
+    await assign("ed", engId);
+    await assign("fi", growthId);
+    // gus stays unassigned.
+  });
+
+  afterAll(async () => {
+    await built.cleanup();
+  });
+
+  test("?category=<id> scopes leaderboard / byModel / recent", async () => {
+    const body = await jsonOf<{
+      leaderboard: Array<{ user: string }>;
+      byModel: Array<{ model: string }>;
+      recent: Array<{ user: string }>;
+    }>(await built.app.request(new Request(`http://x/stats/admin?category=${engId}`)));
+    expect(body.leaderboard.map((r) => r.user)).toEqual(["ed"]);
+    expect(body.byModel.map((m) => m.model)).toEqual(["claude-sonnet-4-5"]);
+    for (const e of body.recent) expect(e.user).toBe("ed");
+  });
+
+  test("categories list is always global with assignedCount", async () => {
+    const body = await jsonOf<{ categories: Array<{ id: number; assignedCount: number }> }>(
+      await built.app.request(new Request(`http://x/stats/admin?category=${engId}`)),
+    );
+    const eng = body.categories.find((c) => c.id === engId)!;
+    const growth = body.categories.find((c) => c.id === growthId)!;
+    expect(eng.assignedCount).toBe(1);
+    expect(growth.assignedCount).toBe(1);
+  });
+
+  test("unknown id → empty 200; non-numeric / 0 / negative → 400", async () => {
+    const unknown = await built.app.request(new Request("http://x/stats/admin?category=999999"));
+    expect(unknown.status).toBe(200);
+    expect((await jsonOf<{ leaderboard: unknown[] }>(unknown)).leaderboard).toEqual([]);
+
+    for (const v of ["abc", "0", "-1", "1.5"]) {
+      const res = await built.app.request(new Request(`http://x/stats/admin?category=${v}`));
+      expect(res.status).toBe(400);
+      expect(await jsonOf<{ error: string }>(res)).toEqual({ error: "invalid category" });
     }
   });
 });

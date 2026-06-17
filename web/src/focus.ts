@@ -16,6 +16,10 @@ export interface DashboardSearch {
   /** Company filter (?company=anara.com). Absent = all companies. Domains
    *  are stored lowercase server-side, so the param is lowercased here. */
   company?: string;
+  /** Category filter (?category=3) — an admin-defined-category id, NOT a
+   *  string. Absent = all categories. Validated as a positive integer; a
+   *  dangling/unknown id is self-healed (dropped) in the index route. */
+  categoryId?: number;
 }
 
 /** validateSearch for the index route: keep only well-formed values so a
@@ -31,6 +35,12 @@ export function parseDashboardSearch(search: Record<string, unknown>): Dashboard
   if (typeof search.company === "string" && search.company.length > 0) {
     out.company = search.company.toLowerCase();
   }
+  // Accept a string or number; keep only a positive integer. Existence is NOT
+  // checked here — a dangling/unknown id is self-healed in the index route.
+  if (typeof search.categoryId === "string" || typeof search.categoryId === "number") {
+    const n = Number(search.categoryId);
+    if (Number.isInteger(n) && n > 0) out.categoryId = n;
+  }
   return out;
 }
 
@@ -43,6 +53,12 @@ export function toggleFocus(current: string | undefined, clicked: string): strin
 /** Clicking a company chip toggles the same way: the active company clears
  *  the filter, any other company moves it. undefined = no filter. */
 export function toggleCompany(current: string | undefined, clicked: string): string | undefined {
+  return current === clicked ? undefined : clicked;
+}
+
+/** Clicking a category pill toggles over ids: the active category clears the
+ *  filter, any other moves it. undefined = no filter. */
+export function toggleCategory(current: number | undefined, clicked: number): number | undefined {
   return current === clicked ? undefined : clicked;
 }
 

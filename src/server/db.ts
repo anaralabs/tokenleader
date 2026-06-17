@@ -42,6 +42,22 @@ CREATE TABLE IF NOT EXISTS user_secrets (
   company        TEXT
 );
 
+-- Admin-defined groups (Engineering, Growth, …). NOT seeded with constants —
+-- a self-hoster starts with zero rows and the whole feature stays invisible
+-- until they create one via the admin UI. name is the display label (case
+-- PRESERVED; the UNIQUE index is COLLATE NOCASE so "Growth"/"growth" can't
+-- both exist). color is an optional "#rrggbb" chip accent; sort_order drives
+-- pill ordering; created_at is unix-ms. The per-user assignment lives on
+-- user_secrets.category_id (added by migrateCategoryId, NOT here, so the
+-- clearFull recreate re-adds it via the migration like company).
+CREATE TABLE IF NOT EXISTS categories (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  color      TEXT,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
 -- Legacy per-user daemon build table. Superseded by user_devices (which
 -- carries version/arch/last_seen per machine); kept so a server rollback
 -- finds its table. No longer read or written.
@@ -134,6 +150,21 @@ function migrateCompany(db: Database): void {
 }
 
 /**
+ * Migration: add `category_id` to user_secrets. Idempotent. Nullable —
+ * NULL = unassigned. Admin-assigned via POST /admin/users/category; never set
+ * from an ingest header (unlike `company`). Bare INTEGER, no REFERENCES (FKs
+ * are off); orphan cleanup is manual in deleteCategory. Lives in a migration,
+ * not SCHEMA, so the clearFull → exec(SCHEMA) recreate re-adds it here.
+ */
+function migrateCategoryId(db: Database): void {
+  const cols = db.prepare<{ name: string }, []>("PRAGMA table_info(user_secrets)").all();
+  const hasCol = cols.some((c) => c.name === "category_id");
+  if (!hasCol) {
+    db.exec("ALTER TABLE user_secrets ADD COLUMN category_id INTEGER");
+  }
+}
+
+/**
  * Migration: seed `user_devices` from pre-multi-device rows. Idempotent —
  * only users with ZERO device rows are seeded, so post-migration rotations
  * are never clobbered. The seed device inherits the user's TOFU hash, the
@@ -211,6 +242,10 @@ export interface LeaderboardAdminRow extends UserTotalsRow {
   assistantMessages: number;
   /** Normalized company domain from user_secrets; null = never reported. */
   company: string | null;
+  /** Assigned category (admin-defined); null when unassigned or undefined. */
+  categoryId: number | null;
+  categoryName: string | null;
+  categoryColor: string | null;
 }
 
 /** Per-user message counts (assistant + user) — the user-row counts the
@@ -311,6 +346,26 @@ export interface ClaimedUserRow {
   claimed_at: number;
 }
 
+/** A category definition row joined with its live assignment count. The
+ *  COUNT comes from a LEFT JOIN so a zero-assignment category still appears
+ *  (assigned_count 0); the UI gates filter pills on assigned_count >= 1. */
+export interface CategoryRow {
+  id: number;
+  name: string;
+  color: string | null;
+  sort_order: number;
+  assigned_count: number;
+}
+
+/** Roster row for GET /admin/users: every claimed user plus their current
+ *  category_id (seeds the assignment dropdown's defaultValue). Never carries
+ *  secret_hash, so the roster cannot leak a credential. */
+export interface ClaimedUserWithCategoryRow {
+  username: string;
+  claimed_at: number;
+  category_id: number | null;
+}
+
 export interface UninstalledUserRow {
   username: string;
   uninstalled_at: number;
@@ -363,6 +418,8 @@ function deviceInfo(r: UserDeviceRow): DeviceInfo {
  *  string spliced into the *ForCompany statement variants — never user
  *  input, so this is splice-safe. */
 const COMPANY_SCOPE = "AND user IN (SELECT username FROM user_secrets WHERE company = ?)";
+/** Restrict to users assigned to a given category id (peer of COMPANY_SCOPE). */
+const CATEGORY_SCOPE = "AND user IN (SELECT username FROM user_secrets WHERE category_id = ?)";
 
 /**
  * Per-(user, model) aggregate over `[since, until)` for `/api/v1`.
@@ -399,11 +456,27 @@ export class Store {
     LeaderboardAdminRow,
     [number, number, string]
   >;
+  private readonly adminLeaderboardForCategoryStmt: Statement<
+    LeaderboardAdminRow,
+    [number, number, number]
+  >;
   private readonly adminByModelStmt: Statement<ModelAggRow, [number, number]>;
   private readonly adminByModelForCompanyStmt: Statement<ModelAggRow, [number, number, string]>;
+  private readonly adminByModelForCategoryStmt: Statement<ModelAggRow, [number, number, number]>;
   private readonly adminRecentStmt: Statement<RecentEventRow>;
   private readonly adminRecentForCompanyStmt: Statement<RecentEventRow, [string, number]>;
+  private readonly adminRecentForCategoryStmt: Statement<RecentEventRow, [number, number]>;
   private readonly listCompaniesStmt: Statement<{ company: string }, []>;
+  // --- categories CRUD + per-user assignment + roster ---
+  private readonly listCategoriesStmt: Statement<CategoryRow, []>;
+  private readonly createCategoryStmt: Statement;
+  private readonly renameCategoryStmt: Statement;
+  private readonly deleteCategoryStmt: Statement;
+  private readonly clearCategoryAssignmentsStmt: Statement;
+  private readonly getCategoryByIdStmt: Statement<{ id: number }, [number]>;
+  private readonly setUserCategoryStmt: Statement;
+  private readonly getUserCategoryStmt: Statement<{ category_id: number | null }, [string]>;
+  private readonly listClaimedUsersWithCategoryStmt: Statement<ClaimedUserWithCategoryRow, []>;
   private readonly dbSizeStmt: Statement<DbSizeRow>;
   private readonly lastEventStmt: Statement<LastEventRow>;
   private readonly getUserSecretStmt: Statement<UserSecretRow>;
@@ -489,6 +562,7 @@ export class Store {
     migrateMessageType(this.db);
     migrateUninstalledAt(this.db);
     migrateCompany(this.db);
+    migrateCategoryId(this.db);
     migrateCostUsdMicros(this.db);
     migrateUserDevices(this.db);
 
@@ -558,7 +632,10 @@ export class Store {
     // scan; lastEventAt spans both kinds ("last seen" = any activity).
     // LEFT JOIN user_secrets (PK lookup per group) carries the company
     // affiliation; users without a claim row read company NULL.
-    this.adminLeaderboardStmt = this.db.prepare<LeaderboardAdminRow, [number, number]>(
+    // One SELECT body, three scoped variants (base / company / category). The
+    // LEFT JOINs carry company + the assigned category (id/name/color) per
+    // row; an optional scope clause narrows to one company or one category.
+    const adminLeaderboardSql = (scope: string): string =>
       `SELECT user,
               COALESCE(SUM(CASE WHEN messageType='assistant' THEN inputTokens         ELSE 0 END), 0) AS totalInputTokens,
               COALESCE(SUM(CASE WHEN messageType='assistant' THEN outputTokens        ELSE 0 END), 0) AS totalOutputTokens,
@@ -570,39 +647,29 @@ export class Store {
               SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END)                                AS assistantMessages,
               COALESCE(MAX(timestamp), 0)                                                             AS lastEventAt,
               COUNT(DISTINCT CASE WHEN messageType='assistant' THEN model END)                        AS modelCount,
-              us.company                                                                              AS company
+              us.company                                                                              AS company,
+              us.category_id                                                                          AS categoryId,
+              cat.name                                                                                AS categoryName,
+              cat.color                                                                               AS categoryColor
          FROM events
          LEFT JOIN user_secrets us ON us.username = events.user
-        WHERE timestamp >= ? AND timestamp < ?
+         LEFT JOIN categories cat ON cat.id = us.category_id
+        WHERE timestamp >= ? AND timestamp < ? ${scope}
         GROUP BY user
         ORDER BY (totalInputTokens + totalOutputTokens
-                  + totalCacheCreationTokens + totalCacheReadTokens) DESC`,
+                  + totalCacheCreationTokens + totalCacheReadTokens) DESC`;
+    this.adminLeaderboardStmt = this.db.prepare<LeaderboardAdminRow, [number, number]>(
+      adminLeaderboardSql(""),
     );
-    // Company-scoped variant: same shape, restricted to users claimed under
-    // the given company. (since, until, company) — the scope clause appends.
+    // Scoped variants: (since, until, company|categoryId) — the scope appends.
     this.adminLeaderboardForCompanyStmt = this.db.prepare<
       LeaderboardAdminRow,
       [number, number, string]
-    >(
-      `SELECT user,
-              COALESCE(SUM(CASE WHEN messageType='assistant' THEN inputTokens         ELSE 0 END), 0) AS totalInputTokens,
-              COALESCE(SUM(CASE WHEN messageType='assistant' THEN outputTokens        ELSE 0 END), 0) AS totalOutputTokens,
-              COALESCE(SUM(CASE WHEN messageType='assistant' THEN cacheCreationTokens ELSE 0 END), 0) AS totalCacheCreationTokens,
-              COALESCE(SUM(CASE WHEN messageType='assistant' THEN cacheReadTokens     ELSE 0 END), 0) AS totalCacheReadTokens,
-              COALESCE(SUM(CASE WHEN messageType='assistant' THEN reasoningTokens     ELSE 0 END), 0) AS totalReasoningTokens,
-              SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END)                                AS eventCount,
-              SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END)                                AS userMessages,
-              SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END)                                AS assistantMessages,
-              COALESCE(MAX(timestamp), 0)                                                             AS lastEventAt,
-              COUNT(DISTINCT CASE WHEN messageType='assistant' THEN model END)                        AS modelCount,
-              us.company                                                                              AS company
-         FROM events
-         LEFT JOIN user_secrets us ON us.username = events.user
-        WHERE timestamp >= ? AND timestamp < ? ${COMPANY_SCOPE}
-        GROUP BY user
-        ORDER BY (totalInputTokens + totalOutputTokens
-                  + totalCacheCreationTokens + totalCacheReadTokens) DESC`,
-    );
+    >(adminLeaderboardSql(COMPANY_SCOPE));
+    this.adminLeaderboardForCategoryStmt = this.db.prepare<
+      LeaderboardAdminRow,
+      [number, number, number]
+    >(adminLeaderboardSql(CATEGORY_SCOPE));
     this.adminByModelStmt = this.db.prepare<ModelAggRow, [number, number]>(
       `SELECT model,
               COUNT(*)                              AS count,
@@ -628,6 +695,22 @@ export class Store {
               COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
          FROM events
         WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant' ${COMPANY_SCOPE}
+        GROUP BY model
+        ORDER BY count DESC`,
+    );
+    // Category-scoped by-model variant — mirror of the company one, swapping
+    // the scope clause. (since, until, categoryId).
+    this.adminByModelForCategoryStmt = this.db.prepare<ModelAggRow, [number, number, number]>(
+      `SELECT model,
+              COUNT(*)                              AS count,
+              COALESCE(SUM(inputTokens), 0)         AS inputTokens,
+              COALESCE(SUM(outputTokens), 0)        AS outputTokens,
+              COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
+              COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
+              COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
+              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
+         FROM events
+        WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant' ${CATEGORY_SCOPE}
         GROUP BY model
         ORDER BY count DESC`,
     );
@@ -670,10 +753,58 @@ export class Store {
         ORDER BY id DESC
         LIMIT ?`,
     );
+    // Category variant has no range predicate either, so the scope clause
+    // opens the WHERE itself (strip the leading "AND "). (categoryId, limit).
+    this.adminRecentForCategoryStmt = this.db.prepare<RecentEventRow, [number, number]>(
+      `SELECT id, user, source, model, timestamp, messageType,
+              (inputTokens + outputTokens + cacheCreationTokens
+                + cacheReadTokens + COALESCE(reasoningTokens, 0)) AS totalTokens
+         FROM events
+        WHERE ${CATEGORY_SCOPE.slice("AND ".length)}
+        ORDER BY id DESC
+        LIMIT ?`,
+    );
     // The dashboard's company-filter pills: every distinct non-null company
     // across ALL users — deliberately never filtered by the company param.
     this.listCompaniesStmt = this.db.prepare<{ company: string }, []>(
       "SELECT DISTINCT company FROM user_secrets WHERE company IS NOT NULL ORDER BY company",
+    );
+    // --- categories CRUD ---
+    // listCategories carries assigned_count (LEFT JOIN so a zero-assignment
+    // category still appears, count 0) — drives pill-gating in the UI.
+    this.listCategoriesStmt = this.db.prepare<CategoryRow, []>(
+      `SELECT c.id, c.name, c.color, c.sort_order,
+              COUNT(us.username) AS assigned_count
+         FROM categories c
+         LEFT JOIN user_secrets us ON us.category_id = c.id
+        GROUP BY c.id
+        ORDER BY c.sort_order ASC, c.name ASC`,
+    );
+    this.createCategoryStmt = this.db.prepare(
+      "INSERT INTO categories (name, color, sort_order, created_at) VALUES ($name, $color, $sort, $created_at)",
+    );
+    this.renameCategoryStmt = this.db.prepare(
+      "UPDATE categories SET name = $name, color = $color WHERE id = $id",
+    );
+    this.deleteCategoryStmt = this.db.prepare("DELETE FROM categories WHERE id = ?");
+    this.clearCategoryAssignmentsStmt = this.db.prepare(
+      "UPDATE user_secrets SET category_id = NULL WHERE category_id = ?",
+    );
+    this.getCategoryByIdStmt = this.db.prepare<{ id: number }, [number]>(
+      "SELECT id FROM categories WHERE id = ?",
+    );
+    // --- per-user assignment (UPDATE-only; NO upsert — the row must already
+    // exist, and the route 404s unknown users) ---
+    this.setUserCategoryStmt = this.db.prepare(
+      "UPDATE user_secrets SET category_id = $cid WHERE username = $u",
+    );
+    this.getUserCategoryStmt = this.db.prepare<{ category_id: number | null }, [string]>(
+      "SELECT category_id FROM user_secrets WHERE username = ?",
+    );
+    // --- roster for the assignment table (carries category_id; never selects
+    // secret_hash) ---
+    this.listClaimedUsersWithCategoryStmt = this.db.prepare<ClaimedUserWithCategoryRow, []>(
+      "SELECT username, claimed_at, category_id FROM user_secrets ORDER BY claimed_at ASC",
     );
     this.dbSizeStmt = this.db.prepare<DbSizeRow, []>(
       "SELECT (SELECT page_count FROM pragma_page_count) AS page_count, " +
@@ -1065,25 +1196,43 @@ export class Store {
     return this.leaderboardStmt.all(sinceMs, untilMs);
   }
 
+  // category and company are mutually exclusive at the store layer: the UI
+  // only ever sends one, and combined filtering + group-by are out of v1
+  // scope. categoryId wins over company when both are (mis)passed.
   adminLeaderboard(
     sinceMs: number = 0,
     untilMs: number = MAX_TS_MS,
     company?: string,
+    categoryId?: number,
   ): LeaderboardAdminRow[] {
+    if (categoryId !== undefined) {
+      return this.adminLeaderboardForCategoryStmt.all(sinceMs, untilMs, categoryId);
+    }
     if (company && company.length > 0) {
       return this.adminLeaderboardForCompanyStmt.all(sinceMs, untilMs, company);
     }
     return this.adminLeaderboardStmt.all(sinceMs, untilMs);
   }
 
-  adminByModel(sinceMs: number = 0, untilMs: number = MAX_TS_MS, company?: string): ModelAggRow[] {
+  adminByModel(
+    sinceMs: number = 0,
+    untilMs: number = MAX_TS_MS,
+    company?: string,
+    categoryId?: number,
+  ): ModelAggRow[] {
+    if (categoryId !== undefined) {
+      return this.adminByModelForCategoryStmt.all(sinceMs, untilMs, categoryId);
+    }
     if (company && company.length > 0) {
       return this.adminByModelForCompanyStmt.all(sinceMs, untilMs, company);
     }
     return this.adminByModelStmt.all(sinceMs, untilMs);
   }
 
-  adminRecent(limit: number, company?: string): RecentEventRow[] {
+  adminRecent(limit: number, company?: string, categoryId?: number): RecentEventRow[] {
+    if (categoryId !== undefined) {
+      return this.adminRecentForCategoryStmt.all(categoryId, limit);
+    }
     if (company && company.length > 0) {
       return this.adminRecentForCompanyStmt.all(company, limit);
     }
@@ -1094,6 +1243,93 @@ export class Store {
    *  filter pick-list, never narrowed by an active company filter. */
   listCompanies(): string[] {
     return this.listCompaniesStmt.all().map((r) => r.company);
+  }
+
+  /** All category definitions with their live assignment count (count 0 for
+   *  defined-but-unassigned). Always global — never narrowed by a filter. */
+  listCategories(): Array<{
+    id: number;
+    name: string;
+    color: string | null;
+    sortOrder: number;
+    assignedCount: number;
+  }> {
+    return this.listCategoriesStmt.all().map((r) => ({
+      id: r.id,
+      name: r.name,
+      color: r.color,
+      sortOrder: r.sort_order,
+      assignedCount: r.assigned_count,
+    }));
+  }
+
+  /** Create a category. `ok:false` on a (COLLATE NOCASE) duplicate name —
+   *  categories.name is the only unique constraint the INSERT can violate. */
+  createCategory(
+    name: string,
+    color: string | null,
+    now: number,
+  ): { ok: true; id: number } | { ok: false; error: "duplicate" } {
+    try {
+      const r = this.createCategoryStmt.run({
+        $name: name,
+        $color: color,
+        $sort: 0,
+        $created_at: now,
+      });
+      return { ok: true, id: Number(r.lastInsertRowid) };
+    } catch (e) {
+      if (String(e).includes("UNIQUE")) return { ok: false, error: "duplicate" };
+      throw e;
+    }
+  }
+
+  /** Rename / recolor a category. False when no row matched (unknown id). */
+  renameCategory(id: number, name: string, color: string | null): boolean {
+    return Number(this.renameCategoryStmt.run({ $id: id, $name: name, $color: color }).changes) > 0;
+  }
+
+  /** Delete a category and null out every assignment in one transaction
+   *  (manual orphan cleanup — FKs are off; mirrors clearUserSecret). False
+   *  when no category row matched. */
+  deleteCategory(id: number): boolean {
+    const tx = this.db.transaction((catId: number): boolean => {
+      this.clearCategoryAssignmentsStmt.run(catId);
+      return Number(this.deleteCategoryStmt.run(catId).changes) > 0;
+    });
+    return tx(id);
+  }
+
+  /** Whether a category id exists. */
+  categoryExists(id: number): boolean {
+    return this.getCategoryByIdStmt.get(id) !== null;
+  }
+
+  /** Assign (id) or clear (null) a user's category. UPDATE-only: the
+   *  user_secrets row must already exist (caller 404s unknown users).
+   *  False when no row matched. */
+  setUserCategory(user: string, categoryId: number | null): boolean {
+    return Number(this.setUserCategoryStmt.run({ $cid: categoryId, $u: user }).changes) > 0;
+  }
+
+  /** A user's assigned category id; null = unassigned / unknown user. */
+  getUserCategory(user: string): number | null {
+    return this.getUserCategoryStmt.get(user)?.category_id ?? null;
+  }
+
+  /** Authoritative roster for the assignment table: every claimed user (even
+   *  those with no events in the active range) plus their current category_id,
+   *  so the dropdown can seed its defaultValue. Never selects secret_hash. */
+  listClaimedUsersWithCategory(): Array<{
+    username: string;
+    claimedAt: number;
+    categoryId: number | null;
+  }> {
+    return this.listClaimedUsersWithCategoryStmt.all().map((r) => ({
+      username: r.username,
+      claimedAt: r.claimed_at,
+      categoryId: r.category_id,
+    }));
   }
 
   /** Per-user (userMessages, assistantMessages) counts in the window.
@@ -1207,7 +1443,7 @@ export class Store {
   clearFull(): void {
     this.cachedCount = null;
     this.db.exec(
-      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices;",
+      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices; DROP TABLE IF EXISTS categories;",
     );
     // server_meta survives (other keys may be unrelated state), but the
     // cursor watermark must go or cleared Cursor history never re-imports.
@@ -1217,6 +1453,9 @@ export class Store {
     migrateMessageType(this.db);
     migrateUninstalledAt(this.db);
     migrateCompany(this.db);
+    // Re-add category_id to the recreated user_secrets (categories defs and
+    // assignments share one lifecycle — both wiped above, recreated here).
+    migrateCategoryId(this.db);
   }
 
   dbSizeBytes(): number {

@@ -3,8 +3,10 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { loadAdminToken, purgeLegacyTokenStorage, storeAdminToken } from "../adminToken";
 import { fetchFleet } from "../api";
+import { CategoryManager } from "../components/CategoryManager";
 import { DangerZone } from "../components/DangerZone";
 import { FleetPanel } from "../components/FleetPanel";
+import { PeopleAssignment } from "../components/PeopleAssignment";
 
 export const Route = createFileRoute("/admin")({
   component: AdminPage,
@@ -83,6 +85,8 @@ function AdminPage() {
         {unlocked ? (
           <>
             <DangerZone token={token.trim()} />
+            <CategoryManager token={token.trim()} />
+            <PeopleAssignment token={token.trim()} />
             <FleetPanel data={fleet.data} />
             {fleet.data && fleet.data.fleet.length === 0 && (
               <p className="muted-2 empty-fleet">No daemons claimed yet.</p>
