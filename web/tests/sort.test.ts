@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LeaderboardRow } from "../src/api";
-import { sortRows } from "../src/components/LeaderboardTable";
+import { DEFAULT_SORT, nextSort, sortRows } from "../src/components/LeaderboardTable";
 
 function row(over: Partial<LeaderboardRow>): LeaderboardRow {
   return {
@@ -59,5 +59,33 @@ describe("sortRows", () => {
     const before = [...rows];
     sortRows(rows, "cost", "desc");
     expect(rows).toEqual(before);
+  });
+});
+
+describe("nextSort (3-click cycle)", () => {
+  test("1st click on a fresh column sorts it in its natural direction", () => {
+    expect(nextSort(DEFAULT_SORT, "output")).toEqual({ key: "output", dir: "desc" });
+    expect(nextSort(DEFAULT_SORT, "user")).toEqual({ key: "user", dir: "asc" });
+  });
+
+  test("2nd click flips the active column's direction", () => {
+    expect(nextSort({ key: "output", dir: "desc" }, "output")).toEqual({
+      key: "output",
+      dir: "asc",
+    });
+    expect(nextSort({ key: "user", dir: "asc" }, "user")).toEqual({ key: "user", dir: "desc" });
+  });
+
+  test("3rd click resets back to the default (cost-desc)", () => {
+    expect(nextSort({ key: "output", dir: "asc" }, "output")).toEqual(DEFAULT_SORT);
+    expect(nextSort({ key: "user", dir: "desc" }, "user")).toEqual(DEFAULT_SORT);
+  });
+
+  test("a full 3-click cycle returns to the starting state", () => {
+    let s = DEFAULT_SORT;
+    s = nextSort(s, "input"); // input desc
+    s = nextSort(s, "input"); // input asc
+    s = nextSort(s, "input"); // reset -> cost desc
+    expect(s).toEqual(DEFAULT_SORT);
   });
 });

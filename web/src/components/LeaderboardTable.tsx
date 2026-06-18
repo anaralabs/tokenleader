@@ -41,6 +41,24 @@ const DEFAULT_DIR: Record<SortKey, SortDir> = {
   lastActive: "desc",
 };
 
+export type Sort = { key: SortKey; dir: SortDir };
+/** The canonical leaderboard order — also the reset target of the 3-click cycle. */
+export const DEFAULT_SORT: Sort = { key: "cost", dir: "desc" };
+
+/**
+ * Three-click header cycle, exported for testing:
+ *   1st click → sort by the column in its natural direction,
+ *   2nd click → flip the direction,
+ *   3rd click → reset back to DEFAULT_SORT (cost-desc).
+ */
+export function nextSort(current: Sort, key: SortKey): Sort {
+  if (current.key !== key) return { key, dir: DEFAULT_DIR[key] };
+  if (current.dir === DEFAULT_DIR[key]) {
+    return { key, dir: current.dir === "asc" ? "desc" : "asc" };
+  }
+  return { ...DEFAULT_SORT };
+}
+
 /** Pure, stable leaderboard sort — exported for testing. Returns a new array. */
 export function sortRows(rows: LeaderboardRow[], key: SortKey, dir: SortDir): LeaderboardRow[] {
   const get = SORT_VALUE[key];
@@ -154,17 +172,12 @@ export function LeaderboardTable({
   /** Row click / Enter / Space — toggles focus on that user. */
   onToggleUser?: (user: string) => void;
 }) {
-  // Client-side sort: rows are already fully fetched, so re-ranking is
-  // instant. Default cost-desc (the canonical leaderboard order); clicking a
-  // header sorts by it, clicking again flips direction. Rank (#) renumbers to
-  // the active order, so the trophy follows the top of whatever you sort by.
-  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "cost", dir: "desc" });
-  const onSort = (key: SortKey) =>
-    setSort((s) =>
-      s.key === key
-        ? { key, dir: s.dir === "asc" ? "desc" : "asc" }
-        : { key, dir: DEFAULT_DIR[key] },
-    );
+  // Client-side sort: rows are already fully fetched, so re-ranking is instant.
+  // Default cost-desc. Each header cycles via nextSort: sort-by-column → flip →
+  // reset to default. Rank (#) renumbers to the active order, so the trophy
+  // follows the top of whatever you sort by.
+  const [sort, setSort] = useState<Sort>(DEFAULT_SORT);
+  const onSort = (key: SortKey) => setSort((s) => nextSort(s, key));
   const sorted = useMemo(() => (rows ? sortRows(rows, sort.key, sort.dir) : rows), [rows, sort]);
 
   let body: ReactNode;
