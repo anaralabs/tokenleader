@@ -12,8 +12,8 @@
 #       on /stats/fleet);
 #   (c) legacy manifest arm64/x64 keys byte-equal their platforms.darwin-*
 #       mirrors (the fleet-frozen v1 consumer shape);
-#   (e) no .env/.env.local at build time (Bun 1.1.38 inlines build-cwd env
-#       files into compiled binaries).
+#   (e) no .env/.env.local at build time (`bun build --compile` can inline
+#       build-cwd env files into compiled binaries).
 #
 # Secrets: NONE beyond the implicit GITHUB_TOKEN. CI does not render
 # install/uninstall scripts (the running server renders them at request
@@ -42,15 +42,19 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # Daemon compile pin. The streaming auto-update download path in
-          # the fielded daemons was verified end-to-end on this version;
-          # never bump without re-running the slow-download/blackhole repros.
-          bun-version: "1.1.38"
+          # Daemon compile pin — unified with ci.yml on the latest stable bun.
+          # 1.1.x `build --compile` baked bun's own Developer-ID (Jarred Sumner)
+          # into the binary AND produced output codesign couldn't re-sign, so
+          # the LaunchAgent showed up as "Jarred Sumner" in macOS background
+          # activity. 1.3.x is re-signable; build-daemon.sh stamps our own
+          # identity. The streaming auto-update download path is covered by
+          # src/daemon/update.test.ts (runs on this pin in ci.yml).
+          bun-version: "1.3.14"
 
       - name: Guard (e) — no env files in the build cwd
-        # Bun 1.1.38 `build --compile` inlines .env/.env.local from the cwd
-        # into the binary. A fresh checkout should never have them; fail loud
-        # if one was ever committed.
+        # `bun build --compile` has historically inlined .env/.env.local from
+        # the cwd into the binary. A fresh checkout should never have them;
+        # this guard stays as cheap insurance regardless of bun version.
         run: test ! -e .env -a ! -e .env.local
 
       - name: Install dependencies

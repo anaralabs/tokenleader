@@ -303,8 +303,10 @@ step_fail() {
 }
 
 # --- step 3: prepare binary -----------------------------------------------
-# bun --compile already ad-hoc signs the binary; re-signing trips macOS
-# strict validation. Only strip the quarantine xattr.
+# The published binary is already ad-hoc signed under our own identifier at
+# build time (scripts/build-daemon.sh), so macOS attributes the LaunchAgent to
+# us rather than to bun's author. Here we only strip the quarantine xattr so
+# launchd can exec it without a Gatekeeper prompt.
 do_codesign() {
   step_start 3 "Preparing binary"
   xattr -cr "\$BIN_DST" 2>/dev/null || true

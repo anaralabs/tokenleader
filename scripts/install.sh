@@ -303,8 +303,9 @@ do_build() {
 }
 
 # --- step 3: prepare binary -----------------------------------------------
-# bun --compile already ad-hoc signs the binary at build time. Re-signing
-# trips macOS's strict-validation mode. All we need is to strip quarantine.
+# The binary is ad-hoc signed under our own identifier at build time
+# (scripts/build-daemon.sh), so macOS attributes the LaunchAgent to us rather
+# than to bun's author. All we need here is to strip the quarantine xattr.
 do_codesign() {
   step_start 3 "Preparing binary"
   xattr -cr "$BIN_DST" 2>/dev/null || true
