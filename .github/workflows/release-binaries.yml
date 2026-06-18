@@ -41,14 +41,14 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # Pinned so CI reproduces the exact daemon binary that was tested
-          # end-to-end (anti-spin + streaming auto-update download); don't
-          # bump without re-testing the slow-download/blackhole repros.
-          bun-version: "1.1.38"
+          # Unified with ci.yml + release.yml on the latest stable bun. 1.3.x
+          # produces re-signable `--compile` output so build-daemon.sh can
+          # stamp our own identity (1.1.x baked in bun's Developer-ID and
+          # surfaced as "Jarred Sumner" in macOS background activity).
+          bun-version: "1.3.14"
 
       - name: Install dependencies
-        # Lockfile is verified under both 1.1.38 and 1.3.14 — no
-        # `|| bun install` fallback.
+        # Lockfile is verified under 1.3.14 — no `|| bun install` fallback.
         run: bun install --frozen-lockfile
 
       - name: Build cross-arch daemons

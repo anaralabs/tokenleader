@@ -48,4 +48,27 @@ if [ -n "${TARGET}" ]; then
 fi
 
 echo "build-daemon: ${OUT} (version=${VERSION}, sha=${SHA}${TARGET:+, target=${TARGET}})" >&2
-exec bun "${ARGS[@]}"
+bun "${ARGS[@]}"
+
+# Stamp OUR identity onto the compiled binary. `bun build --compile` output
+# inherits a code signature from the bun runtime it bundles: a cross-target
+# build (--target) embeds bun's OFFICIAL release runtime, which is Developer-ID
+# signed by "Jarred Sumner" (Bun's author). macOS Background Task Management
+# attributes a LaunchAgent to its executable's signing identity, so teammates
+# saw "Software from 'Jarred Sumner' can run in the background". Re-sign ad-hoc
+# under our own identifier so the daemon is attributed to itself.
+#
+# Requires bun >= 1.3: bun 1.1.x `--compile` output failed codesign strict
+# validation and couldn't be re-signed (or even stripped) — that's why the
+# release workflows build on 1.3.x. set -e aborts the build if re-signing
+# fails, so a stale bun can never silently ship the Jarred Sumner identity.
+if [ "$(uname -s)" = "Darwin" ]; then
+  IDENTIFIER="${CODESIGN_IDENTIFIER:-tokenleader}"
+  codesign --force --sign - --identifier "${IDENTIFIER}" "${OUT}" >&2
+  if codesign -dvvv "${OUT}" 2>&1 | grep -q "Authority=Developer ID"; then
+    echo "build-daemon: ${OUT} still carries a Developer ID after re-sign; refusing to ship" >&2
+    exit 1
+  fi
+  codesign --verify --strict "${OUT}"
+  echo "build-daemon: re-signed ${OUT} ad-hoc as '${IDENTIFIER}'" >&2
+fi

@@ -1,8 +1,9 @@
 # CI tests and gates; no workflow publishes on any push (release-binaries.yml
 # is workflow_dispatch-only; release.yml fires on tags).
 #
-# Bun pins are split on purpose: tests/typecheck/web run on the server pin
-# 1.3.14; daemon binaries are compiled on 1.1.38 (release.yml).
+# All bun pins are unified on the latest stable (1.3.14): tests/typecheck/web
+# here, and the daemon binaries in release.yml (re-signed under our own
+# identity by build-daemon.sh).
 
 name: CI
 
@@ -32,7 +33,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          # Server pin. Daemon builds stay on 1.1.38 in release.yml.
+          # Latest stable bun; release.yml builds the daemons on the same pin.
           bun-version: "1.3.14"
 
       - name: Install dependencies
