@@ -1,8 +1,61 @@
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { LeaderboardRow } from "../api";
 import { fmtCompact, fmtInt, fmtUsd, relTime } from "../format";
 
 const COLS = 9;
+
+export type SortKey =
+  | "user"
+  | "messages"
+  | "input"
+  | "output"
+  | "cacheCreate"
+  | "cacheRead"
+  | "cost"
+  | "lastActive";
+export type SortDir = "asc" | "desc";
+
+// Per-column sort value; numbers compare numerically, the user string A→Z.
+const SORT_VALUE: Record<SortKey, (u: LeaderboardRow) => number | string> = {
+  user: (u) => u.user.toLowerCase(),
+  messages: (u) => (u.userMessages || 0) + (u.assistantMessages || 0),
+  input: (u) => u.totalInputTokens,
+  output: (u) => u.totalOutputTokens,
+  cacheCreate: (u) => u.totalCacheCreationTokens,
+  cacheRead: (u) => u.totalCacheReadTokens,
+  cost: (u) => u.costUsd ?? 0,
+  lastActive: (u) => u.lastEventAt,
+};
+
+// First click on a column sorts in its natural direction (biggest/most-recent
+// first for numbers; A→Z for the name); clicking the active column flips it.
+const DEFAULT_DIR: Record<SortKey, SortDir> = {
+  user: "asc",
+  messages: "desc",
+  input: "desc",
+  output: "desc",
+  cacheCreate: "desc",
+  cacheRead: "desc",
+  cost: "desc",
+  lastActive: "desc",
+};
+
+/** Pure, stable leaderboard sort — exported for testing. Returns a new array. */
+export function sortRows(rows: LeaderboardRow[], key: SortKey, dir: SortDir): LeaderboardRow[] {
+  const get = SORT_VALUE[key];
+  const sign = dir === "asc" ? 1 : -1;
+  return [...rows].sort((a, b) => {
+    const va = get(a);
+    const vb = get(b);
+    const cmp =
+      typeof va === "string" && typeof vb === "string"
+        ? va.localeCompare(vb)
+        : Number(va) - Number(vb);
+    // Tie-break on user so the order is stable across re-sorts/re-renders.
+    return (cmp !== 0 ? cmp * sign : a.user.localeCompare(b.user)) || 0;
+  });
+}
 
 function Trophy() {
   return (
@@ -53,6 +106,39 @@ function GhostRows() {
   );
 }
 
+function SortableTh({
+  label,
+  sortKey,
+  className,
+  sort,
+  onSort,
+}: {
+  label: string;
+  sortKey: SortKey;
+  className?: string;
+  sort: { key: SortKey; dir: SortDir };
+  onSort: (key: SortKey) => void;
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <th
+      className={className}
+      aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}
+    >
+      <button
+        type="button"
+        className={`th-sort${active ? " active" : ""}`}
+        onClick={() => onSort(sortKey)}
+      >
+        {label}
+        <span className="th-arrow" aria-hidden="true">
+          {active ? (sort.dir === "asc" ? "↑" : "↓") : ""}
+        </span>
+      </button>
+    </th>
+  );
+}
+
 export function LeaderboardTable({
   rows,
   failed,
@@ -68,6 +154,19 @@ export function LeaderboardTable({
   /** Row click / Enter / Space — toggles focus on that user. */
   onToggleUser?: (user: string) => void;
 }) {
+  // Client-side sort: rows are already fully fetched, so re-ranking is
+  // instant. Default cost-desc (the canonical leaderboard order); clicking a
+  // header sorts by it, clicking again flips direction. Rank (#) renumbers to
+  // the active order, so the trophy follows the top of whatever you sort by.
+  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "cost", dir: "desc" });
+  const onSort = (key: SortKey) =>
+    setSort((s) =>
+      s.key === key
+        ? { key, dir: s.dir === "asc" ? "desc" : "asc" }
+        : { key, dir: DEFAULT_DIR[key] },
+    );
+  const sorted = useMemo(() => (rows ? sortRows(rows, sort.key, sort.dir) : rows), [rows, sort]);
+
   let body: ReactNode;
   if (failed && !rows) {
     body = (
@@ -80,9 +179,9 @@ export function LeaderboardTable({
         </td>
       </tr>
     );
-  } else if (!rows) {
+  } else if (!sorted) {
     body = <GhostRows />;
-  } else if (rows.length === 0) {
+  } else if (sorted.length === 0) {
     body = (
       <tr>
         <td colSpan={COLS} className="empty">
@@ -91,7 +190,7 @@ export function LeaderboardTable({
       </tr>
     );
   } else {
-    body = rows.map((u, n) => {
+    body = sorted.map((u, n) => {
       const selected = focusUser === u.user;
       const dimmed = focusUser !== undefined && !selected;
       return (
@@ -151,14 +250,38 @@ export function LeaderboardTable({
         <thead>
           <tr>
             <th className="rank-col">#</th>
-            <th>User</th>
-            <th className="num">Messages</th>
-            <th className="num">Input</th>
-            <th className="num">Output</th>
-            <th className="num col-cache">Cache Create</th>
-            <th className="num col-cache">Cache Read</th>
-            <th className="num">Cost</th>
-            <th>Last active</th>
+            <SortableTh label="User" sortKey="user" sort={sort} onSort={onSort} />
+            <SortableTh
+              label="Messages"
+              sortKey="messages"
+              className="num"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh label="Input" sortKey="input" className="num" sort={sort} onSort={onSort} />
+            <SortableTh
+              label="Output"
+              sortKey="output"
+              className="num"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh
+              label="Cache Create"
+              sortKey="cacheCreate"
+              className="num col-cache"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh
+              label="Cache Read"
+              sortKey="cacheRead"
+              className="num col-cache"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh label="Cost" sortKey="cost" className="num" sort={sort} onSort={onSort} />
+            <SortableTh label="Last active" sortKey="lastActive" sort={sort} onSort={onSort} />
           </tr>
         </thead>
         <tbody>{body}</tbody>

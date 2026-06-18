@@ -533,6 +533,36 @@ td.num .msg-split {
 th.num {
   font-weight: 500;
 }
+/* Sortable column headers: the <th> keeps its styling; the inner button is a
+   transparent, full-width click target that inherits the header font/color. */
+.th-sort {
+  appearance: none;
+  -webkit-appearance: none;
+  background: none;
+  border: none;
+  margin: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.th-sort:hover,
+.th-sort.active {
+  color: var(--text-primary);
+}
+/* Right-aligned numeric headers push the label + arrow to the right edge. */
+th.num .th-sort {
+  width: 100%;
+  justify-content: flex-end;
+}
+.th-arrow {
+  font-size: 10px;
+  min-width: 8px;
+  display: inline-block;
+}
 .fleet-version {
   font-family: var(--font-mono);
   font-weight: 600;
