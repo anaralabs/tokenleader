@@ -69,21 +69,21 @@ export function ModelsTable({
   return (
     <div className="card dimmable" data-section-loading={dim || undefined}>
       <div className="card-scroll">
-      <table>
-        <caption className="sr-only">Token usage per model</caption>
-        <thead>
-          <tr>
-            <th>Model</th>
-            <th className="num">Messages</th>
-            <th className="num">Input</th>
-            <th className="num">Output</th>
-            <th className="num col-cache">Cache Create</th>
-            <th className="num col-cache">Cache Read</th>
-            <th className="num">Cost</th>
-          </tr>
-        </thead>
-        <tbody>{body}</tbody>
-      </table>
+        <table>
+          <caption className="sr-only">Token usage per model</caption>
+          <thead>
+            <tr>
+              <th>Model</th>
+              <th className="num">Messages</th>
+              <th className="num">Input</th>
+              <th className="num">Output</th>
+              <th className="num col-cache">Cache Create</th>
+              <th className="num col-cache">Cache Read</th>
+              <th className="num">Cost</th>
+            </tr>
+          </thead>
+          <tbody>{body}</tbody>
+        </table>
       </div>
     </div>
   );

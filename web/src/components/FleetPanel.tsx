@@ -67,50 +67,50 @@ export function FleetPanel({
     <section aria-label="Daemon fleet">
       <div className="card">
         <div className="card-scroll">
-        <table>
-          <caption className="sr-only">Daemon fleet — build per teammate</caption>
-          <thead>
-            <tr>
-              <th>
-                Daemon fleet <span className="fleet-summary">— {summarize(data)}</span>
-              </th>
-              <th>Version</th>
-              <th>Arch</th>
-              <th>Status</th>
-              <th>Last check-in</th>
-            </tr>
-          </thead>
-          <tbody>
-            {data.fleet.map((f) => {
-              const b = badge(f);
-              const dimmed = focusUser !== undefined && f.user !== focusUser;
-              const devices = f.devices ?? [];
-              return (
-                <tr key={f.user} className={dimmed ? "is-dimmed" : ""}>
-                  <td>
-                    {f.user}
-                    {devices.length > 1 && (
-                      <span
-                        className="fleet-devcount"
-                        title={devices.map(deviceSummary).join("\n")}
-                      >
-                        ×{devices.length}
-                      </span>
-                    )}
-                  </td>
-                  <td className="fleet-version">
-                    {f.reporting ? f.version : <span className="muted-2">unknown</span>}
-                  </td>
-                  <td className="muted">{f.arch || "—"}</td>
-                  <td>
-                    <span className={`fleet-badge ${b.cls}`}>{b.text}</span>
-                  </td>
-                  <td className="muted">{f.lastSeen ? relTime(f.lastSeen) : "—"}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+          <table>
+            <caption className="sr-only">Daemon fleet — build per teammate</caption>
+            <thead>
+              <tr>
+                <th>
+                  Daemon fleet <span className="fleet-summary">— {summarize(data)}</span>
+                </th>
+                <th>Version</th>
+                <th>Arch</th>
+                <th>Status</th>
+                <th>Last check-in</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.fleet.map((f) => {
+                const b = badge(f);
+                const dimmed = focusUser !== undefined && f.user !== focusUser;
+                const devices = f.devices ?? [];
+                return (
+                  <tr key={f.user} className={dimmed ? "is-dimmed" : ""}>
+                    <td>
+                      {f.user}
+                      {devices.length > 1 && (
+                        <span
+                          className="fleet-devcount"
+                          title={devices.map(deviceSummary).join("\n")}
+                        >
+                          ×{devices.length}
+                        </span>
+                      )}
+                    </td>
+                    <td className="fleet-version">
+                      {f.reporting ? f.version : <span className="muted-2">unknown</span>}
+                    </td>
+                    <td className="muted">{f.arch || "—"}</td>
+                    <td>
+                      <span className={`fleet-badge ${b.cls}`}>{b.text}</span>
+                    </td>
+                    <td className="muted">{f.lastSeen ? relTime(f.lastSeen) : "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       </div>
     </section>
