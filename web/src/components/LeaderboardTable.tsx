@@ -1,6 +1,15 @@
+import { useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import type { LeaderboardRow } from "../api";
 import { fmtCompact, fmtInt, fmtUsd, relTime } from "../format";
+import {
+  DEFAULT_SORT,
+  nextSort,
+  type Sort,
+  type SortDir,
+  type SortKey,
+  sortRows,
+} from "../leaderboard-sort";
 
 const COLS = 9;
 
@@ -53,6 +62,39 @@ function GhostRows() {
   );
 }
 
+function SortableTh({
+  label,
+  sortKey,
+  className,
+  sort,
+  onSort,
+}: {
+  label: string;
+  sortKey: SortKey;
+  className?: string;
+  sort: { key: SortKey; dir: SortDir };
+  onSort: (key: SortKey) => void;
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <th
+      className={className}
+      aria-sort={active ? (sort.dir === "asc" ? "ascending" : "descending") : "none"}
+    >
+      <button
+        type="button"
+        className={`th-sort${active ? " active" : ""}`}
+        onClick={() => onSort(sortKey)}
+      >
+        {label}
+        <span className="th-arrow" aria-hidden="true">
+          {active ? (sort.dir === "asc" ? "↑" : "↓") : ""}
+        </span>
+      </button>
+    </th>
+  );
+}
+
 export function LeaderboardTable({
   rows,
   failed,
@@ -68,6 +110,14 @@ export function LeaderboardTable({
   /** Row click / Enter / Space — toggles focus on that user. */
   onToggleUser?: (user: string) => void;
 }) {
+  // Client-side sort: rows are already fully fetched, so re-ranking is instant.
+  // Default cost-desc. Each header cycles via nextSort: sort-by-column → flip →
+  // reset to default. Rank (#) renumbers to the active order, so the trophy
+  // follows the top of whatever you sort by.
+  const [sort, setSort] = useState<Sort>(DEFAULT_SORT);
+  const onSort = (key: SortKey) => setSort((s) => nextSort(s, key));
+  const sorted = useMemo(() => (rows ? sortRows(rows, sort.key, sort.dir) : rows), [rows, sort]);
+
   let body: ReactNode;
   if (failed && !rows) {
     body = (
@@ -80,9 +130,9 @@ export function LeaderboardTable({
         </td>
       </tr>
     );
-  } else if (!rows) {
+  } else if (!sorted) {
     body = <GhostRows />;
-  } else if (rows.length === 0) {
+  } else if (sorted.length === 0) {
     body = (
       <tr>
         <td colSpan={COLS} className="empty">
@@ -91,7 +141,7 @@ export function LeaderboardTable({
       </tr>
     );
   } else {
-    body = rows.map((u, n) => {
+    body = sorted.map((u, n) => {
       const selected = focusUser === u.user;
       const dimmed = focusUser !== undefined && !selected;
       return (
@@ -151,14 +201,38 @@ export function LeaderboardTable({
         <thead>
           <tr>
             <th className="rank-col">#</th>
-            <th>User</th>
-            <th className="num">Messages</th>
-            <th className="num">Input</th>
-            <th className="num">Output</th>
-            <th className="num col-cache">Cache Create</th>
-            <th className="num col-cache">Cache Read</th>
-            <th className="num">Cost</th>
-            <th>Last active</th>
+            <SortableTh label="User" sortKey="user" sort={sort} onSort={onSort} />
+            <SortableTh
+              label="Messages"
+              sortKey="messages"
+              className="num"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh label="Input" sortKey="input" className="num" sort={sort} onSort={onSort} />
+            <SortableTh
+              label="Output"
+              sortKey="output"
+              className="num"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh
+              label="Cache Create"
+              sortKey="cacheCreate"
+              className="num col-cache"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh
+              label="Cache Read"
+              sortKey="cacheRead"
+              className="num col-cache"
+              sort={sort}
+              onSort={onSort}
+            />
+            <SortableTh label="Cost" sortKey="cost" className="num" sort={sort} onSort={onSort} />
+            <SortableTh label="Last active" sortKey="lastActive" sort={sort} onSort={onSort} />
           </tr>
         </thead>
         <tbody>{body}</tbody>
