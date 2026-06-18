@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { LeaderboardRow } from "../src/api";
-import { DEFAULT_SORT, nextSort, sortRows } from "../src/components/LeaderboardTable";
+import { DEFAULT_SORT, nextSort, sortRows } from "../src/leaderboard-sort";
 
 function row(over: Partial<LeaderboardRow>): LeaderboardRow {
   return {
