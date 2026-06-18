@@ -68,6 +68,7 @@ export function ModelsTable({
 
   return (
     <div className="card dimmable" data-section-loading={dim || undefined}>
+      <div className="card-scroll">
       <table>
         <caption className="sr-only">Token usage per model</caption>
         <thead>
@@ -83,6 +84,7 @@ export function ModelsTable({
         </thead>
         <tbody>{body}</tbody>
       </table>
+      </div>
     </div>
   );
 }

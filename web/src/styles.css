@@ -492,7 +492,22 @@ tr.is-dimmed > td {
   background: var(--bg-object);
   border: 1px solid var(--border-muted);
   border-radius: var(--radius-card);
+}
+/* Horizontal scroll lives on an inner wrapper so thead can use position:sticky
+   against the page scrollport (overflow-x on .card itself would trap sticky
+   headers inside the card). overflow-y: clip keeps horizontal scroll without
+   creating a vertical scroll container. */
+.card-scroll {
   overflow-x: auto;
+  overflow-y: clip;
+  border-radius: inherit;
+}
+.card thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-object);
+  box-shadow: 0 1px 0 var(--border-muted);
 }
 table {
   width: 100%;

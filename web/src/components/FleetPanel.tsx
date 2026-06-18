@@ -66,6 +66,7 @@ export function FleetPanel({
   return (
     <section aria-label="Daemon fleet">
       <div className="card">
+        <div className="card-scroll">
         <table>
           <caption className="sr-only">Daemon fleet — build per teammate</caption>
           <thead>
@@ -110,6 +111,7 @@ export function FleetPanel({
             })}
           </tbody>
         </table>
+        </div>
       </div>
     </section>
   );

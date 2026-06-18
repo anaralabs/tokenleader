@@ -196,6 +196,7 @@ export function LeaderboardTable({
 
   return (
     <div className="card dimmable">
+      <div className="card-scroll">
       <table className="lb-table">
         <caption className="sr-only">Leaderboard — token usage per user</caption>
         <thead>
@@ -237,6 +238,7 @@ export function LeaderboardTable({
         </thead>
         <tbody>{body}</tbody>
       </table>
+      </div>
     </div>
   );
 }
