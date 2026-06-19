@@ -30,7 +30,13 @@ export const LAUNCHD_LABEL = "sh.anara.leaderboard";
 // Wall-clock fetch budgets. See transport.ts fetchWithTimeout for why a bare
 // AbortSignal is insufficient in Bun 1.1.38 (connect-phase hangs ignore it).
 const UPDATE_FETCH_TIMEOUT_MS = 20_000; // manifest GET
-const UPDATE_BINARY_TIMEOUT_MS = 120_000; // ~60MB binary GET (real transfer headroom)
+// Binary GET. The server serves /bin gzip-compressed (~24 MB), but this is the
+// hard cap on the WHOLE download, so it must clear the worst real-world link:
+// the old 120s stranded the fleet when the binary grew past what a slow
+// connection could pull in two minutes (see the v0.5.x fleet-stuck incident).
+// 600s tolerates links down to ~40 KB/s for the compressed payload; a partial
+// download is sha-rejected, never executed, so a generous budget is free.
+const UPDATE_BINARY_TIMEOUT_MS = 600_000;
 
 async function fetchWithTimeout(
   fetchImpl: typeof fetch,
