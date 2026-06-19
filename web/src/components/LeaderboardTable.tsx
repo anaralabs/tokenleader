@@ -196,47 +196,55 @@ export function LeaderboardTable({
 
   return (
     <div className="card dimmable">
-      <table className="lb-table">
-        <caption className="sr-only">Leaderboard — token usage per user</caption>
-        <thead>
-          <tr>
-            <th className="rank-col">#</th>
-            <SortableTh label="User" sortKey="user" sort={sort} onSort={onSort} />
-            <SortableTh
-              label="Messages"
-              sortKey="messages"
-              className="num"
-              sort={sort}
-              onSort={onSort}
-            />
-            <SortableTh label="Input" sortKey="input" className="num" sort={sort} onSort={onSort} />
-            <SortableTh
-              label="Output"
-              sortKey="output"
-              className="num"
-              sort={sort}
-              onSort={onSort}
-            />
-            <SortableTh
-              label="Cache Create"
-              sortKey="cacheCreate"
-              className="num col-cache"
-              sort={sort}
-              onSort={onSort}
-            />
-            <SortableTh
-              label="Cache Read"
-              sortKey="cacheRead"
-              className="num col-cache"
-              sort={sort}
-              onSort={onSort}
-            />
-            <SortableTh label="Cost" sortKey="cost" className="num" sort={sort} onSort={onSort} />
-            <SortableTh label="Last active" sortKey="lastActive" sort={sort} onSort={onSort} />
-          </tr>
-        </thead>
-        <tbody>{body}</tbody>
-      </table>
+      <div className="card-scroll">
+        <table className="lb-table">
+          <caption className="sr-only">Leaderboard — token usage per user</caption>
+          <thead>
+            <tr>
+              <th className="rank-col">#</th>
+              <SortableTh label="User" sortKey="user" sort={sort} onSort={onSort} />
+              <SortableTh
+                label="Messages"
+                sortKey="messages"
+                className="num"
+                sort={sort}
+                onSort={onSort}
+              />
+              <SortableTh
+                label="Input"
+                sortKey="input"
+                className="num"
+                sort={sort}
+                onSort={onSort}
+              />
+              <SortableTh
+                label="Output"
+                sortKey="output"
+                className="num"
+                sort={sort}
+                onSort={onSort}
+              />
+              <SortableTh
+                label="Cache Create"
+                sortKey="cacheCreate"
+                className="num col-cache"
+                sort={sort}
+                onSort={onSort}
+              />
+              <SortableTh
+                label="Cache Read"
+                sortKey="cacheRead"
+                className="num col-cache"
+                sort={sort}
+                onSort={onSort}
+              />
+              <SortableTh label="Cost" sortKey="cost" className="num" sort={sort} onSort={onSort} />
+              <SortableTh label="Last active" sortKey="lastActive" sort={sort} onSort={onSort} />
+            </tr>
+          </thead>
+          <tbody>{body}</tbody>
+        </table>
+      </div>
     </div>
   );
 }
