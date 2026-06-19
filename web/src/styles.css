@@ -495,12 +495,15 @@ tr.is-dimmed > td {
 }
 /* thead uses position:sticky to pin against the PAGE scrollport as you scroll a
    long table. position:sticky resolves against the nearest *scroll container*,
-   so .card-scroll must NOT be one on desktop — ANY overflow other than visible
-   (overflow-x:auto included; it forces overflow-y to auto and traps the header
-   inside the card). The wide numeric tables only overflow on narrow viewports,
-   so the horizontal scrollbar is scoped to the ~720px breakpoint below: phones
-   trade the pinned header for horizontal scroll, desktop keeps it pinned. */
+   so .card-scroll must NOT be one on desktop — overflow-x/y:auto|scroll|hidden
+   would trap the header inside the card. `overflow: clip` is the exception: it
+   clips children to the card's rounded corners (so the white header corner
+   doesn't poke past them) WITHOUT establishing a scroll container, so the
+   header still pins to the page. The wide numeric tables only overflow on
+   narrow viewports, so horizontal scroll is scoped to the ~720px breakpoint
+   below: phones trade the pinned header for horizontal scroll. */
 .card-scroll {
+  overflow: clip;
   border-radius: inherit;
 }
 .card thead th {
