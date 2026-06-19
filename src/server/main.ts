@@ -659,26 +659,34 @@ export function buildApp(opts: BuildOptions) {
     if (!entry) {
       return c.json({ error: "binary not yet mirrored" }, 503);
     }
+    // Serve gzip to clients that accept it. The daemon's update fetch sends
+    // Accept-Encoding: gzip and transparently decodes; the install script's
+    // curl does NOT (no --compressed), so it still gets the raw binary. The
+    // ~63 MB binary compresses ~2.6x, which keeps the download under the
+    // daemon's 120s fetch timeout (a raw pull over a slow link exceeds it and
+    // strands the update). The sha is verified against the DECODED bytes, so
+    // the manifest is unchanged either way.
+    const acceptsGzip = (c.req.header("accept-encoding") ?? "").toLowerCase().includes("gzip");
+    const gz = acceptsGzip ? mirror.getBinaryGzip(arch) : null;
+    const served = gz ?? entry;
+    const headers: Record<string, string> = {
+      "content-type": "application/octet-stream",
+      "content-length": String(served.size),
+      "cache-control": "no-store",
+    };
+    if (gz) {
+      headers["content-encoding"] = "gzip";
+      // A shared cache must never hand the gzip body to a non-gzip client.
+      headers.vary = "Accept-Encoding";
+    }
     // Stream — don't buffer 60 MB per fetch. Bun.file under bun,
     // createReadStream under plain-node tests.
     if (typeof Bun !== "undefined" && typeof Bun.file === "function") {
-      return new Response(Bun.file(entry.path), {
-        status: 200,
-        headers: {
-          "content-type": "application/octet-stream",
-          "content-length": String(entry.size),
-          "cache-control": "no-store",
-        },
-      });
+      return new Response(Bun.file(served.path), { status: 200, headers });
     }
-    const stream = createReadStream(entry.path);
-    return new Response(stream as unknown as ReadableStream, {
+    return new Response(createReadStream(served.path) as unknown as ReadableStream, {
       status: 200,
-      headers: {
-        "content-type": "application/octet-stream",
-        "content-length": String(entry.size),
-        "cache-control": "no-store",
-      },
+      headers,
     });
   });
 

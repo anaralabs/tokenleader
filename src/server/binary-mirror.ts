@@ -9,6 +9,10 @@
 import { createHash } from "node:crypto";
 import { existsSync, promises as fsp, readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
+import { gzip as gzipCb } from "node:zlib";
+
+const gzipAsync = promisify(gzipCb);
 
 /**
  * Architectures the mirror manages. The `anara-leaderboard-<arch>` filenames
@@ -98,6 +102,10 @@ function binaryPath(cacheDir: string, arch: MirroredArch): string {
   return path.join(cacheDir, `anara-leaderboard-${arch}`);
 }
 
+function gzipPath(cacheDir: string, arch: MirroredArch): string {
+  return `${binaryPath(cacheDir, arch)}.gz`;
+}
+
 function sha256Hex(buf: Uint8Array): string {
   return createHash("sha256").update(buf).digest("hex");
 }
@@ -148,6 +156,11 @@ export class BinaryMirror {
     } catch {
       this.lastManifestSha = null;
     }
+
+    // Backfill the gzip copies for any already-cached binaries (a restart with
+    // an unchanged release won't re-run a refresh), so /bin can serve gzip
+    // right away. Best-effort, off the boot path.
+    void this.ensureGzip();
 
     this.initialTimer = setTimeout(() => {
       this.initialTimer = null;
@@ -229,6 +242,67 @@ export class BinaryMirror {
       return { path: p, size: st.size };
     } catch {
       return null;
+    }
+  }
+
+  /** On-disk path of the gzip-compressed binary for `arch`, if a copy fresher
+   *  than the raw binary is cached. The ~63 MB daemon binary compresses ~2.6x,
+   *  and the daemon's update fetch has a hard 120s timeout — a raw 63 MB pull
+   *  over a slow link exceeds it and strands the update, so /bin serves this to
+   *  gzip-accepting clients. The daemon sha-verifies the DECODED bytes, so the
+   *  manifest sha is unchanged. Returns null when no fresh .gz exists yet
+   *  (ensureGzip hasn't run, or it's stale after a refresh) — the route then
+   *  falls back to the raw binary. */
+  getBinaryGzip(arch: MirroredArch): { path: string; size: number } | null {
+    try {
+      const rawStat = statSync(binaryPath(this.cacheDir, arch));
+      const gzStat = statSync(gzipPath(this.cacheDir, arch));
+      if (gzStat.mtimeMs >= rawStat.mtimeMs) {
+        return { path: gzipPath(this.cacheDir, arch), size: gzStat.size };
+      }
+    } catch {
+      // raw or gz missing — caller falls back to raw serving.
+    }
+    return null;
+  }
+
+  /** Generate (or refresh) the gzip copy of each cached binary. Idempotent and
+   *  atomic (tmp + rename); skips an arch whose .gz is already fresh. Called on
+   *  start() and after each successful refresh so /bin can serve gzip. Errors
+   *  are logged, never thrown — gzip is an optimization; raw serving still works. */
+  async ensureGzip(): Promise<void> {
+    for (const arch of MIRRORED_ARCHES) {
+      const raw = binaryPath(this.cacheDir, arch);
+      const gz = gzipPath(this.cacheDir, arch);
+      let rawStat: ReturnType<typeof statSync>;
+      try {
+        rawStat = statSync(raw);
+      } catch {
+        continue; // no raw binary cached for this arch yet
+      }
+      try {
+        if (statSync(gz).mtimeMs >= rawStat.mtimeMs) continue; // already fresh
+      } catch {
+        // gz missing — generate below.
+      }
+      try {
+        const compressed = await gzipAsync(await fsp.readFile(raw));
+        const tmp = `${gz}.tmp.${process.pid}`;
+        await fsp.writeFile(tmp, compressed);
+        await fsp.rename(tmp, gz);
+        this.log.info(
+          "[tokenleader] binary-mirror: gzipped",
+          `arch=${arch}`,
+          `raw=${rawStat.size}`,
+          `gz=${compressed.length}`,
+        );
+      } catch (err: unknown) {
+        this.log.error(
+          "[tokenleader] binary-mirror: gzip failed",
+          `arch=${arch}`,
+          String((err as Error)?.message ?? err),
+        );
+      }
     }
   }
 
@@ -346,6 +420,9 @@ export class BinaryMirror {
       `tag=${release.tag_name}`,
       `sha=${newManifestSha.slice(0, 12)}`,
     );
+
+    // Regenerate gzip copies for the freshly-swapped binaries.
+    await this.ensureGzip();
   }
 
   /** GitHub's "latest" MARKER endpoint first (vX.Y.Z releases, excludes
@@ -392,6 +469,7 @@ export class BinaryMirror {
 export const __internal = {
   manifestPath,
   binaryPath,
+  gzipPath,
   sha256Hex,
   isGhRelease,
 };

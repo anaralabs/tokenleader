@@ -358,3 +358,48 @@ describe("BinaryMirror.tick", () => {
     expect(got).not.toBeNull();
   });
 });
+
+describe("BinaryMirror gzip serving (ensureGzip / getBinaryGzip)", () => {
+  test("ensureGzip writes a .gz that decodes back to the raw binary", async () => {
+    const { gunzipSync } = await import("node:zlib");
+    const cacheDir = await makeTmpDir();
+    const raw = new Uint8Array(200_000);
+    for (let i = 0; i < raw.length; i++) raw[i] = (i * 7) % 256;
+    await fsp.writeFile(__internal.binaryPath(cacheDir, "arm64"), raw);
+
+    const mirror = makeMirror({ cacheDir, fetchImpl: fakeFetch({}) });
+    // No .gz yet → getBinaryGzip is null; raw serving is the fallback.
+    expect(mirror.getBinaryGzip("arm64")).toBeNull();
+
+    await mirror.ensureGzip();
+    const gz = mirror.getBinaryGzip("arm64");
+    expect(gz).not.toBeNull();
+    expect(gz!.path).toBe(__internal.gzipPath(cacheDir, "arm64"));
+    // Decodes byte-for-byte back to the raw binary (sha-equivalence the daemon
+    // relies on: it verifies the DECODED bytes against the manifest sha).
+    const decoded = gunzipSync(await fsp.readFile(gz!.path));
+    expect(decoded.length).toBe(raw.length);
+    expect(Buffer.from(decoded).equals(Buffer.from(raw))).toBe(true);
+    // A real binary compresses; the .gz must be smaller than the raw.
+    expect(gz!.size).toBeLessThan(raw.length);
+  });
+
+  test("getBinaryGzip ignores a .gz older than its raw binary (stale)", async () => {
+    const cacheDir = await makeTmpDir();
+    const rawPath = __internal.binaryPath(cacheDir, "arm64");
+    await fsp.writeFile(rawPath, new Uint8Array(50_000));
+    const mirror = makeMirror({ cacheDir, fetchImpl: fakeFetch({}) });
+    await mirror.ensureGzip();
+    expect(mirror.getBinaryGzip("arm64")).not.toBeNull();
+
+    // Age the cached .gz behind its raw binary (simulating a refresh that
+    // swapped in a newer raw before ensureGzip regenerated the .gz).
+    const past = new Date(Date.now() - 60_000);
+    await fsp.utimes(__internal.gzipPath(cacheDir, "arm64"), past, past);
+    expect(mirror.getBinaryGzip("arm64")).toBeNull();
+
+    // ensureGzip regenerates the fresher copy.
+    await mirror.ensureGzip();
+    expect(mirror.getBinaryGzip("arm64")).not.toBeNull();
+  });
+});
