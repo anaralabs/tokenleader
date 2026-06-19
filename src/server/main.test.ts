@@ -1578,6 +1578,44 @@ describe("/manifest.json + /bin/* (daemon self-update endpoints)", () => {
     }
   });
 
+  test("GET /bin serves gzip ONLY when the client sends Accept-Encoding: gzip", async () => {
+    const { gzipSync, gunzipSync } = await import("node:zlib");
+    const { dir: cacheDir, cleanup: rmCache } = makeTmpDirSync("tokenleader-bin-");
+    const raw = new Uint8Array(40_000);
+    for (let i = 0; i < raw.length; i++) raw[i] = (i * 13) % 256;
+    writeFileSync(join(cacheDir, "anara-leaderboard-arm64"), raw);
+    // Pre-write the .gz (written after the raw, so its mtime is fresher).
+    const gz = gzipSync(Buffer.from(raw));
+    writeFileSync(join(cacheDir, "anara-leaderboard-arm64.gz"), gz);
+    const { app, cleanup } = withApp(cacheDir);
+    try {
+      // Daemon path: Accept-Encoding: gzip → compressed body, decodes to raw.
+      const gzRes = await app.fetch(
+        new Request("http://x/bin/anara-leaderboard-arm64", {
+          headers: { "accept-encoding": "gzip, deflate" },
+        }),
+      );
+      expect(gzRes.status).toBe(200);
+      expect(gzRes.headers.get("content-encoding")).toBe("gzip");
+      expect(gzRes.headers.get("content-length")).toBe(String(gz.length));
+      expect(gzRes.headers.get("vary")).toBe("Accept-Encoding");
+      const decoded = gunzipSync(Buffer.from(await gzRes.arrayBuffer()));
+      expect(decoded.length).toBe(raw.length);
+      expect(decoded.equals(Buffer.from(raw))).toBe(true);
+
+      // Install path (curl, no --compressed): no Accept-Encoding → RAW bytes,
+      // never the gzip body, even though a .gz is cached.
+      const rawRes = await app.fetch(new Request("http://x/bin/anara-leaderboard-arm64"));
+      expect(rawRes.status).toBe(200);
+      expect(rawRes.headers.get("content-encoding")).toBeNull();
+      expect(rawRes.headers.get("content-length")).toBe(String(raw.length));
+      expect(new Uint8Array(await rawRes.arrayBuffer()).length).toBe(raw.length);
+    } finally {
+      cleanup();
+      rmCache();
+    }
+  });
+
   test("GET /bin/anara-leaderboard-<unknown-arch> 404s (allowlist)", async () => {
     const { dir: cacheDir, cleanup: rmCache } = makeTmpDirSync("tokenleader-bin-");
     // Even if a same-prefix file exists, an arch outside the allowlist
