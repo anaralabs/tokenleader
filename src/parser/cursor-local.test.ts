@@ -136,6 +136,30 @@ describe("parseCursorLocal", () => {
     expect(r.events[0]!.timestamp).toBe(1_780_000_000_000);
   });
 
+  it("rounds fractional db mtime to an integer timestamp (server rejects floats)", () => {
+    const { dbPath } = makeCursorDb([
+      {
+        key: "bubbleId:comp-3:bubble-3",
+        value: {
+          type: 2,
+          bubbleId: "bubble-3",
+          usageUuid: "usage-3",
+          tokenCount: { inputTokens: 0, outputTokens: 5 },
+        },
+      },
+    ]);
+
+    const r = parseCursorLocal({
+      dbPath,
+      lastRowid: 0,
+      user: "bob",
+      dbMtimeMs: 1_780_000_000_000.6118,
+    });
+    expect(r.events.length).toBe(1);
+    expect(Number.isInteger(r.events[0]!.timestamp)).toBe(true);
+    expect(r.events[0]!.timestamp).toBe(1_780_000_000_001);
+  });
+
   it("estimates assistant output tokens from text length when tokenCount is zero", () => {
     const composerId = "comp-2";
     const text = "abcd".repeat(10); // 40 chars → 10 tokens

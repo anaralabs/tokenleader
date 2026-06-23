@@ -117,6 +117,23 @@ describe("parseCursorTranscriptFile", () => {
     expect(second.events[0]!.messageId).toBe(stableTranscriptMessageId(path, 3));
     expect(second.nextLineIndex).toBe(3);
   });
+
+  it("rounds fractional file mtime to an integer timestamp (server rejects floats)", async () => {
+    const { path } = makeTranscriptFile([
+      JSON.stringify({ role: "user", message: { content: [{ type: "text", text: "hi" }] } }),
+    ]);
+
+    const r = await parseCursorTranscriptFile({
+      path,
+      byteOffset: 0,
+      user: "alice",
+      fileMtimeMs: 1_780_100_000_000.6118,
+    });
+
+    expect(r.events.length).toBe(1);
+    expect(Number.isInteger(r.events[0]!.timestamp)).toBe(true);
+    expect(r.events[0]!.timestamp).toBe(1_780_100_000_001);
+  });
 });
 
 describe("estimateTranscriptTextLength", () => {

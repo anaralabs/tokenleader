@@ -311,11 +311,8 @@ export function parseCursorLocal(opts: ParseCursorLocalOptions): ParseCursorLoca
         continue;
       }
 
-      const timestamp = resolveCursorTimestamp(
-        parts.composerId,
-        composerTimes,
-        agentKvTimes,
-        dbMtimeMs,
+      const timestamp = Math.round(
+        resolveCursorTimestamp(parts.composerId, composerTimes, agentKvTimes, dbMtimeMs),
       );
 
       events.push({
