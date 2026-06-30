@@ -5,6 +5,7 @@ import { BUILD_SHA, BUILD_VERSION } from "./build-info";
 import { CLI_COMMANDS, type CliCommand, runCliCommand } from "./cli";
 import { normalizeEndpoint, readEndpointOverride } from "./endpoint-override";
 import { log, LOG_FILE } from "./log";
+import { healInstalledPlist } from "./plist-heal";
 import { loadOrCreateSecret } from "./secret";
 import { applyRescanGeneration, ensureStateDir, loadState, saveState } from "./state";
 import { tick } from "./tick";
@@ -522,6 +523,14 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       err: String((err as Error)?.message ?? err),
     });
     return 1;
+  }
+
+  // One-shot per boot: repair a strand-prone LaunchAgent plist from an older
+  // install so this daemon can never again stay dead after a clean exit. Only
+  // the real launchd entrypoint runs this (runDaemon, used by tests, never
+  // does), so unit tests can't touch a developer's installed plist.
+  if (process.platform === "darwin") {
+    await healInstalledPlist(log);
   }
 
   try {

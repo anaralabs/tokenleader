@@ -227,9 +227,13 @@ function defaultRestart(log: Logger): void {
       err: String((err as Error)?.message ?? err),
     });
   }
-  // Give launchctl a moment to send SIGTERM. KeepAlive.SuccessfulExit=false
-  // in the plist means launchd re-spawns us anyway, but kickstart -k is
-  // the belt-and-suspenders path.
+  // Give launchctl a moment to send SIGTERM, then exit. The plist now sets
+  // unconditional `KeepAlive: true`, so this clean exit(0) is by itself enough
+  // for launchd to respawn us — kickstart -k is just the faster path. The old
+  // {Crashed,SuccessfulExit:false} plist did NOT respawn on a clean exit, so a
+  // kickstart that raced the 30s ThrottleInterval left the daemon dead until
+  // the next login (the v0.5.x fleet-stuck incident; older plists are repaired
+  // on boot by plist-heal.ts).
   setTimeout(() => {
     process.exit(0);
   }, 200).unref?.();

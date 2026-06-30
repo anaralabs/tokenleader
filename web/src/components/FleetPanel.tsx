@@ -7,47 +7,35 @@ function deviceSummary(d: FleetDevice): string {
   return `${name}: ${d.version ?? "unknown"} (${seen})`;
 }
 
-// A daemon seen within its hourly update window (+ jitter slack) that isn't
-// on the newest build yet is just mid-rollout, not a problem — "updating".
-// Only quiet-for-longer daemons earn the orange "stale".
-const UPDATE_WINDOW_MS = 90 * 60 * 1000;
-function isUpdating(f: FleetEntry): boolean {
-  return (
-    f.reporting &&
-    f.isLatest === false &&
-    typeof f.lastSeen === "number" &&
-    Date.now() - f.lastSeen < UPDATE_WINDOW_MS
-  );
+// Health answers "are we receiving this teammate's usage?", NOT "are they on
+// the newest daemon". A daemon only posts when there's new activity, so recency
+// of the last post is the liveness signal — and an OLD daemon posts usage
+// exactly as well as a new one (the server never gates ingest on version), so
+// version is deliberately kept out of the health verdict.
+const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000;
+function isActive(f: FleetEntry): boolean {
+  return typeof f.lastSeen === "number" && Date.now() - f.lastSeen < ACTIVE_WINDOW_MS;
 }
 
 function badge(f: FleetEntry): { cls: string; text: string } {
-  if (!f.reporting) return { cls: "fleet-unknown", text: "old daemon" };
-  if (f.isLatest === true) return { cls: "fleet-ok", text: "latest" };
-  if (f.isLatest === false) {
-    return isUpdating(f)
-      ? { cls: "fleet-neutral", text: "updating" }
-      : { cls: "fleet-stale", text: "stale" };
-  }
-  // No published manifest to compare against (boot window / no GH token).
-  return { cls: "fleet-neutral", text: "reporting" };
+  if (!f.reporting) return { cls: "fleet-unknown", text: "no daemon" };
+  return isActive(f) ? { cls: "fleet-ok", text: "active" } : { cls: "fleet-neutral", text: "idle" };
+}
+
+// Version freshness is informational — shown beside the version, never a health
+// alarm. `isLatest === false` is a behind-but-fine daemon; `null` means there's
+// no published version to compare against (boot window / no GH token).
+function versionBehind(f: FleetEntry): boolean {
+  return f.reporting && f.isLatest === false;
 }
 
 function summarize(data: FleetStats): string {
-  const onLatest = data.fleet.filter((f) => f.isLatest === true).length;
-  const updating = data.fleet.filter((f) => isUpdating(f)).length;
-  const stale = data.fleet.filter(
-    (f) => f.isLatest === false && f.reporting && !isUpdating(f),
-  ).length;
-  const unknown = data.fleet.filter((f) => !f.reporting).length;
-  const uncomparable = data.fleet.filter((f) => f.reporting && f.isLatest === null).length;
-  const parts = data.latestVersion
-    ? [
-        `${onLatest} on latest (${data.latestVersion})`,
-        ...(updating ? [`${updating} updating`] : []),
-        ...(stale ? [`${stale} stale`] : []),
-      ]
-    : [`${uncomparable} reporting (no published version yet)`];
-  if (unknown) parts.push(`${unknown} unknown`);
+  const active = data.fleet.filter(isActive).length;
+  const idle = data.fleet.filter((f) => f.reporting && !isActive(f)).length;
+  const noDaemon = data.fleet.filter((f) => !f.reporting).length;
+  const parts = [`${active} active`];
+  if (idle) parts.push(`${idle} idle`);
+  if (noDaemon) parts.push(`${noDaemon} no daemon`);
   return parts.join(" · ");
 }
 
@@ -68,7 +56,7 @@ export function FleetPanel({
       <div className="card">
         <div className="card-scroll">
           <table>
-            <caption className="sr-only">Daemon fleet — build per teammate</caption>
+            <caption className="sr-only">Daemon fleet — posting health per teammate</caption>
             <thead>
               <tr>
                 <th>
@@ -99,7 +87,14 @@ export function FleetPanel({
                       )}
                     </td>
                     <td className="fleet-version">
-                      {f.reporting ? f.version : <span className="muted-2">unknown</span>}
+                      {f.reporting ? (
+                        <>
+                          {f.version}
+                          {versionBehind(f) && <span className="muted-2"> · update pending</span>}
+                        </>
+                      ) : (
+                        <span className="muted-2">unknown</span>
+                      )}
                     </td>
                     <td className="muted">{f.arch || "—"}</td>
                     <td>

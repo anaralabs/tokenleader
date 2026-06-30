@@ -44,13 +44,11 @@ render_daemon_plist() {
     </dict>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Unconditional: respawn on ANY exit, clean or crash. A {SuccessfulExit:false}
+         dict strands the daemon whenever it exits 0 (e.g. the post-update restart)
+         until the next login — the v0.5.x fleet-stuck incident. -->
     <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>ProcessType</key>
@@ -157,13 +155,11 @@ ${public_url_block}${gh_repo_block}${gh_token_block}${cursor_token_block}${curso
     </dict>
     <key>RunAtLoad</key>
     <true/>
+    <!-- Unconditional: respawn on ANY exit, clean or crash. A {SuccessfulExit:false}
+         dict strands the daemon whenever it exits 0 (e.g. the post-update restart)
+         until the next login — the v0.5.x fleet-stuck incident. -->
     <key>KeepAlive</key>
-    <dict>
-        <key>Crashed</key>
-        <true/>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>ThrottleInterval</key>
     <integer>30</integer>
     <key>ProcessType</key>
