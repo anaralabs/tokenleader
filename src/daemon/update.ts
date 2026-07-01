@@ -2,9 +2,20 @@
 //
 // Flow: GET <endpoint>/manifest.json, compare the manifest sha256 for our
 // arch against the SHA-256 of the running binary; if different, download
-// /bin/anara-leaderboard-<arch>, sha-verify, smoke-run it, atomically rename
-// it over `execPath`, then exit non-zero so launchd's KeepAlive respawns the
-// new binary.
+// /bin/anara-leaderboard-<arch> via a curl subprocess, sha-verify, smoke-run
+// it, atomically rename it over `execPath`, then exit non-zero so launchd's
+// KeepAlive respawns the new binary.
+//
+// The binary download deliberately does NOT use Bun's fetch: the compiled
+// daemon's fetch of this exact transfer (a ~24MB gzip-encoded body from the
+// server) can kill the WHOLE process with a silent clean exit(0) — no throw,
+// no stderr, nothing for the error path to log. Reproduced live on v0.5.6
+// (foreground, twice under launchd), and it is the mechanism behind fleet
+// daemons found dead right after logging "update_available" with launchd
+// showing `last exit code = 0` — which the legacy {SuccessfulExit:false}
+// plists then refused to respawn (the v0.5.x fleet-stuck incident). curl is
+// the same tool the install script uses for the same bytes, ships with every
+// macOS, and its exit codes are honest.
 //
 // Updates come from the daemon's OWN server, never GitHub: a single network
 // dependency (if /ingest is reachable, updates are reachable) and no gh CLI
@@ -15,7 +26,7 @@
 // from the binary and is written atomically, so after an update-driven
 // restart the daemon resumes from each file's stored byteOffset.
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -174,6 +185,17 @@ export interface UpdateOpts {
   execPath?: string;
   arch?: ManifestArch;
   /**
+   * Downloads `url` to `dest` within `timeoutMs`; resolves null on success,
+   * else a short reason. Default shells out to curl — see the header comment
+   * for why Bun's fetch is banned for this transfer.
+   */
+  downloadBinary?: (
+    url: string,
+    dest: string,
+    timeoutMs: number,
+    abortSignal?: AbortSignal,
+  ) => Promise<string | null>;
+  /**
    * Pre-swap smoke test of the downloaded binary. Returns null when the
    * binary executes cleanly, else a short reason. Default: run
    * `<tmp> --version` and require exit 0 — SHA proves the bytes are what CI
@@ -228,6 +250,67 @@ async function sha256OfFile(p: string): Promise<string> {
 
 function sha256OfBytes(buf: Uint8Array): string {
   return createHash("sha256").update(buf).digest("hex");
+}
+
+/**
+ * Download the release binary with a curl subprocess (see the header comment
+ * for why Bun's fetch is banned here). `--compressed` asks the server for
+ * its gzip representation (~24MB instead of ~63MB) and lets curl decode it,
+ * so the on-disk bytes match the manifest sha either way. curl's --max-time
+ * enforces the wall-clock budget over the WHOLE transfer; the outer timer is
+ * a backstop for a curl process that itself hangs. Resolves null on success,
+ * else a short reason (never rejects).
+ */
+function defaultDownloadBinary(
+  url: string,
+  dest: string,
+  timeoutMs: number,
+  abortSignal?: AbortSignal,
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        "curl",
+        [
+          "-fsSL",
+          "--compressed",
+          "--max-time",
+          String(Math.ceil(timeoutMs / 1000)),
+          "-o",
+          dest,
+          url,
+        ],
+        { stdio: ["ignore", "ignore", "pipe"] },
+      );
+    } catch (err: unknown) {
+      resolve(`spawn: ${String((err as Error)?.message ?? err)}`);
+      return;
+    }
+    let stderr = "";
+    child.stderr?.on("data", (d: Buffer) => {
+      if (stderr.length < 4096) stderr += d.toString();
+    });
+    const onAbort = () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    };
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    const timer = setTimeout(onAbort, timeoutMs + 10_000);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", onAbort);
+      resolve(`spawn: ${err.message}`);
+    });
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", onAbort);
+      if (signal) resolve(`killed by ${signal}`);
+      else if (code !== 0) resolve(`curl exit ${code}: ${stderr.trim().slice(0, 200)}`);
+      else resolve(null);
+    });
+  });
 }
 
 // `--version` needs no env/config and touches no state, so it is safe to run
@@ -398,43 +481,21 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   const binaryUrl =
     entry.url && entry.url.length > 0 ? entry.url : `${base}${BINARY_PATH_PREFIX}${arch}`;
 
-  // 3b. STREAM the new binary straight to a temp file via Bun.write rather
-  // than buffering with res.arrayBuffer(): the binary is large (~55MB) and
-  // arrayBuffer() aborts a slow response (~44s observed) that a streamed
-  // write rides out. Retry to absorb transient resets; whatever lands is
-  // sha-verified below before any swap, so a partial/corrupt file is never
-  // executed.
+  // 3b. Download via curl (never Bun's fetch — see header). Retry to absorb
+  // transient resets; whatever lands is sha-verified below before any swap,
+  // so a partial/corrupt file is never executed.
   const tmpPath = `${execPath}.new`;
+  const download = opts.downloadBinary ?? defaultDownloadBinary;
   const DOWNLOAD_ATTEMPTS = 3;
   let downloadOk = false;
   for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
     if (opts.abortSignal?.aborted) return { updated: false, reason: "disabled" };
-    try {
-      const res = await fetchWithTimeout(
-        fetchImpl,
-        binaryUrl,
-        { method: "GET" },
-        UPDATE_BINARY_TIMEOUT_MS,
-        opts.abortSignal,
-      );
-      if (!res.ok) {
-        log.warn("update_download_http", {
-          status: res.status,
-          url: binaryUrl,
-          attempt,
-        });
-        continue;
-      }
-      await Bun.write(tmpPath, res);
+    const dlErr = await download(binaryUrl, tmpPath, UPDATE_BINARY_TIMEOUT_MS, opts.abortSignal);
+    if (dlErr === null) {
       downloadOk = true;
       break;
-    } catch (err: unknown) {
-      log.warn("update_download_threw", {
-        url: binaryUrl,
-        attempt,
-        err: String((err as Error)?.message ?? err),
-      });
     }
+    log.warn("update_download_failed", { url: binaryUrl, attempt, err: dlErr });
   }
   if (!downloadOk) {
     try {
@@ -550,6 +611,7 @@ export const __internal = {
   sha256OfFile,
   pickArch,
   defaultRestart,
+  defaultDownloadBinary,
   defaultVerifyBinary,
   manifestPathLocal: (dir: string) => path.join(dir, "manifest.json"),
 };
