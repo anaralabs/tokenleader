@@ -1,8 +1,10 @@
 // Boot-time self-heal of the LaunchAgent plist.
 //
 // Older installs shipped KeepAlive as {Crashed:true, SuccessfulExit:false},
-// which strands the daemon on ANY clean exit (notably the post-update
-// process.exit(0)) until the next login — the v0.5.x fleet-stuck incident.
+// which strands the daemon on ANY clean exit until the next login — the
+// v0.5.x fleet-stuck incident (the post-update restart exited 0 back then;
+// it exits RESTART_EXIT_CODE now, but a SIGTERM-driven shutdown still ends
+// in a clean exit that a legacy plist would not respawn).
 // We now ship unconditional `KeepAlive: true`. Updates swap only the binary,
 // never the plist, so an already-installed daemon keeps its strand-prone
 // plist forever otherwise. This heals it in place: on boot, any daemon

@@ -106,7 +106,9 @@ describe("resolveConfig", () => {
       TOKENLEADER_BATCH_SIZE: "999999", // above ceiling
     } as NodeJS.ProcessEnv);
     expect(cfg.intervalSec).toBe(5);
-    expect(cfg.batchSize).toBe(10_000);
+    // Ceiling is the server's per-POST cap — anything larger draws a
+    // non-retriable 413 and wedges the daemon resending the same batch.
+    expect(cfg.batchSize).toBe(1000);
   });
 
   test("runOnce parses truthy values", () => {

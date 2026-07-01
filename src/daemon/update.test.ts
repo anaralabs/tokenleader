@@ -6,6 +6,7 @@ import { makeTmpDir as mkTmpDir } from "../test-helpers";
 import { endpointOverridePath, readEndpointOverride } from "./endpoint-override";
 import type { Logger } from "./log";
 import {
+  __internal,
   BINARY_PATH_PREFIX,
   checkForUpdate,
   emptyManifestCache,
@@ -118,6 +119,9 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "x64",
+      // The fixture "binary" is a text payload, not an executable — skip the
+      // real smoke run (it has its own tests below).
+      verifyBinary: () => null,
       restart: () => {
         restartCalls++;
       },
@@ -178,6 +182,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      verifyBinary: () => null,
       restart: () => {},
       fetchImpl: mkFetch(async (url) => {
         calledUrls.push(url);
@@ -554,6 +559,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64" as const,
+      verifyBinary: () => null,
       restart: () => {
         restarts++;
       },
@@ -824,5 +830,75 @@ describe("checkForUpdate", () => {
     for (const u of calledUrls) {
       expect(u.startsWith(ENDPOINT)).toBe(true);
     }
+  });
+});
+
+describe("binary verification", () => {
+  test("verify failure: refuses the swap, cleans temp, keeps old binary, no restart", async () => {
+    const dir = await makeTmpDir();
+    const execPath = path.join(dir, "anara-leaderboard");
+    const oldBytes = new TextEncoder().encode("old-binary");
+    await fsp.writeFile(execPath, oldBytes);
+
+    const newBytes = new TextEncoder().encode("broken-binary");
+    const manifest = manifestFor("arm64", sha(newBytes));
+    const binaryUrl = `${ENDPOINT}${BINARY_PATH_PREFIX}arm64`;
+
+    let restarted = false;
+    const { log, records } = makeLog();
+    const r = await checkForUpdate({
+      log,
+      endpoint: ENDPOINT,
+      execPath,
+      arch: "arm64",
+      verifyBinary: () => "exit 3",
+      restart: () => {
+        restarted = true;
+      },
+      fetchImpl: mkFetch((url) => {
+        if (url === MANIFEST_URL) {
+          return new Response(JSON.stringify(manifest), { status: 200 });
+        }
+        if (url === binaryUrl) {
+          return new Response(newBytes, { status: 200 });
+        }
+        return new Response("nope", { status: 404 });
+      }),
+    });
+
+    expect(r.updated).toBe(false);
+    expect(r.reason).toBe("verify_failed");
+    expect(restarted).toBe(false);
+    expect(records.some((x) => x.msg === "update_verify_failed" && x.level === "error")).toBe(true);
+
+    // The working binary is untouched and the rejected download is gone.
+    const onDisk = await fsp.readFile(execPath);
+    expect(sha(new Uint8Array(onDisk))).toBe(sha(oldBytes));
+    let tmpExists = true;
+    try {
+      await fsp.stat(`${execPath}.new`);
+    } catch {
+      tmpExists = false;
+    }
+    expect(tmpExists).toBe(false);
+  });
+
+  test("defaultVerifyBinary: accepts a binary that exits 0, rejects exit-nonzero and unexecutable", async () => {
+    const dir = await makeTmpDir();
+
+    const good = path.join(dir, "good");
+    await fsp.writeFile(good, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    expect(__internal.defaultVerifyBinary(good)).toBeNull();
+
+    const bad = path.join(dir, "bad");
+    await fsp.writeFile(bad, "#!/bin/sh\nexit 3\n", { mode: 0o755 });
+    expect(__internal.defaultVerifyBinary(bad)).toBe("exit 3");
+
+    // Not executable at all (plain text, no shebang, no +x).
+    const junk = path.join(dir, "junk");
+    await fsp.writeFile(junk, "not a binary", { mode: 0o644 });
+    expect(__internal.defaultVerifyBinary(junk)).not.toBeNull();
+
+    expect(__internal.defaultVerifyBinary(path.join(dir, "missing"))).not.toBeNull();
   });
 });

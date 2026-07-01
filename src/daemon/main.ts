@@ -75,8 +75,12 @@ export function resolveConfig(env: NodeJS.ProcessEnv): ResolvedConfig {
   const intervalRaw = env.TOKENLEADER_INTERVAL_SEC;
   const intervalSec = clampInt(parseIntOr(intervalRaw, 300), 5, 24 * 60 * 60);
 
+  // Ceiling matches the server's per-POST cap (MAX_EVENTS_PER_REQUEST =
+  // DEFAULT_BATCH_SIZE): an oversized batch draws a 413, which is
+  // non-retriable, so a larger env value would wedge the daemon in a
+  // permanent resend loop of the same too-big batch.
   const batchRaw = env.TOKENLEADER_BATCH_SIZE;
-  const batchSize = clampInt(parseIntOr(batchRaw, DEFAULT_BATCH_SIZE), 1, 10_000);
+  const batchSize = clampInt(parseIntOr(batchRaw, DEFAULT_BATCH_SIZE), 1, DEFAULT_BATCH_SIZE);
 
   const stateDir =
     env.TOKENLEADER_STATE_DIR && env.TOKENLEADER_STATE_DIR.length > 0
@@ -363,10 +367,10 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         stateDir: cfg.stateDir,
       });
       if (r.updated) {
-        // The updater is responsible for spawning launchctl + exiting; if
-        // we somehow get here it means a test stub was used. Log and
-        // continue — next iteration will pick up the new binary if the
-        // restart happens.
+        // The updater is responsible for exiting the process (launchd
+        // respawns the swapped binary); if we somehow get here it means a
+        // test stub was used. Log and continue — next iteration will pick
+        // up the new binary if the restart happens.
         log.info("update_post_swap", { reason: r.reason, newSha: r.newSha });
       }
     } catch (err: unknown) {
