@@ -2,8 +2,9 @@
 //
 // Flow: GET <endpoint>/manifest.json, compare the manifest sha256 for our
 // arch against the SHA-256 of the running binary; if different, download
-// /bin/anara-leaderboard-<arch>, sha-verify, atomically rename it over
-// `execPath`, then relaunch via `launchctl kickstart -k`.
+// /bin/anara-leaderboard-<arch>, sha-verify, smoke-run it, atomically rename
+// it over `execPath`, then exit non-zero so launchd's KeepAlive respawns the
+// new binary.
 //
 // Updates come from the daemon's OWN server, never GitHub: a single network
 // dependency (if /ingest is reachable, updates are reachable) and no gh CLI
@@ -14,7 +15,7 @@
 // from the binary and is written atomically, so after an update-driven
 // restart the daemon resumes from each file's stored byteOffset.
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
@@ -25,7 +26,14 @@ import {
 } from "./endpoint-override";
 import type { Logger } from "./log";
 
-export const LAUNCHD_LABEL = "sh.anara.leaderboard";
+// Exit code of the deliberate post-update restart. Non-zero on purpose:
+// launchd respawns a non-zero exit under BOTH plist generations — the current
+// unconditional `KeepAlive: true` respawns any exit, and the legacy
+// {Crashed, SuccessfulExit: false} dict (repaired on boot by plist-heal.ts)
+// ignores clean exits but respawns unsuccessful ones. 75 = EX_TEMPFAIL, so
+// `launchctl print`'s "last exit code" tells a deliberate restart apart from
+// a crash or a config error.
+export const RESTART_EXIT_CODE = 75;
 
 // Wall-clock fetch budgets. See transport.ts fetchWithTimeout for why a bare
 // AbortSignal is insufficient in Bun 1.1.38 (connect-phase hangs ignore it).
@@ -130,6 +138,7 @@ export type UpdateReason =
   | "sha_mismatch"
   | "download_failed"
   | "write_failed"
+  | "verify_failed"
   | "rename_failed"
   | "endpoint_override";
 
@@ -164,8 +173,17 @@ export interface UpdateOpts {
   fetchImpl?: typeof fetch;
   execPath?: string;
   arch?: ManifestArch;
+  /**
+   * Pre-swap smoke test of the downloaded binary. Returns null when the
+   * binary executes cleanly, else a short reason. Default: run
+   * `<tmp> --version` and require exit 0 — SHA proves the bytes are what CI
+   * published, this proves they boot. A binary that can't even print its
+   * version would crash-loop under launchd and never reach its own updater,
+   * bricking the machine until a manual reinstall.
+   */
+  verifyBinary?: (path: string) => string | null;
   // Triggered after a successful swap (or an accepted endpoint override).
-  // Default: launchctl kickstart + exit.
+  // Default: exit non-zero so launchd's KeepAlive respawns the new binary.
   restart?: () => void;
   // Hook the moment we successfully wrote the new binary (used in tests).
   onSwapped?: (info: { oldSha: string; newSha: string }) => void;
@@ -212,31 +230,35 @@ function sha256OfBytes(buf: Uint8Array): string {
   return createHash("sha256").update(buf).digest("hex");
 }
 
-function defaultRestart(log: Logger): void {
-  const uid = process.getuid?.() ?? 0;
-  const target = `gui/${uid}/${LAUNCHD_LABEL}`;
+// `--version` needs no env/config and touches no state, so it is safe to run
+// against a half-configured machine. 15s is generous — a healthy binary
+// answers in well under a second; the timeout only guards a hung exec.
+const VERIFY_TIMEOUT_MS = 15_000;
+
+function defaultVerifyBinary(p: string): string | null {
   try {
-    const child = spawn("launchctl", ["kickstart", "-k", target], {
-      detached: true,
-      stdio: "ignore",
+    const r = spawnSync(p, ["--version"], {
+      timeout: VERIFY_TIMEOUT_MS,
+      stdio: ["ignore", "ignore", "ignore"],
     });
-    child.unref();
-    log.info("update_restart_dispatched", { target });
+    if (r.error) return `spawn: ${r.error.message}`;
+    if (r.signal) return `killed by ${r.signal}`;
+    if (r.status !== 0) return `exit ${r.status}`;
+    return null;
   } catch (err: unknown) {
-    log.warn("update_restart_spawn_failed", {
-      err: String((err as Error)?.message ?? err),
-    });
+    return String((err as Error)?.message ?? err);
   }
-  // Give launchctl a moment to send SIGTERM, then exit. The plist now sets
-  // unconditional `KeepAlive: true`, so this clean exit(0) is by itself enough
-  // for launchd to respawn us — kickstart -k is just the faster path. The old
-  // {Crashed,SuccessfulExit:false} plist did NOT respawn on a clean exit, so a
-  // kickstart that raced the 30s ThrottleInterval left the daemon dead until
-  // the next login (the v0.5.x fleet-stuck incident; older plists are repaired
-  // on boot by plist-heal.ts).
-  setTimeout(() => {
-    process.exit(0);
-  }, 200).unref?.();
+}
+
+function defaultRestart(log: Logger): void {
+  // launchd IS the restart mechanism: exit non-zero and let KeepAlive respawn
+  // us as the already-swapped binary at execPath. No `launchctl kickstart -k`
+  // — dispatching an async kill of our own job and racing it against our own
+  // exit is exactly what made post-update restarts flaky enough to strand
+  // daemons (the v0.5.x fleet-stuck incident). The logger writes
+  // synchronously, so exiting right after the log line is safe.
+  log.info("update_restart_exit", { code: RESTART_EXIT_CODE });
+  process.exit(RESTART_EXIT_CODE);
 }
 
 /**
@@ -469,6 +491,23 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
     // Non-fatal; rename still proceeds.
   }
 
+  // 5b. Smoke-run the new binary before it replaces a working one. Refusing
+  // the swap keeps this daemon alive on the old version (loud in logs, and
+  // retried every update cycle — a re-published fixed binary swaps normally).
+  const verify = opts.verifyBinary ?? defaultVerifyBinary;
+  const verifyErr = verify(tmpPath);
+  if (verifyErr !== null) {
+    log.error("update_verify_failed", {
+      tmpPath,
+      version: manifest.version,
+      err: verifyErr,
+    });
+    try {
+      await fsp.unlink(tmpPath);
+    } catch {}
+    return { updated: false, reason: "verify_failed" };
+  }
+
   try {
     await fsp.rename(tmpPath, execPath);
   } catch (err: unknown) {
@@ -492,8 +531,8 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   });
   opts.onSwapped?.({ oldSha: currentSha, newSha: dlSha });
 
-  // 6. Restart. Default path calls launchctl + process.exit(0); tests
-  // override this so they don't kill the test runner.
+  // 6. Restart. Default path exits non-zero so launchd respawns the swapped
+  // binary; tests override this so they don't kill the test runner.
   const restart = opts.restart ?? (() => defaultRestart(log));
   restart();
 
@@ -511,5 +550,6 @@ export const __internal = {
   sha256OfFile,
   pickArch,
   defaultRestart,
+  defaultVerifyBinary,
   manifestPathLocal: (dir: string) => path.join(dir, "manifest.json"),
 };
