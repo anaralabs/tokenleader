@@ -87,7 +87,7 @@ export async function parseCursorTranscriptFile(
   }
 
   const sessionId = sessionIdFromPath(path);
-  const timestamp = fileMtimeMs > 0 ? fileMtimeMs : Date.now();
+  const timestamp = Math.round(fileMtimeMs > 0 ? fileMtimeMs : Date.now());
 
   const events: TokenEvent[] = [];
   const seenDedupKeys: string[] = [];
