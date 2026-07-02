@@ -80,6 +80,24 @@ own reported cost, which wins over derived pricing.
 | `TOKENLEADER_CURSOR_USER_MAP_FILE` | unset | Path to a file containing the same JSON. When set, the file **wins entirely** over the inline value (no merge). An unreadable file is a fatal config error. |
 | `TOKENLEADER_COMPANY_ALIASES` | unset | Inline JSON of `"from-domain": "to-domain"` rewrites applied to the `X-Tokenleader-Company` header at ingest — fixes a typo'd self-reported affiliation without touching the teammate's machine. Both sides are normalized; non-domain entries are dropped with a warning. |
 
+### Backups (Litestream)
+
+Optional, **off by default**. The Docker image bakes in
+[Litestream](https://litestream.io); when configured, the entrypoint restores
+a missing database from the replica on boot (lost-volume disaster recovery)
+and runs the server under `litestream replicate -exec`, streaming every write
+to S3-compatible storage.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LITESTREAM_REPLICA_URL` | unset = backups off | Replica URL, e.g. `s3://my-bucket/tokenleader`. For R2/B2/minio append `?endpoint=https://…` (R2 example: `s3://bucket/tokenleader?endpoint=https://<account>.r2.cloudflarestorage.com`). |
+| `LITESTREAM_ACCESS_KEY_ID` | unset | Access key for the bucket. |
+| `LITESTREAM_SECRET_ACCESS_KEY` | unset | Secret key for the bucket. |
+
+If the DB file is missing and the replica can't be reached, boot fails on
+purpose — starting fresh next to a populated replica would bury the good
+backup under a new generation; let the supervisor retry instead.
+
 ### Per-platform cheat sheet
 
 | Where | How to set |
