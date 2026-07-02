@@ -97,6 +97,30 @@ CREATE TABLE IF NOT EXISTS server_meta (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- Single-shot remote directives for ALIVE daemons (the zero-touch recovery
+-- channel — no MDM, no SSH). An operator enqueues a verb via
+-- /admin/directives; the next /checkin or /ingest response for that user
+-- carries it (delivered_at stamped atomically, so exactly one daemon ever
+-- receives it) and the daemon executes an allowlisted action client-side.
+CREATE TABLE IF NOT EXISTS pending_directives (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  username     TEXT NOT NULL,
+  verb         TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  delivered_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS pending_directives_user
+  ON pending_directives (username, delivered_at);
+
+-- Latest diagnostic log tail per user (payload of the upload_logs
+-- directive). One row per user — a new upload replaces the old, and the
+-- route caps the size, so the table never grows past users × cap.
+CREATE TABLE IF NOT EXISTS diag_logs (
+  username    TEXT PRIMARY KEY,
+  uploaded_at INTEGER NOT NULL,
+  content     TEXT NOT NULL
+);
 `;
 
 /**
@@ -384,6 +408,33 @@ export interface UserDeviceRow {
   barred: number;
 }
 
+interface DirectiveRow {
+  id: number;
+  verb: string;
+}
+
+export interface DirectiveListRow {
+  id: number;
+  verb: string;
+  created_at: number;
+  delivered_at: number | null;
+}
+
+interface DiagLogRow {
+  uploaded_at: number;
+  content: string;
+}
+
+// A directive older than this is stale — the machine it targeted was
+// offline the whole window, so silently running it days later would be a
+// surprise, not a recovery. Undelivered + expired rows are simply skipped.
+const DIRECTIVE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Daemon actions an operator may enqueue. Enforced at the /admin route AND
+ *  re-checked by the daemon's own allowlist before executing. */
+export const DIRECTIVE_VERBS = ["restart", "upload_logs"] as const;
+export type DirectiveVerb = (typeof DIRECTIVE_VERBS)[number];
+
 /** Camel-cased device row for API surfaces; never carries the hash. */
 export interface DeviceInfo {
   id: number;
@@ -495,6 +546,11 @@ export class Store {
   private readonly revokeAllDevicesStmt: Statement;
   private readonly deviceCheckInStmt: Statement;
   private readonly setDeviceLabelStmt: Statement;
+  private readonly enqueueDirectiveStmt: Statement;
+  private readonly takeDirectiveStmt: Statement<DirectiveRow, [Record<string, string | number>]>;
+  private readonly listDirectivesStmt: Statement<DirectiveListRow, [string, number]>;
+  private readonly saveDiagLogStmt: Statement;
+  private readonly getDiagLogStmt: Statement<DiagLogRow, [string]>;
   private readonly setUserCompanyStmt: Statement;
   private readonly getUserCompanyStmt: Statement<{ company: string | null }, [string]>;
   private readonly userMessageCountsAllStmt: Statement<UserMessageCountsRow, [number, number]>;
@@ -886,6 +942,40 @@ export class Store {
     );
     this.setDeviceLabelStmt = this.db.prepare(
       "UPDATE user_devices SET label = $label WHERE id = $id AND label IS NULL",
+    );
+    this.enqueueDirectiveStmt = this.db.prepare(
+      `INSERT INTO pending_directives (username, verb, created_at)
+       VALUES ($username, $verb, $created_at)`,
+    );
+    // Single-statement claim: the subquery + UPDATE…RETURNING is atomic in
+    // SQLite, so with several devices posting under one handle exactly one
+    // of them receives each directive.
+    this.takeDirectiveStmt = this.db.prepare(
+      `UPDATE pending_directives
+          SET delivered_at = $now
+        WHERE id = (SELECT id FROM pending_directives
+                     WHERE username = $username
+                       AND delivered_at IS NULL
+                       AND created_at > $cutoff
+                     ORDER BY id
+                     LIMIT 1)
+        RETURNING id, verb`,
+    );
+    this.listDirectivesStmt = this.db.prepare(
+      `SELECT id, verb, created_at, delivered_at
+         FROM pending_directives
+        WHERE username = ?
+        ORDER BY id DESC
+        LIMIT ?`,
+    );
+    this.saveDiagLogStmt = this.db.prepare(
+      `INSERT INTO diag_logs (username, uploaded_at, content)
+       VALUES ($username, $uploaded_at, $content)
+       ON CONFLICT (username) DO UPDATE
+         SET uploaded_at = excluded.uploaded_at, content = excluded.content`,
+    );
+    this.getDiagLogStmt = this.db.prepare(
+      "SELECT uploaded_at, content FROM diag_logs WHERE username = ?",
     );
     // UPDATE (not upsert): /ingest only calls this after a successful
     // claim/auth, so the user_secrets row always exists.
@@ -1689,6 +1779,42 @@ export class Store {
     const self = this.listUserDevicesStmt.all(user).find((d) => d.id === deviceId);
     if (!self || self.label !== null) return;
     this.setDeviceLabelStmt.run({ $id: deviceId, $label: this.dedupedLabel(user, label) });
+  }
+
+  /** Queue a directive for the user's next check-in. Returns its id. */
+  enqueueDirective(username: string, verb: DirectiveVerb, now: number): number {
+    this.enqueueDirectiveStmt.run({ $username: username, $verb: verb, $created_at: now });
+    return Number(
+      this.db.prepare<{ id: number }, []>("SELECT last_insert_rowid() AS id").get()?.id ?? 0,
+    );
+  }
+
+  /**
+   * Claim the oldest undelivered, unexpired directive for a user (stamping
+   * delivered_at) — or null. Called from /checkin and /ingest responses.
+   */
+  takeDirective(username: string, now: number): { id: number; verb: string } | null {
+    const row = this.takeDirectiveStmt.get({
+      $username: username,
+      $now: now,
+      $cutoff: now - DIRECTIVE_TTL_MS,
+    });
+    return row ? { id: row.id, verb: row.verb } : null;
+  }
+
+  /** Recent directives for a user, newest first (admin visibility). */
+  listDirectives(username: string, limit = 20): DirectiveListRow[] {
+    return this.listDirectivesStmt.all(username, limit);
+  }
+
+  /** Store (replace) a user's uploaded log tail. Caller caps the size. */
+  saveDiagLog(username: string, content: string, now: number): void {
+    this.saveDiagLogStmt.run({ $username: username, $uploaded_at: now, $content: content });
+  }
+
+  getDiagLog(username: string): { uploadedAt: number; content: string } | null {
+    const row = this.getDiagLogStmt.get(username);
+    return row ? { uploadedAt: row.uploaded_at, content: row.content } : null;
   }
 
   listClaimedUsers(): Array<{ user: string; claimedAt: number }> {

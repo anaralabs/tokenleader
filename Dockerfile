@@ -37,6 +37,16 @@ WORKDIR /app
 # image vintage shipping it).
 RUN apt-get update && apt-get install -y --no-install-recommends sqlite3 util-linux \
     && rm -rf /var/lib/apt/lists/*
+
+# Litestream: optional continuous SQLite replication to S3-compatible storage.
+# Baked into every image; ACTIVE only when LITESTREAM_REPLICA_URL is set (see
+# docker-entrypoint.sh) — an unconfigured deploy pays ~10MB of image, nothing else.
+ARG LITESTREAM_VERSION=0.3.13
+ARG TARGETARCH
+ADD https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/litestream-v${LITESTREAM_VERSION}-linux-${TARGETARCH}.tar.gz /tmp/litestream.tar.gz
+RUN tar -xzf /tmp/litestream.tar.gz -C /usr/local/bin litestream \
+    && rm /tmp/litestream.tar.gz \
+    && litestream version
 COPY --from=deps /app/node_modules ./node_modules
 COPY package.json tsconfig.json ./
 COPY src ./src

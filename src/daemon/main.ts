@@ -1,15 +1,17 @@
 import { promises as fsp } from "node:fs";
 import { homedir, hostname } from "node:os";
 import path from "node:path";
+import type { DaemonDirective } from "../types";
 import { BUILD_SHA, BUILD_VERSION } from "./build-info";
 import { CLI_COMMANDS, type CliCommand, runCliCommand } from "./cli";
+import { executeDirective } from "./directives";
 import { normalizeEndpoint, readEndpointOverride } from "./endpoint-override";
 import { log, LOG_FILE } from "./log";
 import { healInstalledPlist } from "./plist-heal";
 import { loadOrCreateSecret } from "./secret";
 import { applyRescanGeneration, ensureStateDir, loadState, saveState } from "./state";
 import { tick } from "./tick";
-import { DEFAULT_BATCH_SIZE, type TransportOpts } from "./transport";
+import { DEFAULT_BATCH_SIZE, postCheckin, type TransportOpts } from "./transport";
 import { checkForUpdate, pickArch } from "./update";
 
 export interface ResolvedConfig {
@@ -254,6 +256,9 @@ export interface RunDeps {
   // Inject the auto-updater for tests so we never hit the network or
   // accidentally process.exit mid-suite.
   checkForUpdateImpl?: typeof checkForUpdate;
+  // Heartbeat + directive seams (same reason).
+  postCheckinImpl?: typeof postCheckin;
+  executeDirectiveImpl?: typeof executeDirective;
   // Source of "now" for the update scheduler. Defaults to Date.now.
   nowImpl?: () => number;
   // First-update delay in ms; default 30_000 (production). Tests use 0.
@@ -268,6 +273,8 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
   const saveFn = deps.saveStateImpl ?? saveState;
   const loadSecretFn = deps.loadSecretImpl ?? loadOrCreateSecret;
   const updateFn = deps.checkForUpdateImpl ?? checkForUpdate;
+  const checkinFn = deps.postCheckinImpl ?? postCheckin;
+  const directiveFn = deps.executeDirectiveImpl ?? executeDirective;
   const now = deps.nowImpl ?? Date.now;
   const initialUpdateDelayMs = deps.initialUpdateDelayMs ?? 30_000;
   const rnd = deps.random ?? Math.random;
@@ -386,6 +393,8 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
   while (!ac.signal.aborted) {
     const start = Date.now();
     tickInProgress = true;
+    let directive: DaemonDirective | undefined;
+    let tickedQuietly = false;
     try {
       const out = await tickFn(state, {
         user: cfg.user,
@@ -396,6 +405,8 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         saveState: saveFn,
       });
       state = out.state;
+      directive = out.result.directive;
+      tickedQuietly = out.result.posted && out.result.eventsPosted === 0;
       log.info("tick_done", {
         scanned: out.result.scannedFiles,
         eligible: out.result.eligibleFiles,
@@ -419,8 +430,28 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
       return;
     }
 
+    // Heartbeat: a tick with no events makes no HTTP request at all, so an
+    // idle-but-alive daemon would look identical to a dead one (the
+    // observability gap behind the v0.5.x "stale fleet" misdiagnosis).
+    // Check in instead — stamps last_seen/version and picks up directives.
+    if (tickedQuietly && !ac.signal.aborted) {
+      const ci = await checkinFn(cfg.user, transport, ac.signal);
+      directive ??= ci.directive;
+    }
+
     // Runs between the tick and the sleep so it never overlaps a tick.
     await maybeCheckForUpdate();
+
+    // A directive runs LAST: if the update path already swapped + exited,
+    // the process is gone and the directive (usually "restart") is moot.
+    if (directive && !ac.signal.aborted) {
+      await directiveFn(directive, {
+        log,
+        endpoint: cfg.endpoint,
+        secret,
+        user: cfg.user,
+      });
+    }
 
     // Anti-spin guard: if an iteration ran >= one full interval (slow/hung
     // POST, big historical replay, wall clock jumping on wake), do NOT

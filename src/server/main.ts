@@ -13,7 +13,7 @@ import { normalizeCompany } from "./company.ts";
 import { BinaryMirror, normalizeArch } from "./binary-mirror.ts";
 import { ConfigError, echoConfig, parseServerConfig, type ServerConfig } from "./config.ts";
 import { CursorMirror } from "./cursor-mirror.ts";
-import { type Bucket, type DeviceInfo, Store } from "./db.ts";
+import { type Bucket, type DeviceInfo, DIRECTIVE_VERBS, type DirectiveVerb, Store } from "./db.ts";
 import { renderInstallScript, renderUninstallScript } from "./install-script.ts";
 import { PricingCache, computeRowCostUsd, roundUsd } from "./pricing.ts";
 import { parseStatsRange } from "./range.ts";
@@ -25,6 +25,9 @@ import pkg from "../../package.json";
 export const SERVER_VERSION: string = process.env.TOKENLEADER_SERVER_VERSION?.trim() || pkg.version;
 
 const MAX_EVENTS_PER_REQUEST = 1000;
+// Cap on a /diag/logs upload (the daemon sends a 64KB tail; headroom for
+// multi-byte truncation and future growth without letting anyone bloat the DB).
+const DIAG_LOG_MAX_BYTES = 256 * 1024;
 // Ceiling on a single event's self-reported cost ($100). costUsdMicros is
 // authenticated but client-supplied; without a cap a daemon could inflate
 // leaderboard cost arbitrarily. No realistic single Cursor request approaches
@@ -1420,9 +1423,66 @@ export function buildApp(opts: BuildOptions) {
 
     const result = store.insertMany(validated);
     if (result.inserted > 0) invalidateStatsCache();
+    // Piggyback a pending directive on the response — a busy daemon posts
+    // events every tick and may never hit /checkin. Old daemons ignore the
+    // extra field.
+    const directive = store.takeDirective(firstUser, Date.now());
     // Only surface `skipped` when some row was dropped — an all-valid batch
     // keeps the exact {inserted, duplicates} shape older daemons expect.
-    return c.json(rejected.length > 0 ? { ...result, skipped: rejected.length } : result);
+    const payload: Record<string, unknown> =
+      rejected.length > 0 ? { ...result, skipped: rejected.length } : { ...result };
+    if (directive) payload.directive = directive;
+    return c.json(payload);
+  });
+
+  // Heartbeat for daemons with nothing to post: stamps the device's
+  // last_seen/version (so an idle-but-alive daemon is distinguishable from
+  // a dead one) and delivers any pending directive. Auth is EXISTING
+  // devices only — no claim, no re-claim, no link redemption; identity
+  // changes stay exclusively on /ingest.
+  app.post("/checkin", (c) => {
+    const user = (c.req.header("x-tokenleader-user") ?? "").trim();
+    if (!/^[a-z0-9._-]{1,64}$/.test(user)) {
+      return c.json({ error: "invalid or missing X-Tokenleader-User" }, 400);
+    }
+    const auth = authDevice(c, user);
+    if (!auth) {
+      return c.json({ error: "unknown user or secret mismatch" }, 403);
+    }
+    try {
+      const dVer = (c.req.header("x-tokenleader-version") ?? "").trim();
+      const dArch = (c.req.header("x-tokenleader-arch") ?? "").trim();
+      store.recordDeviceCheckIn(
+        user,
+        auth.deviceId,
+        dVer.length > 0 && dVer.toLowerCase() !== "dev" ? dVer.slice(0, 64) : null,
+        dArch.length > 0 ? dArch.slice(0, 16) : null,
+        deviceLabelFrom(c.req.header("x-tokenleader-device")),
+        Date.now(),
+      );
+    } catch {
+      // fleet tracking is non-critical; the heartbeat itself still counts
+    }
+    const directive = store.takeDirective(user, Date.now());
+    return c.json(directive ? { ok: true, directive } : { ok: true });
+  });
+
+  // Log-tail upload (the upload_logs directive's payload). Same auth as
+  // /checkin. Body is plain text, capped server-side so a misbehaving
+  // client can't bloat the DB; one row per user (newest replaces).
+  app.post("/diag/logs", async (c) => {
+    const user = (c.req.header("x-tokenleader-user") ?? "").trim();
+    if (!/^[a-z0-9._-]{1,64}$/.test(user)) {
+      return c.json({ error: "invalid or missing X-Tokenleader-User" }, 400);
+    }
+    const auth = authDevice(c, user);
+    if (!auth) {
+      return c.json({ error: "unknown user or secret mismatch" }, 403);
+    }
+    const body = (await c.req.text()).slice(0, DIAG_LOG_MAX_BYTES);
+    if (body.length === 0) return c.json({ error: "empty body" }, 400);
+    store.saveDiagLog(user, body, Date.now());
+    return c.json({ ok: true, bytes: body.length });
   });
 
   // Called by the uninstall script BEFORE it removes local state (the
@@ -1573,6 +1633,47 @@ export function buildApp(opts: BuildOptions) {
       return c.json({ error: `unknown user '${user}' — a first install needs no link code` }, 404);
     }
     return linkCodeResponse(c, user);
+  });
+
+  // --- directives: zero-touch remote actions for alive daemons -------------
+  // Enqueue. Body { user, verb }. The user's next /checkin or /ingest
+  // response carries it exactly once; the daemon executes from its own
+  // allowlist. Undelivered directives expire after 24h.
+  app.post("/admin/directives", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const parsed = await parseUserBody(c);
+    if (!parsed.ok) return parsed.res;
+    const user = parsed.body.user as string;
+    const verb = parsed.body.verb;
+    if (typeof verb !== "string" || !(DIRECTIVE_VERBS as readonly string[]).includes(verb)) {
+      return c.json({ error: `verb must be one of: ${DIRECTIVE_VERBS.join(", ")}` }, 400);
+    }
+    if (store.getUserSecretRow(user) === null) {
+      return c.json({ error: `unknown user '${user}'` }, 404);
+    }
+    const id = store.enqueueDirective(user, verb as DirectiveVerb, Date.now());
+    return c.json({ id, user, verb });
+  });
+
+  // Recent directives for a user (delivered_at null = still pending).
+  app.get("/admin/directives", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const user = (c.req.query("user") ?? "").trim();
+    if (user.length === 0) return c.json({ error: "user query param required" }, 400);
+    return c.json({ directives: store.listDirectives(user) });
+  });
+
+  // Read a user's uploaded log tail (the upload_logs directive's result).
+  app.get("/admin/diag/logs", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const user = (c.req.query("user") ?? "").trim();
+    if (user.length === 0) return c.json({ error: "user query param required" }, 400);
+    const row = store.getDiagLog(user);
+    if (!row) return c.json({ error: `no log upload from '${user}'` }, 404);
+    return c.json({ user, uploadedAt: row.uploadedAt, content: row.content });
   });
 
   // --- categories: admin-defined groups + per-user assignment --------------

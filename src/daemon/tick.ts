@@ -1,5 +1,5 @@
 import { promises as fsp } from "node:fs";
-import type { DaemonState, FileState, TokenEvent } from "../types";
+import type { DaemonDirective, DaemonState, FileState, TokenEvent } from "../types";
 import {
   CURSOR_SYNC_BACKFILL_MAX_PAGES,
   type CursorSyncMode,
@@ -60,6 +60,9 @@ export interface TickResult {
   posted: boolean;
   // Files newly observed this tick.
   newFiles: number;
+  // Remote action piggybacked on the ingest response; the daemon loop
+  // executes it after the tick.
+  directive?: DaemonDirective;
 }
 
 async function defaultStat(path: string): Promise<{ mtimeMs: number } | null> {
@@ -391,6 +394,7 @@ export async function tick(
   let posted = false;
   let inserted = 0;
   let duplicates = 0;
+  let directive: DaemonDirective | undefined;
 
   if (collected.length === 0) {
     posted = true;
@@ -399,6 +403,7 @@ export async function tick(
     posted = r.ok;
     inserted = r.inserted;
     duplicates = r.duplicates;
+    directive = r.directive;
     if (!r.ok) {
       log.error("tick_post_failed", { err: r.error, events: collected.length });
     }
@@ -456,6 +461,7 @@ export async function tick(
       duplicates,
       posted,
       newFiles,
+      ...(directive ? { directive } : {}),
     },
   };
 }

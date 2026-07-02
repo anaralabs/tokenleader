@@ -9,6 +9,142 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [0.5.9] - 2026-07-02
+
+The stability release: observable, remotely recoverable, and unlosable.
+
+### Added
+- **Heartbeat check-ins.** A tick with no events now POSTs `/checkin` (headers
+  only), stamping the device's `last_seen`/version — an idle-but-alive daemon
+  is finally distinguishable from a dead one, the observability gap behind the
+  v0.5.x "stale fleet" misdiagnosis. Auth is existing devices only; identity
+  claims stay exclusively on `/ingest`. Old servers 404 it harmlessly.
+- **Directive channel (zero-touch remote recovery).** An operator enqueues a
+  verb via `POST /admin/directives`; the user's next `/checkin` or `/ingest`
+  response delivers it exactly once and the daemon executes from its own
+  allowlist: `restart` (exit 75 → launchd respawns fresh) and `upload_logs`
+  (POST the `daemon.jsonl` tail to `/diag/logs`, readable via
+  `/admin/diag/logs`). Unknown verbs are logged and dropped.
+- **Litestream replication (opt-in).** Set `LITESTREAM_REPLICA_URL` (+
+  standard Litestream credential env vars) and the container restores a
+  missing DB from the replica on boot and runs the server under
+  `litestream replicate -exec`. Unset = no behavior change.
+- **Release guard (f).** CI now executes the actual arm64 release artifact
+  through a complete self-update cycle (manifest → curl download → sha verify
+  → smoke test → swap → exit 75) against a local server — compiled-runtime
+  landmines can no longer ship through a green unit-test suite.
+
+### Changed
+- The installer requires an explicit handle (`--name=` or `TOKENLEADER_USER`)
+  and aborts with the exact command otherwise. The `$USER` fallback silently
+  registered junk identities whenever the classic `VAR=… curl … | bash`
+  misfire dropped the env var on `curl`; the installer's own hint used to
+  teach that broken form.
+
+## [0.5.8] - 2026-07-02
+
+### Fixed
+- **The fleet-stuck root cause.** The compiled daemon's Bun `fetch` of the
+  release binary could kill the whole process with a silent, clean `exit(0)`
+  — reproduced against production and against a local plain-HTTP identity
+  proxy (ruling out gzip/TLS/HTTP2/the server). Under the legacy launchd
+  plists that clean exit *was* the stranding event. Binary downloads now
+  shell out to `curl` (same tool the installer uses), keep the gzip
+  transfer, sha-verify as before, and enforce the 600s budget across the
+  whole transfer (the fetch path left body streaming unbounded).
+
+## [0.5.7] - 2026-07-01
+
+### Changed
+- **Restart from first principles.** The post-update restart no longer shells
+  out to `launchctl kickstart -k` and no longer exits 0 — it exits **75**
+  (EX_TEMPFAIL) and lets `KeepAlive` respawn the swapped binary. A non-zero
+  exit respawns under both plist generations, closing the race that could
+  strand a daemon mid-update while the old plist was still in effect.
+
+### Added
+- Pre-swap smoke test: the updater runs the downloaded binary with
+  `--version` and refuses the swap unless it exits 0 — a boot-crashing
+  published binary can no longer brick the fleet beyond the reach of its own
+  updater.
+
+### Fixed
+- `TOKENLEADER_BATCH_SIZE` is clamped to the server's 1,000-events-per-POST
+  cap; larger values drew a non-retriable 413 and wedged the daemon
+  resending the same batch forever.
+
+## [0.5.6] - 2026-07-01
+
+### Fixed
+- `cursor_local` events could carry fractional millisecond timestamps (file
+  mtime / composer time), which the server's integer validation rejected —
+  an all-invalid batch 400s and froze the flush. Both paths now
+  `Math.round(…)`. Contributed by @wing-anara (#16).
+
+## [0.5.5] - 2026-07-01
+
+### Fixed
+- **Daemon liveness (the fleet-stuck incident).** The LaunchAgent plist
+  shipped `KeepAlive={Crashed:true, SuccessfulExit:false}`, which never
+  respawns a clean exit — any `exit(0)` stranded the daemon until the next
+  login. Both plist templates now use unconditional `KeepAlive: true`, and a
+  boot-time self-heal (`plist-heal.ts`) rewrites a drifted stanza on
+  already-installed machines so the fix arrives via a normal binary update.
+- Binary-download timeout raised 120s → 600s (#15); the server serves
+  `/bin` gzip-compressed (~24MB instead of ~63MB) to clients that accept it
+  (#14).
+
+### Changed
+- The fleet panel reports **health** (active / idle / no daemon, by posting
+  recency) instead of version compliance; being behind `latestVersion` is an
+  informational "update pending" note, never a red state.
+
+## [0.5.4] - 2026-06-19
+
+### Fixed
+- Sticky-header corner clip: `.card-scroll { overflow: clip }` clips children
+  to the card's rounded corners **without** becoming a scroll container, so
+  the sticky header keeps pinning to the page.
+
+## [0.5.3] - 2026-06-19
+
+### Fixed
+- Sticky table headers actually pin now: `overflow-x: auto` made
+  `.card-scroll` a scroll container, so `position: sticky` pinned inside it
+  (invisibly) instead of to the page. Horizontal scroll is scoped to the
+  ≤720px breakpoint where sticky is inert anyway.
+
+## [0.5.2] - 2026-06-19
+
+### Added
+- Sticky table headers on the leaderboard, models, and fleet tables.
+  Contributed by @alexapvl (#10).
+
+## [0.5.1] - 2026-06-18
+
+### Fixed
+- The daemon is code-signed as `tokenleader` instead of inheriting Bun's own
+  Developer ID — macOS background-activity notifications no longer attribute
+  the LaunchAgent to "Jarred Sumner". Daemon compile pin bumped to Bun
+  1.3.14 (1.1.x output could not be re-signed at all).
+
+## [0.5.0] - 2026-06-17
+
+### Fixed
+- **Per-row tolerant `/ingest`.** One malformed event used to 400 the whole
+  1000-event batch, freezing the daemon in a permanent retry loop; the
+  server now inserts the valid rows and reports `skipped`. Parser fallbacks
+  for empty `sessionId` (session UUID from the filename) and empty assistant
+  `model` ("unknown") remove the known trigger.
+- `/install` works on Macs without python3: the sed fallback now parses the
+  pretty-printed manifest.
+- Cursor cloud cost/token fields are clamped server-side (no negatives,
+  fractions, or absurd ceilings) on both the ingest and mirror paths.
+
+### Added
+- Admin-defined **categories** (Engineering, Growth, …): CRUD + per-user
+  assignment endpoints, leaderboard chips, and a `?category=` filter.
+
 ## [0.4.0] - 2026-06-17
 
 Claude Cowork usage now counts on the leaderboard.

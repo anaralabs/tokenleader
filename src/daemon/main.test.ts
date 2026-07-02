@@ -1204,6 +1204,103 @@ describe("runDaemon", () => {
     expect(ticks).toBeGreaterThanOrEqual(3);
   });
 
+  test("quiet ticks heartbeat via /checkin; a delivered directive executes", async () => {
+    const dir = await makeTmpDir();
+    const ac = new AbortController();
+    let ticks = 0;
+    const checkins: string[] = [];
+    const executed: string[] = [];
+    await runDaemon(
+      {
+        user: "krish",
+        endpoint: "https://example.com",
+        intervalSec: 1,
+        stateDir: dir,
+        batchSize: 500,
+        runOnce: false,
+        updateIntervalSec: 60 * 60,
+        updateDisabled: true,
+      },
+      {
+        signal: ac.signal,
+        tickImpl: async (state) => {
+          ticks++;
+          // Tick 1 posts events (ingest is the liveness signal — no
+          // heartbeat); tick 2 is quiet (heartbeat fires).
+          const events = ticks === 1 ? 5 : 0;
+          return {
+            state,
+            result: {
+              scannedFiles: 0,
+              eligibleFiles: 0,
+              eventsPosted: events,
+              inserted: events,
+              duplicates: 0,
+              posted: true,
+              newFiles: 0,
+            },
+          };
+        },
+        postCheckinImpl: async (user) => {
+          checkins.push(user);
+          return { ok: true, directive: { id: 9, verb: "upload_logs" } };
+        },
+        executeDirectiveImpl: async (d) => {
+          executed.push(d.verb);
+          ac.abort();
+        },
+      },
+    );
+    expect(ticks).toBe(2);
+    expect(checkins).toEqual(["krish"]);
+    expect(executed).toEqual(["upload_logs"]);
+  });
+
+  test("a directive on the tick's ingest response executes without a heartbeat", async () => {
+    const dir = await makeTmpDir();
+    const ac = new AbortController();
+    const executed: number[] = [];
+    let checkinCalls = 0;
+    await runDaemon(
+      {
+        user: "krish",
+        endpoint: "https://example.com",
+        intervalSec: 1,
+        stateDir: dir,
+        batchSize: 500,
+        runOnce: false,
+        updateIntervalSec: 60 * 60,
+        updateDisabled: true,
+      },
+      {
+        signal: ac.signal,
+        tickImpl: async (state) => ({
+          state,
+          result: {
+            scannedFiles: 0,
+            eligibleFiles: 0,
+            eventsPosted: 3,
+            inserted: 3,
+            duplicates: 0,
+            posted: true,
+            newFiles: 0,
+            directive: { id: 4, verb: "restart" },
+          },
+        }),
+        postCheckinImpl: async () => {
+          checkinCalls++;
+          return { ok: true };
+        },
+        executeDirectiveImpl: async (d) => {
+          executed.push(d.id);
+          ac.abort();
+        },
+      },
+    );
+    expect(executed).toEqual([4]);
+    expect(checkinCalls).toBe(0);
+  });
+
   test("boot applies the one-time rescan (offsets reset, generation stamped, saved BEFORE the first tick)", async () => {
     const dir = await makeTmpDir();
     // A pre-backfill state: real offsets, no rescanGeneration.
