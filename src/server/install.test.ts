@@ -129,12 +129,37 @@ describe("renderInstallScript", () => {
     expect(r.status).toBe(0);
   });
 
+  test("no handle → aborts with the flag-form command; never guesses from $USER", () => {
+    // The handle is the leaderboard identity. `VAR=… curl … | bash` drops
+    // the env var on curl (it never crosses the pipe), which used to fall
+    // back to $USER and register junk handles like a full unix username.
+    const body = renderInstallScript(SERVER_URL);
+    expect(body).toContain("must be explicit");
+    expect(body).toContain("--name=your-handle");
+    // The old fallback is gone from the script entirely.
+    expect(body).not.toContain("${USER:-");
+
+    // Execute the abort path for real where the platform check allows it
+    // (the script exits earlier on non-macOS runners).
+    if (process.platform === "darwin") {
+      const tmpScript = join(tmpDir, "no-name-install.sh");
+      writeFileSync(tmpScript, body);
+      const env = { ...process.env };
+      delete env.TOKENLEADER_USER;
+      const r = spawnSync("bash", [tmpScript], { encoding: "utf8", env });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toContain("--name=your-handle");
+      expect(r.stderr).toContain("must be explicit");
+    }
+  });
+
   test("has the polished UX bits the team expects", () => {
     const body = renderInstallScript(SERVER_URL);
     expect(body).toContain("tokenleader installer");
     // Numbered step prefix; steps start at [2/N] (there is no name step).
     expect(body).toContain("[2/");
-    // No interactive prompts -- handle is resolved from --name/env/$USER.
+    // No interactive prompts -- handle comes from --name/env, or the
+    // installer aborts (a $USER-derived handle registered junk identities).
     expect(body).not.toContain('read -r -p "  > "');
     expect(body).toContain("--name=");
     expect(body).toContain("resolve_handle");
