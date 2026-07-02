@@ -37,6 +37,20 @@ export interface IngestRequest {
 export interface IngestResponse {
   inserted: number;
   duplicates: number;
+  /** Rows the server skipped as invalid (per-row-tolerant ingest). */
+  skipped?: number;
+  /** Single-shot remote action for this daemon (zero-touch recovery). */
+  directive?: DaemonDirective;
+}
+
+/**
+ * A remote action delivered to exactly one daemon via the /checkin or
+ * /ingest response. The daemon executes only verbs on its own allowlist
+ * (restart, upload_logs) — unknown verbs are logged and dropped.
+ */
+export interface DaemonDirective {
+  id: number;
+  verb: string;
 }
 
 export interface FileState {

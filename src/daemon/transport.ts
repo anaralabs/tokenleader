@@ -1,4 +1,4 @@
-import type { IngestRequest, IngestResponse, TokenEvent } from "../types";
+import type { DaemonDirective, IngestRequest, IngestResponse, TokenEvent } from "../types";
 import { log } from "./log";
 
 export const USER_AGENT = "tokenleader-daemon/0.1.0";
@@ -52,6 +52,9 @@ export interface PostResult {
   duplicates: number;
   // Reason if !ok, for logging.
   error?: string;
+  // Single-shot remote action piggybacked on the server's response.
+  // Old servers never set it.
+  directive?: DaemonDirective;
 }
 
 const BACKOFF_BASE_MS = [1000, 4000, 16000];
@@ -177,6 +180,7 @@ async function postBatch(
           ok: true,
           inserted: typeof json.inserted === "number" ? json.inserted : 0,
           duplicates: typeof json.duplicates === "number" ? json.duplicates : 0,
+          ...(isDirective(json.directive) ? { directive: json.directive } : {}),
         };
       }
 
@@ -262,6 +266,66 @@ async function postBatch(
   };
 }
 
+function isDirective(v: unknown): v is DaemonDirective {
+  if (!v || typeof v !== "object") return false;
+  const d = v as Record<string, unknown>;
+  return typeof d.id === "number" && typeof d.verb === "string" && d.verb.length > 0;
+}
+
+// Heartbeats are cheap and retried by the very next tick, so a single
+// short-leash attempt is enough — never let a slow/hung heartbeat delay
+// the loop the way an event POST is allowed to.
+const CHECKIN_TIMEOUT_MS = 15_000;
+
+/**
+ * Liveness heartbeat for a tick that had nothing to post: stamps this
+ * device's last_seen/version on the server and picks up any pending
+ * directive. Best-effort — a 404 (old server), auth refusal, or network
+ * error all resolve to {ok:false} and the daemon just carries on.
+ */
+export async function postCheckin(
+  user: string,
+  opts: TransportOpts,
+  signal?: AbortSignal,
+): Promise<{ ok: boolean; directive?: DaemonDirective }> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const url = `${opts.endpoint.replace(/\/+$/, "")}/checkin`;
+  try {
+    const res = await fetchWithTimeout(
+      fetchImpl,
+      url,
+      {
+        method: "POST",
+        headers: {
+          "User-Agent": USER_AGENT,
+          "X-Tokenleader-Secret": opts.secret,
+          "X-Tokenleader-User": user,
+          "X-Tokenleader-Version": opts.version ?? "dev",
+          "X-Tokenleader-Arch": opts.arch ?? "",
+          ...(opts.device ? { "X-Tokenleader-Device": opts.device } : {}),
+        },
+      },
+      CHECKIN_TIMEOUT_MS,
+      signal,
+    );
+    if (!res.ok) {
+      // 404 = pre-directive server; 403 = unclaimed/mismatched identity
+      // (a fresh install that hasn't posted its first events yet). Both
+      // are expected states, not errors worth a warn.
+      log.debug("checkin_http", { url, status: res.status });
+      return { ok: false };
+    }
+    const json = (await res.json()) as { directive?: unknown };
+    return {
+      ok: true,
+      ...(isDirective(json.directive) ? { directive: json.directive } : {}),
+    };
+  } catch (err: unknown) {
+    log.debug("checkin_failed", { url, err: String((err as Error)?.message ?? err) });
+    return { ok: false };
+  }
+}
+
 /**
  * Post events to the server, splitting into batches up to `batchSize`.
  * If ANY batch fails, the whole call fails — the daemon does NOT advance
@@ -281,6 +345,7 @@ export async function postEvents(
 
   let inserted = 0;
   let duplicates = 0;
+  let directive: DaemonDirective | undefined;
 
   for (let i = 0; i < batches.length; i++) {
     const batch = batches[i]!;
@@ -296,7 +361,10 @@ export async function postEvents(
     }
     inserted += r.inserted;
     duplicates += r.duplicates;
+    // Keep the first directive seen this flush; anything else still queued
+    // arrives on a later tick's response.
+    directive ??= r.directive;
   }
 
-  return { ok: true, inserted, duplicates };
+  return { ok: true, inserted, duplicates, ...(directive ? { directive } : {}) };
 }
