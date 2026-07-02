@@ -89,6 +89,16 @@ jobs:
           fi
           echo "guard (b) ok: bin/tokenleader-darwin-x64 -> ${GITHUB_REF_NAME} (embedded-bytes check; not executable on this runner)"
 
+      - name: Guard (f) — released binary completes a real update cycle
+        # Tests run under bun; the fleet runs the COMPILED binary — a
+        # different runtime surface (the v0.5.x silent-exit fetch kill
+        # shipped through a fully green suite). This executes the actual
+        # arm64 artifact and drives it through manifest → curl download →
+        # sha verify → smoke test → swap → exit(75) against a local server.
+        run: |
+          VERSION=v0.0.0-updategate bash scripts/build-daemon.sh '' /tmp/gate-next
+          bun scripts/update-gate.ts bin/tokenleader-darwin-arm64 /tmp/gate-next
+
       - name: Build manifest.json (dual shape)
         run: bun scripts/make-manifest.ts --version "${GITHUB_REF_NAME}" --bin-dir bin --out bin/manifest.json
 
