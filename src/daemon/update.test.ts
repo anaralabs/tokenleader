@@ -67,6 +67,22 @@ function mkFetch(handler: (url: string) => Response | Promise<Response>): typeof
   }) as unknown as typeof fetch;
 }
 
+/**
+ * Stub for the downloadBinary seam (curl in prod): writes `bytes` to dest
+ * and records the requested URL into `urls` when given.
+ */
+function mkDownload(
+  bytes: Uint8Array | string,
+  urls?: string[],
+): (url: string, dest: string) => Promise<string | null> {
+  return async (url, dest) => {
+    urls?.push(url);
+    const buf = typeof bytes === "string" ? new TextEncoder().encode(bytes) : bytes;
+    await fsp.writeFile(dest, buf);
+    return null;
+  };
+}
+
 describe("checkForUpdate", () => {
   test("up-to-date: returns reason 'up_to_date' and does not restart", async () => {
     const dir = await makeTmpDir();
@@ -119,6 +135,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "x64",
+      downloadBinary: mkDownload(newBytes, calledUrls),
       // The fixture "binary" is a text payload, not an executable — skip the
       // real smoke run (it has its own tests below).
       verifyBinary: () => null,
@@ -132,9 +149,6 @@ describe("checkForUpdate", () => {
         calledUrls.push(url);
         if (url === MANIFEST_URL) {
           return new Response(JSON.stringify(manifest), { status: 200 });
-        }
-        if (url === expectedBinaryUrl) {
-          return new Response(newBytes, { status: 200 });
         }
         return new Response("nope", { status: 404 });
       }),
@@ -182,15 +196,13 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      downloadBinary: mkDownload(newBytes, calledUrls),
       verifyBinary: () => null,
       restart: () => {},
       fetchImpl: mkFetch(async (url) => {
         calledUrls.push(url);
         if (url === MANIFEST_URL) {
           return new Response(JSON.stringify(manifest), { status: 200 });
-        }
-        if (url === customUrl) {
-          return new Response(newBytes, { status: 200 });
         }
         return new Response("nope", { status: 404 });
       }),
@@ -220,15 +232,13 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      downloadBinary: mkDownload(actualBytes),
       restart: () => {
         restarted = true;
       },
       fetchImpl: mkFetch(async (url) => {
         if (url === MANIFEST_URL) {
           return new Response(JSON.stringify(manifest), { status: 200 });
-        }
-        if (url === `${ENDPOINT}${BINARY_PATH_PREFIX}arm64`) {
-          return new Response(actualBytes, { status: 200 });
         }
         return new Response("nope", { status: 404 });
       }),
@@ -332,7 +342,7 @@ describe("checkForUpdate", () => {
     expect(r.reason).toBe("manifest_invalid");
   });
 
-  test("download HTTP failure: returns 'download_failed' and does not touch exec", async () => {
+  test("download failure: retries 3x, returns 'download_failed', does not touch exec", async () => {
     const dir = await makeTmpDir();
     const execPath = path.join(dir, "anara-leaderboard");
     const oldBytes = new TextEncoder().encode("old");
@@ -341,12 +351,17 @@ describe("checkForUpdate", () => {
     const newSha = sha("intended-new");
     const manifest = manifestFor("arm64", newSha);
 
+    let attempts = 0;
     const { log } = makeLog();
     const r = await checkForUpdate({
       log,
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      downloadBinary: async () => {
+        attempts++;
+        return "curl exit 22: The requested URL returned error: 404";
+      },
       restart: () => {},
       fetchImpl: mkFetch((url) => {
         if (url === MANIFEST_URL) {
@@ -357,6 +372,7 @@ describe("checkForUpdate", () => {
     });
     expect(r.updated).toBe(false);
     expect(r.reason).toBe("download_failed");
+    expect(attempts).toBe(3);
     const onDisk = await fsp.readFile(execPath);
     expect(sha(new Uint8Array(onDisk))).toBe(sha(oldBytes));
   });
@@ -542,12 +558,6 @@ describe("checkForUpdate", () => {
           headers: { ETag: '"e1"' },
         });
       }
-      if (req.url === binaryUrl) {
-        binaryHits++;
-        return binaryUp
-          ? new Response(newBytes, { status: 200 })
-          : new Response("mirror cold", { status: 503 });
-      }
       return new Response("nope", { status: 404 });
     }) as unknown as typeof fetch;
 
@@ -559,6 +569,13 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64" as const,
+      downloadBinary: async (url: string, dest: string) => {
+        expect(url).toBe(binaryUrl);
+        binaryHits++;
+        if (!binaryUp) return "curl exit 22: mirror cold (503)";
+        await fsp.writeFile(dest, newBytes);
+        return null;
+      },
       verifyBinary: () => null,
       restart: () => {
         restarts++;
@@ -842,7 +859,6 @@ describe("binary verification", () => {
 
     const newBytes = new TextEncoder().encode("broken-binary");
     const manifest = manifestFor("arm64", sha(newBytes));
-    const binaryUrl = `${ENDPOINT}${BINARY_PATH_PREFIX}arm64`;
 
     let restarted = false;
     const { log, records } = makeLog();
@@ -851,6 +867,7 @@ describe("binary verification", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      downloadBinary: mkDownload(newBytes),
       verifyBinary: () => "exit 3",
       restart: () => {
         restarted = true;
@@ -858,9 +875,6 @@ describe("binary verification", () => {
       fetchImpl: mkFetch((url) => {
         if (url === MANIFEST_URL) {
           return new Response(JSON.stringify(manifest), { status: 200 });
-        }
-        if (url === binaryUrl) {
-          return new Response(newBytes, { status: 200 });
         }
         return new Response("nope", { status: 404 });
       }),
@@ -900,5 +914,40 @@ describe("binary verification", () => {
     expect(__internal.defaultVerifyBinary(junk)).not.toBeNull();
 
     expect(__internal.defaultVerifyBinary(path.join(dir, "missing"))).not.toBeNull();
+  });
+});
+
+describe("defaultDownloadBinary (real curl)", () => {
+  test("downloads bytes to dest via curl; 404 reports a curl failure", async () => {
+    const dir = await makeTmpDir();
+    const payload = new TextEncoder().encode("binary-payload-via-curl");
+    const server = Bun.serve({
+      port: 0,
+      fetch(req) {
+        const u = new URL(req.url);
+        if (u.pathname === "/bin/ok") return new Response(payload);
+        return new Response("nope", { status: 404 });
+      },
+    });
+    try {
+      const dest = path.join(dir, "downloaded");
+      const ok = await __internal.defaultDownloadBinary(
+        `http://127.0.0.1:${server.port}/bin/ok`,
+        dest,
+        30_000,
+      );
+      expect(ok).toBeNull();
+      expect(sha(new Uint8Array(await fsp.readFile(dest)))).toBe(sha(payload));
+
+      const err = await __internal.defaultDownloadBinary(
+        `http://127.0.0.1:${server.port}/bin/missing`,
+        path.join(dir, "missing"),
+        30_000,
+      );
+      expect(err).not.toBeNull();
+      expect(err).toContain("curl exit 22");
+    } finally {
+      server.stop(true);
+    }
   });
 });
