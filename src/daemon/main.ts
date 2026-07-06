@@ -1,18 +1,33 @@
 import { promises as fsp } from "node:fs";
 import { homedir, hostname } from "node:os";
 import path from "node:path";
-import type { DaemonDirective } from "../types";
+import type { CheckinBody, DaemonDirective } from "../types";
 import { BUILD_SHA, BUILD_VERSION } from "./build-info";
 import { CLI_COMMANDS, type CliCommand, runCliCommand } from "./cli";
 import { executeDirective } from "./directives";
 import { normalizeEndpoint, readEndpointOverride } from "./endpoint-override";
-import { log, LOG_FILE } from "./log";
+import {
+  clearUpdateMarker,
+  createHeartbeat,
+  journalExit,
+  journalTail,
+  readUpdateMarker,
+} from "./heartbeat";
+import { log, LOG_DIR, LOG_FILE } from "./log";
 import { healInstalledPlist } from "./plist-heal";
 import { loadOrCreateSecret } from "./secret";
 import { applyRescanGeneration, ensureStateDir, loadState, saveState } from "./state";
 import { tick } from "./tick";
-import { DEFAULT_BATCH_SIZE, postCheckin, type TransportOpts } from "./transport";
-import { checkForUpdate, pickArch } from "./update";
+import {
+  DEFAULT_BATCH_SIZE,
+  deviceLabelFromHost,
+  postCheckin,
+  postDirectiveAck,
+  type TransportOpts,
+} from "./transport";
+import { checkForUpdate, pickArch, RESTART_EXIT_CODE } from "./update";
+import { resolveWatchdogStateDir, runWatchdog } from "./watchdog";
+import { ensureWatchdogInstalled, type WatchdogInstallStatus } from "./watchdog-install";
 
 export interface ResolvedConfig {
   user: string;
@@ -180,17 +195,7 @@ export async function ensureCliSymlink(execPath: string = process.execPath): Pro
   }
 }
 
-/** Short hostname → device label ("Krishs-MacBook-Pro.local" →
- *  "krishs-macbook-pro"). Sent as X-Tokenleader-Device; the server treats
- *  it as cosmetic. undefined when nothing survives the cleanup. */
-export function deviceLabelFromHost(host: string): string | undefined {
-  const s = (host.split(".")[0] ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32);
-  return s.length > 0 ? s : undefined;
-}
+export { deviceLabelFromHost } from "./transport";
 
 /**
  * Boot-time endpoint precedence: `<stateDir>/endpoint` (written by the
@@ -261,10 +266,77 @@ export interface RunDeps {
   executeDirectiveImpl?: typeof executeDirective;
   // Source of "now" for the update scheduler. Defaults to Date.now.
   nowImpl?: () => number;
-  // First-update delay in ms; default 30_000 (production). Tests use 0.
-  initialUpdateDelayMs?: number;
   // Random source 0..1 for the update-interval jitter. Tests pin it.
   random?: () => number;
+  // Watchdog install outcome from main(), reported in checkins.
+  watchdogStatus?: WatchdogInstallStatus;
+  // Deliberate self-exit seam (drift/recycle); default journals + exit(75).
+  exitImpl?: (code: number) => void;
+}
+
+// L1 drift exit: a between-tick sleep that overshoots by this much means the
+// runtime's timers are degrading (or the machine slept — in which case a
+// fresh process at wake is exactly the churn-reset we want). Deliberate,
+// journaled, respawned by KeepAlive.
+export const DRIFT_EXIT_MIN_OVERSHOOT_MS = 30 * 60_000;
+
+// L2 recycling: hygiene against slow runtime rot, demoted to 7d + persisted
+// per-machine jitter (0-24h) so a fleet never recycles in lockstep.
+export const RECYCLE_AFTER_MS = 7 * 24 * 60 * 60_000;
+export const RECYCLE_JITTER_MAX_MS = 24 * 60 * 60_000;
+
+/** Monotonic count of daemon boots (crash-loop signal for the classifier —
+ *  the journal only explains DELIBERATE exits; boots it can't explain are
+ *  crashes). Best-effort: an unreadable file restarts the count. */
+async function bumpBootCount(stateDir: string): Promise<number> {
+  const p = path.join(stateDir, "boot-count");
+  let n = 0;
+  try {
+    n = Number.parseInt(await fsp.readFile(p, "utf8"), 10);
+    if (!Number.isFinite(n) || n < 0) n = 0;
+  } catch {
+    // first boot
+  }
+  n += 1;
+  try {
+    await fsp.writeFile(p, String(n));
+  } catch {
+    // count restarts next boot; harmless
+  }
+  return n;
+}
+
+/** Free space on the state volume, or null where statfs is unavailable. */
+async function diskFreeMb(stateDir: string): Promise<number | null> {
+  try {
+    const statfs = (
+      fsp as unknown as {
+        statfs?: (p: string) => Promise<{ bavail: number; bsize: number }>;
+      }
+    ).statfs;
+    if (!statfs) return null;
+    const s = await statfs(stateDir);
+    return Math.round((s.bavail * s.bsize) / (1024 * 1024));
+  } catch {
+    return null;
+  }
+}
+
+async function recycleJitterMs(stateDir: string, rnd: () => number): Promise<number> {
+  const p = path.join(stateDir, "recycle-jitter");
+  try {
+    const v = Number.parseInt(await fsp.readFile(p, "utf8"), 10);
+    if (Number.isFinite(v) && v >= 0 && v <= RECYCLE_JITTER_MAX_MS) return v;
+  } catch {
+    // first boot — mint below
+  }
+  const v = Math.floor(rnd() * RECYCLE_JITTER_MAX_MS);
+  try {
+    await fsp.writeFile(p, String(v));
+  } catch {
+    // unpersisted jitter re-mints next boot; harmless
+  }
+  return v;
 }
 
 export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promise<void> {
@@ -276,13 +348,29 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
   const checkinFn = deps.postCheckinImpl ?? postCheckin;
   const directiveFn = deps.executeDirectiveImpl ?? executeDirective;
   const now = deps.nowImpl ?? Date.now;
-  const initialUpdateDelayMs = deps.initialUpdateDelayMs ?? 30_000;
   const rnd = deps.random ?? Math.random;
 
   await ensureStateDir(cfg.stateDir);
   await ensureCliSymlink();
 
   const secret = await loadSecretFn(cfg.stateDir);
+
+  // Liveness contract, inner half: the heartbeat file the watchdog stats.
+  // First write happens before any slow work so a fresh boot is immediately
+  // distinguishable from the wedge it may have replaced.
+  const hb = createHeartbeat(cfg.stateDir, BUILD_VERSION);
+  hb.progress();
+  const bootAt = Date.now();
+
+  // Debris sweep from a previous incarnation: a crash mid-download leaves a
+  // partial .new (harmless, but confusing) and a stale update marker (would
+  // wrongly widen the watchdog's deadline).
+  try {
+    await fsp.unlink(`${process.execPath}.new`);
+  } catch {
+    // none — the normal case
+  }
+  if (readUpdateMarker(cfg.stateDir)) clearUpdateMarker(cfg.stateDir);
 
   const device = deviceLabelFromHost(hostname());
   const transport: TransportOpts = {
@@ -291,6 +379,7 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
     batchSize: cfg.batchSize,
     version: BUILD_VERSION,
     arch: process.arch,
+    onProgress: () => hb.progress(),
     ...(cfg.join ? { join: cfg.join } : {}),
     ...(cfg.company ? { company: cfg.company } : {}),
     ...(device ? { device } : {}),
@@ -344,20 +433,21 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
   process.once("SIGINT", () => onSig("SIGINT"));
   process.once("SIGTERM", () => onSig("SIGTERM"));
 
-  // Schedule the first update check ~30s after boot so the very first tick
-  // (which on a fresh install can be a big historical-replay POST) doesn't
-  // contend with a multi-MB binary download. After that we check every
-  // updateIntervalSec. tickInProgress gates the check so we never overlap.
+  // Update scheduling. The FIRST check runs before the first tick — a binary
+  // that crashes in its tick path still gets a self-update window, which is
+  // the difference between a bad release self-healing and a fleet reinstall
+  // (docs/resilience.md, update-path hardening). After that, every
+  // updateIntervalSec with fresh ±10% jitter per cycle so a fleet installed
+  // at the same minute doesn't herd binary downloads forever.
   let tickInProgress = false;
   let tickCount = 0;
   // Emit a health heartbeat (cpu/mem/uptime) every this-many ticks (~1h at the
   // default 5-min interval) so daemon resource use is always on record in the
   // local log — makes a future spin/leak diagnosable from a single grep.
   const HEARTBEAT_EVERY_TICKS = 12;
-  // Each cycle's due-interval gets fresh ±10% jitter so a fleet installed
-  // at the same minute doesn't herd binary downloads forever.
   let updateIntervalMs = jitterUpdateIntervalMs(cfg.updateIntervalSec * 1000, rnd);
-  let lastUpdateCheckAt = now() - updateIntervalMs + initialUpdateDelayMs;
+  let lastUpdateCheckAt = now() - updateIntervalMs;
+  let lastUpdateResult: string | null = null;
 
   const maybeCheckForUpdate = async () => {
     if (cfg.updateDisabled || cfg.runOnce) return;
@@ -373,6 +463,7 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         endpoint: cfg.endpoint,
         stateDir: cfg.stateDir,
       });
+      lastUpdateResult = r.updated ? "updated" : (r.reason ?? null);
       if (r.updated) {
         // The updater is responsible for exiting the process (launchd
         // respawns the swapped binary); if we somehow get here it means a
@@ -384,17 +475,63 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
       // Belt-and-suspenders — checkForUpdate is supposed to swallow all
       // errors internally, but if it somehow throws we still don't want
       // to crash the daemon.
+      lastUpdateResult = "threw";
       log.warn("update_check_threw", {
         err: String((err as Error)?.message ?? err),
       });
     }
   };
 
+  const deliberateExit = (reason: string) => {
+    hb.progress();
+    journalExit(cfg.stateDir, reason, RESTART_EXIT_CODE);
+    log.info("daemon_deliberate_exit", { reason, code: RESTART_EXIT_CODE });
+    (deps.exitImpl ?? process.exit)(RESTART_EXIT_CODE);
+  };
+
+  const recycleJitter = await recycleJitterMs(cfg.stateDir, rnd);
+  let lastDriftMs = 0;
+  const bootCount = await bumpBootCount(cfg.stateDir);
+
+  const buildCheckinBody = async (): Promise<CheckinBody> => {
+    const snap = hb.snapshot();
+    const ws = deps.watchdogStatus;
+    return {
+      uptime_s: Math.round((Date.now() - bootAt) / 1000),
+      tick_seq: snap.tick_seq,
+      interval_s: cfg.intervalSec,
+      boot_count: bootCount,
+      consec_failures: snap.consec_failures,
+      last_error: snap.last_error,
+      last_update_result: lastUpdateResult,
+      disk_free_mb: await diskFreeMb(cfg.stateDir),
+      drift_ms: lastDriftMs,
+      heartbeat_write_failures: hb.writeFailures,
+      exit_journal_tail: journalTail(cfg.stateDir, Date.now() - 24 * 60 * 60_000).slice(-20),
+      watchdog_installed:
+        ws === undefined || ws === "skipped" ? null : ws === "installed" || ws === "already",
+    };
+  };
+
+  // First update check, before the first tick.
+  await maybeCheckForUpdate();
+
   while (!ac.signal.aborted) {
+    // L2 recycling: between ticks only, never while an update is in flight.
+    if (
+      Date.now() - bootAt > RECYCLE_AFTER_MS + recycleJitter &&
+      !cfg.runOnce &&
+      readUpdateMarker(cfg.stateDir) === null
+    ) {
+      deliberateExit("recycle");
+    }
+
     const start = Date.now();
     tickInProgress = true;
     let directive: DaemonDirective | undefined;
-    let tickedQuietly = false;
+    let tickOk = false;
+    let tickErr: string | undefined;
+    hb.tickStart();
     try {
       const out = await tickFn(state, {
         user: cfg.user,
@@ -403,10 +540,11 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         signal: ac.signal,
         loadState: loadFn,
         saveState: saveFn,
+        progress: () => hb.progress(),
       });
       state = out.state;
       directive = out.result.directive;
-      tickedQuietly = out.result.posted && out.result.eventsPosted === 0;
+      tickOk = out.result.posted || out.result.eventsPosted === 0;
       log.info("tick_done", {
         scanned: out.result.scannedFiles,
         eligible: out.result.eligibleFiles,
@@ -417,12 +555,13 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         newFiles: out.result.newFiles,
         elapsedMs: Date.now() - start,
       });
+      if (!tickOk) tickErr = "post_failed";
     } catch (err: unknown) {
-      log.error("tick_failed", {
-        err: String((err as Error)?.message ?? err),
-      });
+      tickErr = String((err as Error)?.message ?? err);
+      log.error("tick_failed", { err: tickErr });
     } finally {
       tickInProgress = false;
+      hb.tickEnd(tickOk, tickErr);
     }
 
     if (cfg.runOnce) {
@@ -430,12 +569,12 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
       return;
     }
 
-    // Heartbeat: a tick with no events makes no HTTP request at all, so an
-    // idle-but-alive daemon would look identical to a dead one (the
-    // observability gap behind the v0.5.x "stale fleet" misdiagnosis).
-    // Check in instead — stamps last_seen/version and picks up directives.
-    if (tickedQuietly && !ac.signal.aborted) {
-      const ci = await checkinFn(cfg.user, transport, ac.signal);
+    // Checkin after EVERY tick — success, quiet, or failure. A sick-but-alive
+    // daemon (403 loop, parse loop) previously went server-dark exactly when
+    // it mattered; the status body is what lets the fleet classifier tell
+    // healthy/degraded/crash-looping apart (docs/resilience.md).
+    if (!ac.signal.aborted) {
+      const ci = await checkinFn(cfg.user, transport, ac.signal, await buildCheckinBody());
       directive ??= ci.directive;
     }
 
@@ -445,11 +584,21 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
     // A directive runs LAST: if the update path already swapped + exited,
     // the process is gone and the directive (usually "restart") is moot.
     if (directive && !ac.signal.aborted) {
-      await directiveFn(directive, {
+      const d = directive;
+      await directiveFn(d, {
         log,
         endpoint: cfg.endpoint,
         secret,
         user: cfg.user,
+        stateDir: cfg.stateDir,
+        ack: async (result, detail) => {
+          await postDirectiveAck(
+            cfg.user,
+            { id: d.id, result, ...(detail ? { detail } : {}), executed_by: "daemon" },
+            transport,
+            ac.signal,
+          );
+        },
       });
     }
 
@@ -481,9 +630,22 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
       });
     }
     const sleepMs = elapsed >= intervalMs ? intervalMs : intervalMs - elapsed;
+    const sleepStart = Date.now();
     await sleep(sleepMs, ac.signal);
+
+    // L1 drift exit: this sleep resolving grossly late means the runtime's
+    // timers are degrading (the wedge precursor) — or the machine slept, in
+    // which case a fresh process at wake is exactly the churn-reset we want.
+    // Either way: journaled deliberate exit, KeepAlive respawn, no data loss.
+    const overshoot = Date.now() - sleepStart - sleepMs;
+    lastDriftMs = Math.max(0, overshoot);
+    if (!ac.signal.aborted && overshoot > Math.max(3 * intervalMs, DRIFT_EXIT_MIN_OVERSHOOT_MS)) {
+      log.warn("clock_skew", { sleepMs, overshootMs: overshoot });
+      deliberateExit("clock_drift");
+    }
   }
 
+  journalExit(cfg.stateDir, "shutdown", 0);
   log.info("daemon_shutdown");
 }
 
@@ -527,6 +689,21 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return runCliCommand(sub as CliCommand, argv.slice(1));
   }
 
+  // The out-of-process liveness checker (docs/resilience.md). Runs under its
+  // own launchd label, lives for seconds, always exits 0 — a non-zero exit
+  // would only add launchd log spam with no one to react to it.
+  if (sub === "watchdog") {
+    if (process.platform !== "darwin") return 0;
+    const stateDir = resolveWatchdogStateDir(process.env, homedir());
+    try {
+      const r = await runWatchdog({ log, stateDir, logDir: LOG_DIR });
+      log.debug("watchdog_run_done", { action: r.action, staleRuns: r.staleRuns });
+    } catch (err: unknown) {
+      log.warn("watchdog_run_failed", { err: String((err as Error)?.message ?? err) });
+    }
+    return 0;
+  }
+
   // Friendly top-level usage. The same binary is BOTH the launchd-run daemon
   // and the user-facing CLI, so we must tell them apart: launchd always sets
   // TOKENLEADER_USER (from the plist), so a bare invocation WITHOUT it is a
@@ -561,16 +738,29 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
 
   // One-shot per boot: repair a strand-prone LaunchAgent plist from an older
-  // install so this daemon can never again stay dead after a clean exit. Only
-  // the real launchd entrypoint runs this (runDaemon, used by tests, never
-  // does), so unit tests can't touch a developer's installed plist.
+  // install so this daemon can never again stay dead after a clean exit, and
+  // install/refresh the watchdog pair. Only the real launchd entrypoint runs
+  // these (runDaemon, used by tests, never does), so unit tests and the CI
+  // update-gate (TOKENLEADER_WATCHDOG_DISABLED=1) can't touch a developer's
+  // or runner's launchd.
+  let watchdogStatus: WatchdogInstallStatus = "skipped";
   if (process.platform === "darwin") {
     await healInstalledPlist(log);
+    // Heartbeat dir + first write happen inside runDaemon before the first
+    // tick; the watchdog treats a missing heartbeat as observe-only, so the
+    // ordering slack here is safe.
+    try {
+      await ensureStateDir(cfg.stateDir);
+      watchdogStatus = ensureWatchdogInstalled(log, cfg.stateDir);
+    } catch (err: unknown) {
+      log.warn("watchdog_install_threw", { err: String((err as Error)?.message ?? err) });
+      watchdogStatus = "failed";
+    }
   }
 
   try {
     cfg = await applyEndpointOverride(cfg);
-    await runDaemon(cfg);
+    await runDaemon(cfg, { watchdogStatus });
     return 0;
   } catch (err: unknown) {
     log.error("daemon_fatal", {

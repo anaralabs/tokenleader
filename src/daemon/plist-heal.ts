@@ -31,10 +31,18 @@ export function defaultPlistPath(): string {
 const LEGACY_KEEPALIVE = /<key>KeepAlive<\/key>\s*<dict>[\s\S]*?<\/dict>/;
 const HEALED_KEEPALIVE = "<key>KeepAlive</key>\n    <true/>";
 
-/** Pure core: rewrite a drifted KeepAlive stanza to the unconditional form. */
+// stdout duplicated the jsonl file sink into an unbounded stdout.log
+// (launchd never rotates StandardOutPath targets). Healed to /dev/null;
+// stderr is deliberately left alone — it catches crash output that never
+// reaches the logger.
+const LEGACY_STDOUT = /(<key>StandardOutPath<\/key>\s*<string>)[^<]*stdout\.log(<\/string>)/;
+
+/** Pure core: rewrite drifted stanzas (KeepAlive dict, stdout.log sink). */
 export function healPlistXml(xml: string): { changed: boolean; xml: string } {
-  if (!LEGACY_KEEPALIVE.test(xml)) return { changed: false, xml };
-  return { changed: true, xml: xml.replace(LEGACY_KEEPALIVE, HEALED_KEEPALIVE) };
+  let out = xml;
+  if (LEGACY_KEEPALIVE.test(out)) out = out.replace(LEGACY_KEEPALIVE, HEALED_KEEPALIVE);
+  if (LEGACY_STDOUT.test(out)) out = out.replace(LEGACY_STDOUT, "$1/dev/null$2");
+  return { changed: out !== xml, xml: out };
 }
 
 async function atomicWrite(p: string, data: string): Promise<void> {

@@ -44,13 +44,61 @@ export interface IngestResponse {
 }
 
 /**
- * A remote action delivered to exactly one daemon via the /checkin or
- * /ingest response. The daemon executes only verbs on its own allowlist
- * (restart, upload_logs) — unknown verbs are logged and dropped.
+ * A remote action delivered to exactly one daemon or watchdog via the
+ * /checkin, /ingest, or /watchdog-checkin response. Executors run only verbs
+ * on their own allowlist — unknown verbs are logged and dropped. Completion
+ * is the executed-ack POST, not the handout: undelivered or un-acked
+ * directives re-queue on TTL (docs/resilience.md).
  */
 export interface DaemonDirective {
   id: number;
   verb: string;
+}
+
+/** Executed-ack POSTed back after a directive runs (or fails). */
+export interface DirectiveAck {
+  id: number;
+  result: "ok" | "failed";
+  detail?: string;
+  executed_by: "daemon" | "watchdog";
+}
+
+/**
+ * Optional JSON body on daemon /checkin POSTs (headers alone remain valid —
+ * old daemons send none, old servers ignore it). Fields feed the fleet
+ * classifier; exit_journal_tail explains deliberate restarts so recycling
+ * and update swaps are never misread as crash loops.
+ */
+export interface CheckinBody {
+  uptime_s: number;
+  tick_seq: number;
+  /** Configured tick cadence — the fleet classifier scales its staleness
+   *  thresholds per device so slow-cadence daemons are never misread. */
+  interval_s?: number;
+  /** Monotonic count of daemon boots on this machine (crash-loop signal). */
+  boot_count?: number;
+  consec_failures: number;
+  last_error: string | null;
+  last_update_result: string | null;
+  disk_free_mb: number | null;
+  drift_ms: number;
+  heartbeat_write_failures: number;
+  exit_journal_tail: { ts: number; reason: string; code: number }[];
+  watchdog_installed: boolean | null;
+}
+
+/** Body of the watchdog's ~200B curl checkin to /watchdog-checkin. */
+export interface WatchdogCheckinBody {
+  watchdog_version: string;
+  daemon_pid_alive: boolean;
+  /** Consecutive watchdog firings with an unchanged heartbeat (awake-time
+   *  staleness in launchd-clock units; 8 ≈ 16 min awake). */
+  heartbeat_age_runs: number;
+  kills_recent: number;
+  degraded: boolean;
+  spool_pending: number;
+  /** The watchdog's own counter file was unreadable this run. */
+  state_corrupt?: boolean;
 }
 
 export interface FileState {

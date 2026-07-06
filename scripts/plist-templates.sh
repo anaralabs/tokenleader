@@ -53,12 +53,78 @@ render_daemon_plist() {
     <integer>30</integer>
     <key>ProcessType</key>
     <string>Background</string>
+    <!-- stdout duplicates the jsonl file sink and grew unbounded (launchd
+         never rotates these); stderr stays a real file to catch crash output
+         that never reaches the logger. -->
     <key>StandardOutPath</key>
-    <string>${home}/Library/Logs/anara-leaderboard/stdout.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>${home}/Library/Logs/anara-leaderboard/stderr.log</string>
     <key>WorkingDirectory</key>
     <string>${home}</string>
+</dict>
+</plist>
+EOF
+}
+
+# render_watchdog_plist <home>
+#   home - absolute path to $HOME (program/log paths resolve under it)
+#
+# Second half of the v0.6.0 "Never Silent" watchdog pair (docs/resilience.md):
+# a one-shot checker on launchd's clock that stats the daemon's heartbeat
+# file and escalates when it stops moving. ProgramArguments points at the
+# .watchdog HARDLINK (refreshed by the daemon at every boot), NOT the daemon
+# binary, so a deleted or rolled-back daemon binary cannot take the watchdog
+# — and its phone-home channel — down with it.
+#
+# StartInterval 120 + RunAtLoad, and deliberately NO KeepAlive: launchd drops
+# (never queues) StartInterval firings that collide with a running instance
+# or occur during sleep, which makes "N unchanged firings" a measure of awake
+# time; the watchdog is a one-shot alive for seconds, and a resident copy
+# would just be a second wedgeable-runtime daemon.
+#
+# CONVERGENCE MARKER: the daemon's own ensure-plist path single-sources this
+# XML from a TypeScript renderer in src/daemon/watchdog.ts. The two renderers
+# MUST stay byte-identical (same key order, 4-space indent, same XML comment)
+# or every daemon boot rewrites the installer's plist and vice versa. Change
+# one, change both.
+render_watchdog_plist() {
+  local home="$1"
+
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.anara.leaderboard.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${home}/.local/bin/anara-leaderboard.watchdog</string>
+        <string>watchdog</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>${home}</string>
+        <key>PATH</key>
+        <string>${home}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <!-- One-shot checker on launchd's clock: StartInterval fires while awake
+         (collided/asleep firings are dropped, never queued) and RunAtLoad
+         covers login. Deliberately NO KeepAlive - the watchdog must stay a
+         short-lived one-shot; a resident copy would share the daemon's
+         wedgeable-runtime failure domain. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>${home}/Library/Logs/anara-leaderboard/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>${home}/Library/Logs/anara-leaderboard/watchdog.log</string>
 </dict>
 </plist>
 EOF

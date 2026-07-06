@@ -255,6 +255,90 @@ describe("renderInstallScript", () => {
     expect(open).not.toContain("requires a join code for NEW handles");
   });
 
+  test("registers the v0.6.0 watchdog pair: hardlink, plist, then same launchctl discipline", () => {
+    const body = renderInstallScript(SERVER_URL);
+    // Derived label + plist path, pinned beside the daemon's.
+    expect(body).toContain('WATCHDOG_LABEL="${LABEL}.watchdog"');
+    expect(body).toContain('WATCHDOG_PLIST="$HOME/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"');
+    // Hardlink (same filesystem, force-replace) — the plist must point at
+    // the .watchdog HARDLINK, never the daemon binary, so a deleted or
+    // rolled-back daemon binary can't take the watchdog down with it.
+    expect(body).toContain('ln -f "$BIN_DST" "$BIN_DST.watchdog"');
+    expect(body).toContain("<string>${HOME}/.local/bin/anara-leaderboard.watchdog</string>");
+    expect(body).toContain("<string>watchdog</string>");
+    // Both labels go through the ONE registration function (bootout +
+    // disappearance wait + enable + bootstrap retries + print verify).
+    expect(body).toContain('register_launch_agent "$LABEL" "$PLIST"');
+    expect(body).toContain('register_launch_agent "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"');
+    expect(body).toContain("for _i in 1 2 3 4 5 6 7 8 9 10; do");
+    expect(body).toContain('launchctl enable "$DOMAIN/$label"');
+    // Verdict is `launchctl print` (loaded?), not bootstrap's exit code —
+    // "already loaded" on a half-installed machine counts as success.
+    expect(body).toContain('launchctl print "$DOMAIN/$label" >/dev/null 2>&1\n}');
+    // Main flow order: daemon registered, then watchdog, then start.
+    expect(body).toContain(
+      "write_plist_and_register\nwrite_watchdog_plist_and_register\nwait_for_first_tick",
+    );
+    // A watchdog registration failure warns; only the daemon path is fatal.
+    expect(body).toContain("watchdog not registered (daemon retries at every boot");
+  });
+
+  test("watchdog plist: StartInterval+RunAtLoad one-shot, no KeepAlive, single log file", () => {
+    const body = renderInstallScript(SERVER_URL);
+    const m = body.match(/<<WATCHDOG_PLIST_EOF\n([\s\S]*?)\nWATCHDOG_PLIST_EOF/);
+    expect(m).not.toBeNull();
+    const plist = m![1]!;
+    expect(plist).toContain("<string>sh.anara.leaderboard.watchdog</string>");
+    expect(plist).toContain("<key>StartInterval</key>");
+    expect(plist).toContain("<integer>120</integer>");
+    expect(plist).toContain("<key>RunAtLoad</key>");
+    // NEVER a KeepAlive key: launchd drops (never queues) collided/asleep
+    // StartInterval firings — the watchdog is a one-shot, and a resident
+    // copy would share the daemon's wedgeable-runtime failure domain. (The
+    // XML *comment* explaining this contains the word, hence the key match.)
+    expect(plist).not.toContain("<key>KeepAlive</key>");
+    expect(plist).toContain("<key>ProcessType</key>");
+    // stdout and stderr share one watchdog.log.
+    const logRefs = plist.match(/watchdog\.log<\/string>/g) ?? [];
+    expect(logRefs.length).toBe(2);
+    // HOME + PATH env like the daemon plist.
+    expect(plist).toContain("<key>HOME</key>");
+    expect(plist).toContain("<key>PATH</key>");
+  });
+
+  test("installer watchdog plist is byte-identical to render_watchdog_plist (plist-templates.sh)", () => {
+    // The daemon's own ensure-plist renderer (src/daemon/watchdog.ts) is
+    // byte-converged to this same XML; if the two installer-side renderers
+    // drift from each other, that three-way contract is already broken.
+    const body = renderInstallScript(SERVER_URL);
+    const m = body.match(/<<WATCHDOG_PLIST_EOF\n([\s\S]*?)\nWATCHDOG_PLIST_EOF/);
+    expect(m).not.toBeNull();
+    const fixtureHome = "/Users/fixture";
+
+    // Expand the installer's heredoc exactly as the installer would.
+    const harness = `HOME="${fixtureHome}"\ncat <<WATCHDOG_PLIST_EOF\n${m![1]!}\nWATCHDOG_PLIST_EOF\n`;
+    const fromInstaller = spawnSync("bash", ["-c", harness], { encoding: "utf8" });
+    expect(fromInstaller.status).toBe(0);
+
+    const templates = join(import.meta.dir, "..", "..", "scripts", "plist-templates.sh");
+    const fromTemplates = spawnSync(
+      "bash",
+      ["-c", `source "${templates}"; render_watchdog_plist "${fixtureHome}"`],
+      { encoding: "utf8" },
+    );
+    expect(fromTemplates.status).toBe(0);
+    expect(fromInstaller.stdout).toBe(fromTemplates.stdout);
+
+    // Execution assertion where the platform allows it: the converged XML
+    // must satisfy plutil (comments included).
+    if (process.platform === "darwin") {
+      const plistPath = join(tmpDir, "watchdog-converged.plist");
+      writeFileSync(plistPath, fromTemplates.stdout);
+      const lint = spawnSync("plutil", ["-lint", plistPath], { encoding: "utf8" });
+      expect(lint.status).toBe(0);
+    }
+  });
+
   test("teamName renders into the banner subtitle (sanitized)", () => {
     const branded = renderInstallScript(SERVER_URL, { teamName: "acme" });
     expect(branded).toContain("acme team token-usage leaderboard");
@@ -286,6 +370,31 @@ describe("renderUninstallScript", () => {
   test("removes the tokenleader symlink (and only a symlink)", () => {
     const body = renderUninstallScript(SERVER_URL);
     expect(body).toContain('if [ -L "$HOME/.local/bin/tokenleader" ]; then');
+    expect(body).toContain('rm -f "$HOME/.local/bin/tokenleader"');
+  });
+
+  test("boots out the watchdog first, then the daemon; removes plists, hardlink, symlink", () => {
+    // This script ships with the server deploy BEFORE v0.6.0 exists in the
+    // wild (docs/resilience.md, migration step 1) — it must clean up a
+    // watchdog when present without assuming one exists.
+    const body = renderUninstallScript(SERVER_URL);
+    expect(body).toContain('WATCHDOG_LABEL="${LABEL}.watchdog"');
+    expect(body).toContain('BIN_WATCHDOG="$BIN.watchdog"');
+
+    // Watchdog bootout precedes the daemon's: its boot-time self-heal
+    // re-bootstraps an absent daemon label (resurrection race otherwise).
+    const wdBootout = body.indexOf('launchctl bootout "$DOMAIN/$WATCHDOG_LABEL"');
+    const daemonBootout = body.indexOf('launchctl bootout "$DOMAIN/$LABEL"');
+    expect(wdBootout).toBeGreaterThan(0);
+    expect(daemonBootout).toBeGreaterThan(wdBootout);
+    // A missing watchdog is informational, never an error.
+    expect(body).toContain("pre-v0.6.0 install, or already gone");
+
+    // Both plists, the binary, the .watchdog hardlink and the CLI symlink.
+    expect(body).toContain('rm -f "$WATCHDOG_PLIST"');
+    expect(body).toContain('rm -f "$PLIST"');
+    expect(body).toContain('rm -f "$BIN"');
+    expect(body).toContain('rm -f "$BIN_WATCHDOG"');
     expect(body).toContain('rm -f "$HOME/.local/bin/tokenleader"');
   });
 

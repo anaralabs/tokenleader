@@ -35,6 +35,7 @@ import {
   normalizeEndpoint,
   writeEndpointOverride,
 } from "./endpoint-override";
+import { clearUpdateMarker, journalExit, writeUpdateMarker } from "./heartbeat";
 import type { Logger } from "./log";
 
 // Exit code of the deliberate post-update restart. Non-zero on purpose:
@@ -209,6 +210,13 @@ export interface UpdateOpts {
   restart?: () => void;
   // Hook the moment we successfully wrote the new binary (used in tests).
   onSwapped?: (info: { oldSha: string; newSha: string }) => void;
+  /**
+   * Repair mode (watchdog boot heal): a missing execPath is treated as
+   * "always outdated" instead of an error, so the pipeline reinstalls the
+   * manifest binary onto an empty path. Callers pass a no-op restart —
+   * launchd's KeepAlive respawn of the daemon label picks the binary up.
+   */
+  allowMissingExec?: boolean;
 }
 
 export function pickArch(): ManifestArch {
@@ -345,6 +353,26 @@ function defaultRestart(log: Logger): void {
 }
 
 /**
+ * Hardlink the running binary to `<execPath>.prev` BEFORE the atomic rename
+ * installs the new one. Hardlink (not a second rename) is load-bearing:
+ * there is never an instant without a complete binary at execPath, and the
+ * daemon + watchdog share that path family (docs/resilience.md, update-path
+ * hardening). Non-fatal: a failed .prev only forfeits the rollback backstop.
+ */
+async function keepPrev(execPath: string, log: Logger): Promise<void> {
+  const prevPath = `${execPath}.prev`;
+  try {
+    await fsp.unlink(prevPath).catch(() => {});
+    await fsp.link(execPath, prevPath);
+  } catch (err: unknown) {
+    log.warn("update_prev_link_failed", {
+      prevPath,
+      err: String((err as Error)?.message ?? err),
+    });
+  }
+}
+
+/**
  * Check the manifest, swap the binary if a new version is published, and
  * trigger a relaunch. Safe to call concurrently with nothing else (the
  * daemon loop in main.ts must NOT run a tick while this runs — caller is
@@ -429,6 +457,7 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
       try {
         await writeEndpointOverride(opts.stateDir, canonical);
         log.info("endpoint_override_active", { from: base, to: canonical });
+        journalExit(opts.stateDir, "endpoint_override", RESTART_EXIT_CODE);
         const restartForOverride = opts.restart ?? (() => defaultRestart(log));
         restartForOverride();
         return { updated: false, reason: "endpoint_override" };
@@ -448,16 +477,22 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
     return { updated: false, reason: "no_entry_for_arch" };
   }
 
-  // 2. SHA of running binary.
+  // 2. SHA of running binary. In repair mode a missing binary compares as
+  // never-matching, so the pipeline reinstalls onto the empty path.
   let currentSha: string;
   try {
     currentSha = await sha256OfFile(execPath);
   } catch (err: unknown) {
-    log.warn("update_current_sha_failed", {
-      execPath,
-      err: String((err as Error)?.message ?? err),
-    });
-    return { updated: false, reason: "network_error" };
+    if (opts.allowMissingExec) {
+      log.warn("update_exec_missing_repair", { execPath });
+      currentSha = "";
+    } else {
+      log.warn("update_current_sha_failed", {
+        execPath,
+        err: String((err as Error)?.message ?? err),
+      });
+      return { updated: false, reason: "network_error" };
+    }
   }
 
   if (currentSha.toLowerCase() === entry.sha256.toLowerCase()) {
@@ -483,125 +518,143 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
 
   // 3b. Download via curl (never Bun's fetch — see header). Retry to absorb
   // transient resets; whatever lands is sha-verified below before any swap,
-  // so a partial/corrupt file is never executed.
+  // so a partial/corrupt file is never executed. The update marker widens
+  // the watchdog's deadline for the duration — a slow-link download can
+  // legitimately take most of the 3 × 600s budget, far past the normal
+  // staleness threshold (docs/resilience.md, update grace).
   const tmpPath = `${execPath}.new`;
-  const download = opts.downloadBinary ?? defaultDownloadBinary;
-  const DOWNLOAD_ATTEMPTS = 3;
-  let downloadOk = false;
-  for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
-    if (opts.abortSignal?.aborted) return { updated: false, reason: "disabled" };
-    const dlErr = await download(binaryUrl, tmpPath, UPDATE_BINARY_TIMEOUT_MS, opts.abortSignal);
-    if (dlErr === null) {
-      downloadOk = true;
-      break;
+  if (opts.stateDir) writeUpdateMarker(opts.stateDir);
+  try {
+    const download = opts.downloadBinary ?? defaultDownloadBinary;
+    const DOWNLOAD_ATTEMPTS = 3;
+    let downloadOk = false;
+    for (let attempt = 1; attempt <= DOWNLOAD_ATTEMPTS; attempt++) {
+      if (opts.abortSignal?.aborted) return { updated: false, reason: "disabled" };
+      const dlErr = await download(binaryUrl, tmpPath, UPDATE_BINARY_TIMEOUT_MS, opts.abortSignal);
+      if (dlErr === null) {
+        downloadOk = true;
+        break;
+      }
+      log.warn("update_download_failed", { url: binaryUrl, attempt, err: dlErr });
     }
-    log.warn("update_download_failed", { url: binaryUrl, attempt, err: dlErr });
-  }
-  if (!downloadOk) {
-    try {
-      await fsp.unlink(tmpPath);
-    } catch {}
-    return { updated: false, reason: "download_failed" };
-  }
+    if (!downloadOk) {
+      try {
+        await fsp.unlink(tmpPath);
+      } catch {}
+      return { updated: false, reason: "download_failed" };
+    }
 
-  // 4. Verify SHA of the downloaded file (rejects partial/corrupt downloads).
-  let dlSha: string;
-  try {
-    dlSha = await sha256OfFile(tmpPath);
-  } catch (err: unknown) {
-    log.error("update_tmp_read_failed", {
-      tmpPath,
-      err: String((err as Error)?.message ?? err),
-    });
+    // 4. Verify SHA of the downloaded file (rejects partial/corrupt downloads).
+    let dlSha: string;
     try {
-      await fsp.unlink(tmpPath);
-    } catch {}
-    return { updated: false, reason: "download_failed" };
-  }
-  if (dlSha.toLowerCase() !== entry.sha256.toLowerCase()) {
-    log.error("update_sha_mismatch", {
-      expected: entry.sha256,
-      actual: dlSha,
-    });
+      dlSha = await sha256OfFile(tmpPath);
+    } catch (err: unknown) {
+      log.error("update_tmp_read_failed", {
+        tmpPath,
+        err: String((err as Error)?.message ?? err),
+      });
+      try {
+        await fsp.unlink(tmpPath);
+      } catch {}
+      return { updated: false, reason: "download_failed" };
+    }
+    if (dlSha.toLowerCase() !== entry.sha256.toLowerCase()) {
+      log.error("update_sha_mismatch", {
+        expected: entry.sha256,
+        actual: dlSha,
+      });
+      try {
+        await fsp.unlink(tmpPath);
+      } catch {}
+      return { updated: false, reason: "sha_mismatch" };
+    }
+
+    // 5. chmod, strip quarantine, rename atomically.
     try {
-      await fsp.unlink(tmpPath);
-    } catch {}
-    return { updated: false, reason: "sha_mismatch" };
-  }
+      await fsp.chmod(tmpPath, 0o755);
+    } catch (err: unknown) {
+      log.error("update_tmp_write_failed", {
+        tmpPath,
+        err: String((err as Error)?.message ?? err),
+      });
+      try {
+        await fsp.unlink(tmpPath);
+      } catch {}
+      return { updated: false, reason: "write_failed" };
+    }
 
-  // 5. chmod, strip quarantine, rename atomically.
-  try {
-    await fsp.chmod(tmpPath, 0o755);
-  } catch (err: unknown) {
-    log.error("update_tmp_write_failed", {
-      tmpPath,
-      err: String((err as Error)?.message ?? err),
-    });
+    // macOS quarantine xattr can prevent execution if the bytes arrived via
+    // browser-style download. `bun build --compile` outputs are already
+    // ad-hoc signed, so `xattr -cr` is enough — never re-sign.
     try {
-      await fsp.unlink(tmpPath);
-    } catch {}
-    return { updated: false, reason: "write_failed" };
-  }
+      spawnSync("xattr", ["-cr", tmpPath], { stdio: "ignore" });
+    } catch {
+      // Non-fatal; rename still proceeds.
+    }
 
-  // macOS quarantine xattr can prevent execution if the bytes arrived via
-  // browser-style download. `bun build --compile` outputs are already
-  // ad-hoc signed, so `xattr -cr` is enough — never re-sign.
-  try {
-    spawnSync("xattr", ["-cr", tmpPath], { stdio: "ignore" });
-  } catch {
-    // Non-fatal; rename still proceeds.
-  }
+    // 5b. Smoke-run the new binary before it replaces a working one. Refusing
+    // the swap keeps this daemon alive on the old version (loud in logs, and
+    // retried every update cycle — a re-published fixed binary swaps normally).
+    const verify = opts.verifyBinary ?? defaultVerifyBinary;
+    const verifyErr = verify(tmpPath);
+    if (verifyErr !== null) {
+      log.error("update_verify_failed", {
+        tmpPath,
+        version: manifest.version,
+        err: verifyErr,
+      });
+      try {
+        await fsp.unlink(tmpPath);
+      } catch {}
+      return { updated: false, reason: "verify_failed" };
+    }
 
-  // 5b. Smoke-run the new binary before it replaces a working one. Refusing
-  // the swap keeps this daemon alive on the old version (loud in logs, and
-  // retried every update cycle — a re-published fixed binary swaps normally).
-  const verify = opts.verifyBinary ?? defaultVerifyBinary;
-  const verifyErr = verify(tmpPath);
-  if (verifyErr !== null) {
-    log.error("update_verify_failed", {
-      tmpPath,
+    // The .prev hardlink is the rollback backstop; skipped in repair mode
+    // (nothing at execPath to keep).
+    if (currentSha !== "") await keepPrev(execPath, log);
+
+    try {
+      await fsp.rename(tmpPath, execPath);
+    } catch (err: unknown) {
+      log.error("update_rename_failed", {
+        from: tmpPath,
+        to: execPath,
+        err: String((err as Error)?.message ?? err),
+      });
+      try {
+        await fsp.unlink(tmpPath);
+      } catch {}
+      return { updated: false, reason: "rename_failed" };
+    }
+
+    log.info("update_swapped", {
       version: manifest.version,
-      err: verifyErr,
+      oldSha: currentSha,
+      newSha: dlSha,
+      arch,
+      execPath,
     });
-    try {
-      await fsp.unlink(tmpPath);
-    } catch {}
-    return { updated: false, reason: "verify_failed" };
+    opts.onSwapped?.({ oldSha: currentSha, newSha: dlSha });
+
+    // 6. Restart. Default path exits non-zero so launchd respawns the swapped
+    // binary; tests override this so they don't kill the test runner. The
+    // journal entry is what tells the watchdog and the fleet classifier that
+    // the coming respawn is deliberate, never a crash.
+    if (opts.stateDir) {
+      journalExit(opts.stateDir, "update_swap", RESTART_EXIT_CODE);
+      clearUpdateMarker(opts.stateDir);
+    }
+    const restart = opts.restart ?? (() => defaultRestart(log));
+    restart();
+
+    return {
+      updated: true,
+      oldSha: currentSha,
+      newSha: dlSha,
+    };
+  } finally {
+    if (opts.stateDir) clearUpdateMarker(opts.stateDir);
   }
-
-  try {
-    await fsp.rename(tmpPath, execPath);
-  } catch (err: unknown) {
-    log.error("update_rename_failed", {
-      from: tmpPath,
-      to: execPath,
-      err: String((err as Error)?.message ?? err),
-    });
-    try {
-      await fsp.unlink(tmpPath);
-    } catch {}
-    return { updated: false, reason: "rename_failed" };
-  }
-
-  log.info("update_swapped", {
-    version: manifest.version,
-    oldSha: currentSha,
-    newSha: dlSha,
-    arch,
-    execPath,
-  });
-  opts.onSwapped?.({ oldSha: currentSha, newSha: dlSha });
-
-  // 6. Restart. Default path exits non-zero so launchd respawns the swapped
-  // binary; tests override this so they don't kill the test runner.
-  const restart = opts.restart ?? (() => defaultRestart(log));
-  restart();
-
-  return {
-    updated: true,
-    oldSha: currentSha,
-    newSha: dlSha,
-  };
 }
 
 // Exported for tests / future tooling.

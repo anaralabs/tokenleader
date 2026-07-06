@@ -20,9 +20,12 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 LABEL="sh.anara.leaderboard"
+WATCHDOG_LABEL="${LABEL}.watchdog"
 DOMAIN="gui/$(id -u)"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+WATCHDOG_PLIST="$HOME/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"
 BIN="$HOME/.local/bin/anara-leaderboard"
+BIN_WATCHDOG="$BIN.watchdog"
 STATE_DIR="$HOME/.local/share/anara-leaderboard"
 LOG_DIR="$HOME/Library/Logs/anara-leaderboard"
 SECRET_FILE="$STATE_DIR/secret"
@@ -81,7 +84,17 @@ notify_server_uninstall() {
 }
 notify_server_uninstall
 
-# --- stop the agent --------------------------------------------------------
+# --- stop the agents -------------------------------------------------------
+# Watchdog FIRST: its boot-time self-heal re-bootstraps an absent daemon
+# label, so booting the daemon out first invites a resurrection race.
+# Pre-v0.6.0 installs have no watchdog — absence of each is fine.
+info "Stopping watchdog LaunchAgent (if running)..."
+if launchctl bootout "$DOMAIN/$WATCHDOG_LABEL" 2>/dev/null; then
+  ok  "Booted out $WATCHDOG_LABEL."
+else
+  info "$WATCHDOG_LABEL was not loaded (pre-v0.6.0 install, or already gone)."
+fi
+
 info "Stopping LaunchAgent (if running)..."
 if launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null; then
   ok  "Booted out $LABEL."
@@ -89,7 +102,14 @@ else
   warn "$LABEL was not loaded (or bootout failed); continuing."
 fi
 
-# --- remove plist + binary -------------------------------------------------
+# --- remove plists + binary ------------------------------------------------
+if [ -f "$WATCHDOG_PLIST" ]; then
+  rm -f "$WATCHDOG_PLIST"
+  ok "Removed $WATCHDOG_PLIST"
+else
+  info "No plist at $WATCHDOG_PLIST"
+fi
+
 if [ -f "$PLIST" ]; then
   rm -f "$PLIST"
   ok "Removed $PLIST"
@@ -102,6 +122,19 @@ if [ -f "$BIN" ]; then
   ok "Removed $BIN"
 else
   info "No binary at $BIN"
+fi
+
+# The .watchdog hardlink shares the daemon binary's inode; remove it too or
+# the watchdog's plist would keep a runnable copy alive after uninstall.
+if [ -f "$BIN_WATCHDOG" ]; then
+  rm -f "$BIN_WATCHDOG"
+  ok "Removed $BIN_WATCHDOG"
+fi
+
+# The CLI-name symlink the installer (or daemon) created beside the binary.
+if [ -L "$HOME/.local/bin/tokenleader" ]; then
+  rm -f "$HOME/.local/bin/tokenleader"
+  ok "Removed $HOME/.local/bin/tokenleader"
 fi
 
 # --- prompt about state/logs ----------------------------------------------

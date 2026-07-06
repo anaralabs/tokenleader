@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -67,5 +67,34 @@ describe("scripts/uninstall.sh", () => {
     const r = spawnSync("bash", ["-n", SCRIPT], { encoding: "utf8" });
     expect(r.stderr).toBe("");
     expect(r.status).toBe(0);
+  });
+
+  // Static assertions only for the launchctl/rm tail: executing it would
+  // bootout the REAL labels in the developer's gui/$UID domain.
+  test("boots out the watchdog label first, then the daemon", () => {
+    // Watchdog first: its boot-time self-heal re-bootstraps an absent
+    // daemon label — daemon-first invites a resurrection race. Must also
+    // tolerate pre-v0.6.0 machines where no watchdog exists at all.
+    const body = readFileSync(SCRIPT, "utf8");
+    expect(body).toContain('WATCHDOG_LABEL="${LABEL}.watchdog"');
+    const wdBootout = body.indexOf('launchctl bootout "$DOMAIN/$WATCHDOG_LABEL"');
+    const daemonBootout = body.indexOf('launchctl bootout "$DOMAIN/$LABEL"');
+    expect(wdBootout).toBeGreaterThan(0);
+    expect(daemonBootout).toBeGreaterThan(wdBootout);
+    expect(body).toContain("pre-v0.6.0 install, or already gone");
+  });
+
+  test("removes both plists, the .watchdog hardlink and the tokenleader symlink", () => {
+    const body = readFileSync(SCRIPT, "utf8");
+    expect(body).toContain('WATCHDOG_PLIST="$HOME/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"');
+    expect(body).toContain('BIN_WATCHDOG="$BIN.watchdog"');
+    expect(body).toContain('rm -f "$WATCHDOG_PLIST"');
+    expect(body).toContain('rm -f "$PLIST"');
+    expect(body).toContain('rm -f "$BIN"');
+    expect(body).toContain('rm -f "$BIN_WATCHDOG"');
+    // Symlink removal is guarded: only ever an actual symlink, never a
+    // real file that owns the name.
+    expect(body).toContain('if [ -L "$HOME/.local/bin/tokenleader" ]; then');
+    expect(body).toContain('rm -f "$HOME/.local/bin/tokenleader"');
   });
 });

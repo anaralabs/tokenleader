@@ -29,6 +29,10 @@ export interface TickDeps {
   stateDir: string;
   transport: TransportOpts;
   signal?: AbortSignal;
+  // Liveness progress hook, fired between per-file parses so a long scan
+  // (fresh-install replay) keeps the heartbeat moving; per-batch progress
+  // during the POST rides transport.onProgress (docs/resilience.md).
+  progress?: () => void;
 
   // Test seams. Real callers leave these undefined.
   listClaudeCodeFiles?: typeof listClaudeCodeFiles;
@@ -206,6 +210,11 @@ export async function tick(
   let cloudReady = false;
   if (hasCursorToken) {
     try {
+      // Bracket the cloud walk with progress: its worst legitimate case
+      // (25 pages × 30s timeout ≈ 12.5 min) stays under the watchdog's
+      // 16-min awake-staleness threshold, so interior page hooks aren't
+      // needed — but the heartbeat must be fresh going in.
+      deps.progress?.();
       const cloud = await fetchCloud({
         user: deps.user,
         stateDir: deps.stateDir,
@@ -234,6 +243,7 @@ export async function tick(
         }
         collectDeduped(cloud.events, collected, seenThisTick);
       }
+      deps.progress?.();
     } catch (err: unknown) {
       log.error("cursor_cloud_fetch_failed", {
         err: String((err as Error)?.message ?? err),
@@ -242,8 +252,16 @@ export async function tick(
   }
   const cursorLocalEnabled = cursorEnabled && !cloudReady;
 
+  let scannedSinceProgress = 0;
   for (const item of allPaths) {
     if (deps.signal?.aborted) break;
+
+    // Keep the heartbeat moving through a long scan — a fresh install
+    // replaying thousands of files must never look wedged to the watchdog.
+    if (++scannedSinceProgress >= 200) {
+      scannedSinceProgress = 0;
+      deps.progress?.();
+    }
 
     // Cloud Cursor already covered this user's transcript usage this tick;
     // skip parsing to avoid double-counting. The path is still in presentSet

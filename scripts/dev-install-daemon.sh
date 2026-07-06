@@ -41,6 +41,15 @@ xattr -cr "$tmp" 2>/dev/null || true
 mv -f "$tmp" "$BIN_DST"
 xattr -cr "$BIN_DST" 2>/dev/null || true
 
+# Keep the v0.6.0 watchdog pair converged: mv gave $BIN_DST a NEW inode, so
+# the .watchdog hardlink must be re-pointed or the watchdog label keeps
+# executing the old binary. This script stays daemon-only otherwise — it
+# never touches the watchdog label, so a live watchdog isn't fought (its
+# heartbeat-identity rule protects the fresh daemon; the "already loaded"
+# tolerance below absorbs a watchdog that re-bootstrapped the daemon during
+# the bootout window).
+ln -f "$BIN_DST" "$BIN_DST.watchdog" 2>/dev/null || true
+
 if [ ! -e "$HOME/.local/bin/tokenleader" ] || [ -L "$HOME/.local/bin/tokenleader" ]; then
   ln -sfn "$BIN_DST" "$HOME/.local/bin/tokenleader"
 fi

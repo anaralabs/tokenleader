@@ -9,6 +9,72 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [0.6.0] - 2026-07-06
+
+The "Never Silent" release. Root cause: a production daemon spent two days
+alive-but-wedged after macOS DarkWake churn killed the Bun runtime's timer
+subsystem — no exit for KeepAlive to respawn, no phone-home for directives to
+ride. v0.6.0 makes silent death structurally impossible: liveness is now
+enforced from OUTSIDE the process, on launchd's clock. Full design, thresholds,
+and failure-mode coverage: `docs/resilience.md`.
+
+### Added
+- **Watchdog LaunchAgent pair.** A second label
+  (`sh.anara.leaderboard.watchdog`, StartInterval 120s, never KeepAlive) runs
+  the same binary as a one-shot checker: alive for seconds, structurally
+  immune to the timer wedge. It stats a heartbeat file; "unchanged across 8
+  consecutive firings" ≈ 16 minutes of awake time (StartInterval never fires
+  during sleep — the staleness clock is launchd itself, no clock arithmetic).
+  Escalation: forensics (native `sample`, launchctl snapshot, log tail —
+  captured BEFORE any signal) → SIGTERM → SIGKILL → KeepAlive respawns.
+  Identity-anchored: only the pid recorded in the heartbeat, and only while
+  launchd reports that same pid live, is ever signaled — PID reuse and
+  rolled-back daemons are unkillable by construction. A respawn-churn fuse
+  (≥3 unexplained respawns / 90 min) latches a degraded state that alarms
+  instead of kill-looping. The daemon self-installs the watchdog on boot; the
+  plist runs a hardlink (`anara-leaderboard.watchdog`) so the watchdog
+  survives daemon-binary loss and pre-watchdog rollbacks.
+- **Heartbeat + exit journal.** The daemon writes `heartbeat.json` at every
+  progress boundary (tick start/end, per 200 files scanned, per batch POST)
+  and explains every deliberate exit in `exit-journal.jsonl` — update swaps
+  and restarts are never misread as crash loops, and a boot with no journal
+  entry exposes the silent-exit class in the next checkin.
+- **Second phone-home channel.** Every watchdog run POSTs a ~200B
+  `/watchdog-checkin` via curl and executes directives from the response
+  (`restart`, `upload_logs`, `sample`, `upload_state`, `reinstall_watchdog`)
+  — remote heal no longer requires the patient to be alive.
+- **Unconditional status checkins.** `/checkin` now fires after every tick
+  (success, quiet, or failure) with a status body: uptime, tick sequence,
+  consecutive failures, last error, last update result, drift, exit-journal
+  tail. Sick-but-alive daemons (403 loops, parse loops) are no longer
+  server-dark exactly when it matters.
+- **Directive lifecycle.** Directives are per-device and complete on an
+  executed-ack, not at handout — un-acked directives re-queue, closing the
+  "update swap eats the directive" hole. Fleet classification
+  (healthy / late / wedged / crash-looping / degraded / dark / uninstalled),
+  per-device forensics storage, failed-auth traces, and optional Slack
+  alerting (`TOKENLEADER_ALERT_WEBHOOK`) land server-side.
+- **In-process hardening.** Clock-drift exit (a grossly late inter-tick sleep
+  is the wedge precursor → journaled exit(75), fresh process), 7-day
+  jittered process recycling, first update check moved before the first tick
+  (a boot-crasher gets a self-update window).
+
+### Changed
+- Updates keep `<execPath>.prev` via hardlink (created before the single
+  atomic rename — there is never a moment without a complete binary) and
+  write an `update_in_progress` marker that widens the watchdog's deadline
+  to 45 minutes so slow-link downloads are never killed mid-transfer.
+- Installer registers both labels with the same enable → bootstrap → verify
+  ladder; uninstaller (including the server-rendered one) tears down both.
+- CI's release guard runs with `TOKENLEADER_WATCHDOG_DISABLED=1` — the gate
+  exercises the update path, never the runner's launchd.
+
+### Fixed
+- The 2026-07-06 incident class: a wedged daemon is now detected in ≤ ~18
+  minutes and revived automatically, with the forensic evidence (the same
+  `sample` output that diagnosed the original incident) captured and shipped
+  to the server before the kill.
+
 ## [0.5.9] - 2026-07-02
 
 The stability release: observable, remotely recoverable, and unlosable.

@@ -13,14 +13,16 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/plist-templates.sh"
 
 LABEL="sh.anara.leaderboard"
+WATCHDOG_LABEL="${LABEL}.watchdog"
 DOMAIN="gui/$(id -u)"
 LOG_DIR="$HOME/Library/Logs/anara-leaderboard"
 STDERR_LOG="$LOG_DIR/stderr.log"
 STDOUT_LOG="$LOG_DIR/stdout.log"
 BIN_DST="$HOME/.local/bin/anara-leaderboard"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+WATCHDOG_PLIST="$HOME/Library/LaunchAgents/${WATCHDOG_LABEL}.plist"
 BIN_SRC="$REPO_DIR/bin/anara-leaderboard"
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 
 # --- color setup ----------------------------------------------------------
 if [ -t 1 ]; then
@@ -312,6 +314,30 @@ do_codesign() {
   step_ok
 }
 
+# --- launchctl registration discipline -------------------------------------
+# Shared by the daemon and watchdog labels. launchctl bootout is ASYNC:
+# bootstrapping too soon fails with "service already loaded", so wait for the
+# old instance to disappear, then enable + bootstrap with retries. The final
+# verdict is `launchctl print` (is the job loaded?), NOT bootstrap's exit
+# code — a mid-retry "already loaded" IS success, which keeps re-runs over
+# half-installed states idempotent. All targets pinned to gui/$UID.
+register_launch_agent() {
+  # register_launch_agent <label> <plist-path>
+  local label="$1"
+  local plist="$2"
+  launchctl bootout "$DOMAIN/$label" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "$DOMAIN/$label" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  launchctl enable "$DOMAIN/$label" 2>/dev/null || true
+  for _i in 1 2 3 4 5; do
+    if launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  launchctl print "$DOMAIN/$label" >/dev/null 2>&1
+}
+
 # --- step 4: launchagent --------------------------------------------------
 write_plist_and_register() {
   step_start 4 "Registering LaunchAgent"
@@ -320,21 +346,45 @@ write_plist_and_register() {
   if ! plutil -lint "$PLIST" >/dev/null 2>&1; then
     step_fail "generated plist failed plutil -lint (see $PLIST)"
   fi
-  launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-  launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
-  if ! launchctl bootstrap "$DOMAIN" "$PLIST" 2>/dev/null; then
+  if ! register_launch_agent "$LABEL" "$PLIST"; then
     step_fail "launchctl bootstrap failed (run 'launchctl bootstrap $DOMAIN $PLIST' for the error)"
   fi
   launchctl kickstart -k "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
   step_ok
 }
 
-# --- step 5: start daemon -------------------------------------------------
+# --- step 5: watchdog launchagent ------------------------------------------
+# Second half of the v0.6.0 "Never Silent" watchdog pair (docs/resilience.md).
+# The plist points at a HARDLINK of the daemon binary so a deleted or
+# rolled-back daemon binary can't take the watchdog down with it. Same
+# registration discipline as the daemon label; a registration failure is a
+# warning, not a failure — the daemon re-registers the watchdog at every
+# boot and the server queues reinstall_watchdog for devices that stay silent.
+write_watchdog_plist_and_register() {
+  step_start 5 "Registering watchdog"
+  # Same filesystem as $BIN_DST by construction; -f replaces a stale link.
+  if ! ln -f "$BIN_DST" "$BIN_DST.watchdog" 2>/dev/null; then
+    step_warn "couldn't hardlink $BIN_DST.watchdog (daemon retries at every boot)"
+    return 0
+  fi
+  render_watchdog_plist "$HOME" > "$WATCHDOG_PLIST"
+  chmod 600 "$WATCHDOG_PLIST"
+  if ! plutil -lint "$WATCHDOG_PLIST" >/dev/null 2>&1; then
+    step_fail "generated watchdog plist failed plutil -lint (see $WATCHDOG_PLIST)"
+  fi
+  if register_launch_agent "$WATCHDOG_LABEL" "$WATCHDOG_PLIST"; then
+    step_ok
+  else
+    step_warn "watchdog not registered (daemon retries at every boot; try 'launchctl print $DOMAIN/$WATCHDOG_LABEL')"
+  fi
+}
+
+# --- step 6: start daemon -------------------------------------------------
 # Confirm the daemon process is running; don't block on the first sync.
 # A heavy CC user with 100k+ historical events takes 10-60s to scan and
 # POST — fine to do in background. The dashboard fills in within seconds.
 wait_for_first_tick() {
-  step_start 5 "Starting daemon"
+  step_start 6 "Starting daemon"
   launchctl kickstart -k "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
 
   local deadline=$(( $(date +%s) + 5 ))
@@ -415,5 +465,6 @@ prompt_endpoint
 do_build
 do_codesign
 write_plist_and_register
+write_watchdog_plist_and_register
 wait_for_first_tick
 print_summary
