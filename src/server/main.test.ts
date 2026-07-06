@@ -3280,3 +3280,257 @@ describe("category filter (?category=)", () => {
     }
   });
 });
+
+// ----- v0.6 "Never Silent": fleet classification, auth-failure trace, -------
+// admin mark-uninstalled (docs/resilience.md, server half). Each block runs
+// on its own app+DB so backdated device timestamps can't leak between suites.
+
+describe("fleet classification in /stats/fleet (v0.6)", () => {
+  const SECRET = "fleet-state-secret";
+  let built: ReturnType<typeof createTestApp>;
+
+  beforeAll(async () => {
+    built = createTestApp();
+    const res = await built.app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-tokenleader-secret": SECRET,
+          "x-tokenleader-device": "walts-mbp",
+          "x-tokenleader-version": "v0.6.0",
+        },
+        body: JSON.stringify({ events: [makeEvent({ user: "walt", messageId: "fleet-walt" })] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  afterAll(async () => {
+    await built.cleanup();
+  });
+
+  function setTimes(lastSeen: number | null, watchdogLastSeen: number | null): void {
+    built.store.db
+      .prepare("UPDATE user_devices SET last_seen = ?, watchdog_last_seen = ? WHERE username = ?")
+      .run(lastSeen, watchdogLastSeen, "walt");
+  }
+
+  async function waltDevice(): Promise<{
+    state: string;
+    lastSeen: number | null;
+    watchdogLastSeen: number | null;
+  }> {
+    const body = await jsonOf<{ fleet: Array<{ user: string; devices: any[] }> }>(
+      await built.app.request(new Request("http://x/stats/fleet")),
+    );
+    return body.fleet.find((f) => f.user === "walt")!.devices[0];
+  }
+
+  test("fresh device renders HEALTHY with a null watchdogLastSeen (pre-watchdog)", async () => {
+    const dev = await waltDevice();
+    expect(dev.state).toBe("HEALTHY");
+    expect(dev.watchdogLastSeen).toBeNull();
+  });
+
+  test("version-aware: 45min silence is LATE without a watchdog, WEDGED with one", async () => {
+    const now = Date.now();
+    setTimes(now - 45 * 60_000, null);
+    expect((await waltDevice()).state).toBe("LATE");
+
+    setTimes(now - 45 * 60_000, now - 2 * 60_000);
+    const dev = await waltDevice();
+    expect(dev.state).toBe("WEDGED");
+    expect(dev.watchdogLastSeen).toBe(now - 2 * 60_000);
+  });
+
+  test("dual-channel silence past an hour is DARK; a pre-0.6 device needs a day", async () => {
+    const now = Date.now();
+    setTimes(now - 3 * 3_600_000, now - 2 * 3_600_000);
+    expect((await waltDevice()).state).toBe("DARK");
+
+    // Same daemon silence with NO watchdog history: still LATE (sleep is
+    // indistinguishable from death on one channel).
+    setTimes(now - 3 * 3_600_000, null);
+    expect((await waltDevice()).state).toBe("LATE");
+    setTimes(now - 25 * 3_600_000, null);
+    expect((await waltDevice()).state).toBe("DARK");
+  });
+});
+
+describe("failed-auth trace (/admin/auth-failures)", () => {
+  const ADMIN = "auth-trace-admin";
+  const SECRET = "auth-trace-secret";
+  let built: ReturnType<typeof createTestApp>;
+
+  beforeAll(async () => {
+    built = createTestApp({ adminToken: ADMIN });
+    const res = await built.app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tokenleader-secret": SECRET },
+        body: JSON.stringify({ events: [makeEvent({ user: "zara", messageId: "auth-zara" })] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  afterAll(async () => {
+    await built.cleanup();
+  });
+
+  const failures = async (qs = "") =>
+    (
+      await jsonOf<{
+        failures: Array<{
+          username: string;
+          device_label: string | null;
+          route: string;
+          ts: number;
+        }>;
+      }>(
+        await built.app.request(
+          new Request(`http://x/admin/auth-failures${qs}`, {
+            headers: { authorization: `Bearer ${ADMIN}` },
+          }),
+        ),
+      )
+    ).failures;
+
+  test("403s on the reporting routes leave a trace with route + claimed device label", async () => {
+    // /checkin with a rotated-away secret and a device header.
+    const checkin = await built.app.request(
+      new Request("http://x/checkin", {
+        method: "POST",
+        headers: {
+          "x-tokenleader-secret": "lost-tofu-secret",
+          "x-tokenleader-user": "zara",
+          "x-tokenleader-device": "zaras-mbp",
+        },
+      }),
+    );
+    expect(checkin.status).toBe(403);
+
+    // /ingest secret mismatch for a claimed handle.
+    const ingest = await built.app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tokenleader-secret": "wrong" },
+        body: JSON.stringify({ events: [makeEvent({ user: "zara", messageId: "auth-zara-2" })] }),
+      }),
+    );
+    expect(ingest.status).toBe(403);
+
+    // /watchdog-checkin and /diag/logs too.
+    for (const [route, init] of [
+      ["/watchdog-checkin", {}],
+      ["/diag/logs", { body: "tail" }],
+    ] as const) {
+      const res = await built.app.request(
+        new Request(`http://x${route}`, {
+          method: "POST",
+          headers: { "x-tokenleader-secret": "wrong", "x-tokenleader-user": "zara" },
+          ...init,
+        }),
+      );
+      expect(res.status).toBe(403);
+    }
+
+    const rows = await failures("?user=zara");
+    expect(rows.length).toBe(4);
+    expect(rows.map((r) => r.route).sort()).toEqual([
+      "/checkin",
+      "/diag/logs",
+      "/ingest",
+      "/watchdog-checkin",
+    ]);
+    const checkinRow = rows.find((r) => r.route === "/checkin")!;
+    expect(checkinRow.device_label).toBe("zaras-mbp");
+    expect(checkinRow.ts).toBeGreaterThan(Date.now() - 10_000);
+  });
+
+  test("successful auth adds nothing; ?user= filters; route is admin-gated", async () => {
+    const ok = await built.app.request(
+      new Request("http://x/checkin", {
+        method: "POST",
+        headers: { "x-tokenleader-secret": SECRET, "x-tokenleader-user": "zara" },
+      }),
+    );
+    expect(ok.status).toBe(200);
+    expect((await failures("?user=zara")).length).toBe(4); // unchanged
+
+    expect((await failures("?user=someone-else")).length).toBe(0);
+    expect((await failures()).length).toBe(4);
+
+    const noAuth = await built.app.request(new Request("http://x/admin/auth-failures"));
+    expect(noAuth.status).toBe(401);
+  });
+});
+
+describe("POST /admin/mark-uninstalled", () => {
+  const ADMIN = "mark-admin-tok";
+  const SECRET = "uma-machine-secret";
+  let built: ReturnType<typeof createTestApp>;
+
+  beforeAll(async () => {
+    built = createTestApp({ adminToken: ADMIN });
+    const res = await built.app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tokenleader-secret": SECRET },
+        body: JSON.stringify({ events: [makeEvent({ user: "uma", messageId: "mark-uma" })] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+  });
+
+  afterAll(async () => {
+    await built.cleanup();
+  });
+
+  const mark = (user: string, auth = true) =>
+    built.app.request(
+      new Request("http://x/admin/mark-uninstalled", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          ...(auth ? { authorization: `Bearer ${ADMIN}` } : {}),
+        },
+        body: JSON.stringify({ user }),
+      }),
+    );
+
+  test("revokes devices, sets the uninstalled flag, and drops the user from the fleet", async () => {
+    const res = await mark("uma");
+    expect(res.status).toBe(200);
+    const body = await jsonOf<{ ok: boolean; uninstalledAt: number }>(res);
+    expect(body.ok).toBe(true);
+    expect(body.uninstalledAt).toBeGreaterThan(0);
+
+    expect(built.store.listUserDevices("uma")).toEqual([]);
+    expect(built.store.listUninstalledUsers().map((u) => u.user)).toContain("uma");
+    const fleet = await jsonOf<{ fleet: Array<{ user: string }> }>(
+      await built.app.request(new Request("http://x/stats/fleet")),
+    );
+    expect(fleet.fleet.find((f) => f.user === "uma")).toBeUndefined();
+  });
+
+  test("a wiped machine's handle stays reclaimable by a fresh install", async () => {
+    // Non-barred revocation: the same invariant the uninstall script leaves
+    // (uninstalled_at set + no active devices → TOFU re-claim allowed).
+    const res = await built.app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-tokenleader-secret": "uma-fresh" },
+        body: JSON.stringify({ events: [makeEvent({ user: "uma", messageId: "mark-uma-2" })] }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect(built.store.listUserDevices("uma").length).toBe(1);
+  });
+
+  test("unknown user 404; missing bearer 401", async () => {
+    expect((await mark("nobody-at-all")).status).toBe(404);
+    expect((await mark("uma", false)).status).toBe(401);
+  });
+});
