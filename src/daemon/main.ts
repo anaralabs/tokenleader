@@ -560,7 +560,7 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
         ack: async (result, detail) => {
           await postDirectiveAck(
             cfg.user,
-            { id: d.id, result, ...(detail ? { detail } : {}), executedBy: "daemon" },
+            { id: d.id, result, ...(detail ? { detail } : {}), executed_by: "daemon" },
             transport,
             ac.signal,
           );

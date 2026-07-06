@@ -60,7 +60,7 @@ export interface DirectiveAck {
   id: number;
   result: "ok" | "failed";
   detail?: string;
-  executedBy: "daemon" | "watchdog";
+  executed_by: "daemon" | "watchdog";
 }
 
 /**

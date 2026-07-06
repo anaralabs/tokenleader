@@ -1619,14 +1619,14 @@ export function buildApp(opts: BuildOptions) {
     if (b.result !== "ok" && b.result !== "failed") {
       return c.json({ error: "body.result must be 'ok' | 'failed'" }, 400);
     }
-    if (b.executedBy !== "daemon" && b.executedBy !== "watchdog") {
-      return c.json({ error: "body.executedBy must be 'daemon' | 'watchdog'" }, 400);
+    if (b.executed_by !== "daemon" && b.executed_by !== "watchdog") {
+      return c.json({ error: "body.executed_by must be 'daemon' | 'watchdog'" }, 400);
     }
     const detail = typeof b.detail === "string" ? b.detail.slice(0, ACK_DETAIL_MAX_CHARS) : null;
     const r = store.ackDirective(
       user,
       b.id,
-      { result: b.result, detail, executedBy: b.executedBy },
+      { result: b.result, detail, executedBy: b.executed_by },
       Date.now(),
     );
     if (r === null) {

@@ -733,7 +733,7 @@ function executeWatchdogDirective(
         "X-Tokenleader-User": ctx.user,
         ...(ctx.device ? { "X-Tokenleader-Device": ctx.device } : {}),
       },
-      { id: directive.id, result, detail: detail.slice(0, 300), executedBy: "watchdog" },
+      { id: directive.id, result, detail: detail.slice(0, 300), executed_by: "watchdog" },
     );
   }
 }

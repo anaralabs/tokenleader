@@ -374,7 +374,7 @@ describe("executed-ack lifecycle (/directives/ack)", () => {
     expect(row.executed_at).toBeNull();
 
     const ack = await app.request(
-      ackReq("quinn", SECRET, { id, result: "ok", executedBy: "daemon", detail: "restarted" }),
+      ackReq("quinn", SECRET, { id, result: "ok", executed_by: "daemon", detail: "restarted" }),
     );
     expect(ack.status).toBe(200);
     expect((await jsonOf(ack)).duplicate).toBe(false);
@@ -388,7 +388,7 @@ describe("executed-ack lifecycle (/directives/ack)", () => {
 
     // Replayed ack: idempotent, first write stands.
     const replay = await jsonOf(
-      await app.request(ackReq("quinn", SECRET, { id, result: "failed", executedBy: "watchdog" })),
+      await app.request(ackReq("quinn", SECRET, { id, result: "failed", executed_by: "watchdog" })),
     );
     expect(replay.ok).toBe(true);
     expect(replay.duplicate).toBe(true);
@@ -401,29 +401,29 @@ describe("executed-ack lifecycle (/directives/ack)", () => {
     await app.request(checkinReq("rene", SECRET));
 
     expect(
-      (await app.request(ackReq("rene", "intruder", { id, result: "ok", executedBy: "daemon" })))
+      (await app.request(ackReq("rene", "intruder", { id, result: "ok", executed_by: "daemon" })))
         .status,
     ).toBe(403);
     // Another user cannot ack rene's directive even with valid auth.
     await claim("sana", SECRET);
     expect(
-      (await app.request(ackReq("sana", SECRET, { id, result: "ok", executedBy: "daemon" })))
+      (await app.request(ackReq("sana", SECRET, { id, result: "ok", executed_by: "daemon" })))
         .status,
     ).toBe(404);
     expect(
       (
         await app.request(
-          ackReq("rene", SECRET, { id: 999_999, result: "ok", executedBy: "daemon" }),
+          ackReq("rene", SECRET, { id: 999_999, result: "ok", executed_by: "daemon" }),
         )
       ).status,
     ).toBe(404);
     expect((await app.request(ackReq("rene", SECRET, "{{{not json"))).status).toBe(400);
     expect(
-      (await app.request(ackReq("rene", SECRET, { id, result: "shrug", executedBy: "daemon" })))
+      (await app.request(ackReq("rene", SECRET, { id, result: "shrug", executed_by: "daemon" })))
         .status,
     ).toBe(400);
     expect(
-      (await app.request(ackReq("rene", SECRET, { id, result: "ok", executedBy: "cron" }))).status,
+      (await app.request(ackReq("rene", SECRET, { id, result: "ok", executed_by: "cron" }))).status,
     ).toBe(400);
   });
 });
