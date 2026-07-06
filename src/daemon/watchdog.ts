@@ -32,14 +32,21 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, hostname } from "node:os";
 import path from "node:path";
 import type { WatchdogCheckinBody } from "../types";
 import { BUILD_VERSION } from "./build-info";
 import { parsePlistEnv } from "./cli";
 import { endpointOverridePath, isAcceptableEndpoint, normalizeEndpoint } from "./endpoint-override";
-import { readHeartbeat, readJournal, readUpdateMarker, UPDATE_MARKER_IGNORE_MS } from "./heartbeat";
+import {
+  readHeartbeat,
+  readJournal,
+  readUpdateMarker,
+  UPDATE_GRACE_MS,
+  UPDATE_MARKER_IGNORE_MS,
+} from "./heartbeat";
 import type { Logger } from "./log";
+import { deviceLabelFromHost } from "./transport";
 
 export const DAEMON_LABEL = "sh.anara.leaderboard";
 export const WATCHDOG_LABEL = "sh.anara.leaderboard.watchdog";
@@ -52,8 +59,9 @@ export const STALE_RUNS_MIN = 8;
 export function staleRunsFor(tickIntervalSec: number): number {
   return Math.max(STALE_RUNS_MIN, Math.ceil((3 * tickIntervalSec) / WATCHDOG_INTERVAL_SEC));
 }
-// Update grace: a fresh update marker widens the deadline to ~45 min.
-export const UPDATE_GRACE_RUNS = Math.ceil((45 * 60) / WATCHDOG_INTERVAL_SEC);
+// Update grace: a fresh update marker widens the deadline (single-sourced
+// from the marker's own constant so the two sides can't drift).
+export const UPDATE_GRACE_RUNS = Math.ceil(UPDATE_GRACE_MS / 1000 / WATCHDOG_INTERVAL_SEC);
 
 // Fuse (respawns, not kills — kill-based fuses are dead code at ≥17-min kill
 // spacing): ≥3 unexplained daemon respawns inside 90 min without heartbeat
@@ -86,6 +94,11 @@ export interface WatchdogState {
   termedPid: number | null;
   /** Label pid observed last run (respawn detection). */
   lastLabelPid: number | null;
+  /** Heartbeat author pid observed last run — respawn evidence that survives
+   *  label-pid sampling gaps (every boot writes a heartbeat immediately). */
+  lastHbPid: number | null;
+  /** Wall ts of our previous firing (anchors the journal-explain window). */
+  lastRunAt: number | null;
   /** Timestamps of unexplained respawns (pruned to FUSE_WINDOW_MS). */
   respawns: number[];
   /** Timestamps of our kills (reporting only). */
@@ -103,6 +116,8 @@ export function emptyWatchdogState(): WatchdogState {
     freshSince: null,
     termedPid: null,
     lastLabelPid: null,
+    lastHbPid: null,
+    lastRunAt: null,
     respawns: [],
     kills: [],
     degraded: false,
@@ -120,14 +135,16 @@ export function loadWatchdogState(stateDir: string): { state: WatchdogState; cor
     const raw = readFileSync(path.join(stateDir, WATCHDOG_STATE_FILE), "utf8");
     const v = JSON.parse(raw) as WatchdogState;
     if (v.schema !== 1 || typeof v.consecUnchanged !== "number") throw new Error("schema");
+    // Fields added after 0.6.0 ship as absent in older state files — not
+    // corruption, just a younger writer.
+    v.lastHbPid ??= null;
+    v.lastRunAt ??= null;
     return { state: v, corrupt: false };
   } catch (err: unknown) {
     const missing =
       (err as NodeJS.ErrnoException)?.code === "ENOENT" ||
       String((err as Error)?.message).includes("no such file");
-    const state = emptyWatchdogState();
-    if (!missing) state.consecUnchanged = 1;
-    return { state, corrupt: !missing };
+    return { state: emptyWatchdogState(), corrupt: !missing };
   }
 }
 
@@ -184,6 +201,27 @@ export interface WatchdogDeps {
 // the daemon's own boot precedence. A machine where none of that exists is
 // an uninstall remnant — see selfCleanIfUninstalled.
 
+/**
+ * The watchdog's stateDir mirrors the DAEMON's resolution: its own plist
+ * carries no TOKENLEADER_* env, so a custom TOKENLEADER_STATE_DIR in the
+ * daemon plist must be honored here too or the two processes would watch
+ * different heartbeat files.
+ */
+export function resolveWatchdogStateDir(env: NodeJS.ProcessEnv, home: string): string {
+  if (env.TOKENLEADER_STATE_DIR?.trim()) return env.TOKENLEADER_STATE_DIR.trim();
+  try {
+    const plist = readFileSync(
+      path.join(home, "Library", "LaunchAgents", `${DAEMON_LABEL}.plist`),
+      "utf8",
+    );
+    const fromPlist = parsePlistEnv(plist).TOKENLEADER_STATE_DIR;
+    if (fromPlist?.trim()) return fromPlist.trim();
+  } catch {
+    // no daemon plist — default below
+  }
+  return path.join(home, ".local", "share", "anara-leaderboard");
+}
+
 export interface WatchdogContext {
   user: string | null;
   endpoint: string | null;
@@ -222,7 +260,7 @@ export function resolveWatchdogContext(deps: WatchdogDeps): WatchdogContext {
   }
   const execPath = path.join(home, ".local", "bin", "anara-leaderboard");
   const tickIntervalSec = Number.parseInt(plistEnv.TOKENLEADER_INTERVAL_SEC ?? "", 10) || 300;
-  const device = deviceLabel();
+  const device = deviceLabelFromHost(hostname()) ?? null;
   return {
     user,
     endpoint: endpoint ? endpoint.replace(/\/+$/, "") : null,
@@ -232,21 +270,6 @@ export function resolveWatchdogContext(deps: WatchdogDeps): WatchdogContext {
     tickIntervalSec,
     daemonPlistPath,
   };
-}
-
-function deviceLabel(): string | null {
-  try {
-    const host = spawnSync("hostname", ["-s"], { encoding: "utf8", timeout: 3000 }).stdout ?? "";
-    const s = host
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 32);
-    return s.length > 0 ? s : null;
-  } catch {
-    return null;
-  }
 }
 
 // --- launchd introspection ---------------------------------------------------
@@ -259,7 +282,7 @@ export function labelPid(exec: Exec, uid: number, label: string): number | null 
   return m ? Number.parseInt(m[1]!, 10) : null;
 }
 
-function labelLoaded(exec: Exec, uid: number, label: string): boolean {
+export function labelLoaded(exec: Exec, uid: number, label: string): boolean {
   return exec("launchctl", ["print", `gui/${uid}/${label}`]).ok;
 }
 
@@ -310,29 +333,54 @@ export async function runWatchdog(deps: WatchdogDeps): Promise<WatchdogRunResult
   const daemonPid = labelPid(exec, uid, DAEMON_LABEL);
   let action: WatchdogRunResult["action"] = "observe";
 
-  // Respawn accounting for the fuse (pid change since last run, unexplained
-  // by the exit journal).
-  if (daemonPid !== null && state.lastLabelPid !== null && daemonPid !== state.lastLabelPid) {
-    // The exit that produced this pid change happened somewhere since our
-    // previous firing; a journal entry inside that window (plus slop for a
-    // slow respawn) marks it deliberate.
-    const windowMs = WATCHDOG_INTERVAL_SEC * 1000 + JOURNAL_EXPLAIN_SLOP_MS;
-    const explained = readJournal(deps.stateDir).some((e) => now() - e.ts < windowMs);
-    if (!explained) state.respawns.push(now());
+  // Respawn accounting for the fuse. Evidence comes from BOTH the heartbeat
+  // pid (every boot writes one immediately, so this survives sampling gaps —
+  // a crash-looper that lives 10s is invisible to 120s label-pid samples but
+  // never to its own boot writes) and label-pid changes across two live
+  // samples. A journal entry since our previous firing marks it deliberate.
+  const journalSince = state.lastRunAt ?? now() - WATCHDOG_INTERVAL_SEC * 1000;
+  const explained = readJournal(deps.stateDir).some(
+    (e) => e.ts >= journalSince - JOURNAL_EXPLAIN_SLOP_MS,
+  );
+  const hbPidChanged = hb !== null && state.lastHbPid !== null && hb.pid !== state.lastHbPid;
+  const labelPidChanged =
+    daemonPid !== null && state.lastLabelPid !== null && daemonPid !== state.lastLabelPid;
+  if ((hbPidChanged || labelPidChanged) && !explained) {
+    state.respawns.push(now());
   }
   state.lastLabelPid = daemonPid;
+  if (hb) state.lastHbPid = hb.pid;
+  state.lastRunAt = now();
   state.respawns = state.respawns.filter((t) => now() - t < FUSE_WINDOW_MS);
 
+  const staleThresholdRuns = staleRunsFor(ctx.tickIntervalSec);
   const sig = hb ? `${hb.tick_seq}:${hb.wall_ms}:${hb.pid}` : null;
-  if (sig === null) {
+  if (corrupt && sig !== null) {
+    // Fail closed toward detection: a corrupt counter file counts as one
+    // stale observation already recorded — the compare below must not run
+    // (it would see a "changed" sig and erase the observation).
+    state.lastSig = sig;
+    state.consecUnchanged = 1;
+  } else if (sig === null) {
     // Missing/corrupt heartbeat: observe-only, always.
     state.lastSig = null;
     state.consecUnchanged = 0;
   } else if (sig !== state.lastSig) {
     state.lastSig = sig;
-    if (state.consecUnchanged > 0 || state.freshSince === null) state.freshSince = now();
+    // freshSince anchors the unlatch clock: re-anchor only when recovering
+    // from REAL staleness (>= threshold) — a sub-threshold unchanged streak
+    // is the daemon's normal 5-min rhythm, not a freshness break.
+    if (state.consecUnchanged >= staleThresholdRuns || state.freshSince === null) {
+      state.freshSince = now();
+    }
     state.consecUnchanged = 0;
     state.termedPid = null;
+    // "Do not recover the heartbeat" (spec, ladder #3): a respawned daemon
+    // that completes a healthy tick IS recovered — clear the fuse memory.
+    // Crash-loopers die before their first tick, so they never get here.
+    if (hb!.tick_seq >= 1 && hb!.consec_failures === 0) {
+      state.respawns = [];
+    }
   } else {
     state.consecUnchanged += 1;
   }
@@ -351,7 +399,7 @@ export async function runWatchdog(deps: WatchdogDeps): Promise<WatchdogRunResult
     state.kills = [];
   }
 
-  // Fuse: repeated unexplained respawns without recovery → stop killing.
+  // Fuse: repeated unexplained, unrecovered respawns → stop killing, alarm.
   if (!state.degraded && state.respawns.length >= FUSE_RESPAWNS) {
     log.error("watchdog_degraded", { respawns: state.respawns.length });
     state.degraded = true;
@@ -415,6 +463,7 @@ export async function runWatchdog(deps: WatchdogDeps): Promise<WatchdogRunResult
       kills_recent: state.kills.length,
       degraded: state.degraded,
       spool_pending: spoolFiles(deps.stateDir).length,
+      state_corrupt: corrupt,
     };
     const res = curlJson(
       exec,
@@ -512,13 +561,22 @@ function logTail(logDir: string): string {
 function drainSpool(deps: WatchdogDeps, exec: Exec, ctx: WatchdogContext, log: Logger): void {
   const files = spoolFiles(deps.stateDir);
   if (files.length === 0 || !ctx.endpoint || !ctx.secret || !ctx.user) return;
-  // One combined POST, capped to the server's diag limit; delete on 2xx only.
+  // One combined POST, capped to the server's diag limit. Only the files that
+  // actually made it into the payload are deleted on 2xx — the remainder
+  // drains on subsequent runs instead of being destroyed unsent.
   let combined = "";
+  const included: string[] = [];
   for (const f of files) {
+    let chunk: string;
     try {
-      combined += `===== ${f} =====\n${readFileSync(path.join(spoolDir(deps.stateDir), f), "utf8")}\n`;
-    } catch {}
-    if (combined.length > 240 * 1024) break;
+      chunk = `===== ${f} =====\n${readFileSync(path.join(spoolDir(deps.stateDir), f), "utf8")}\n`;
+    } catch {
+      included.push(f); // unreadable = never uploadable; let the 2xx clear it
+      continue;
+    }
+    if (combined.length + chunk.length > 240 * 1024 && included.length > 0) break;
+    combined += chunk;
+    included.push(f);
   }
   // Stage the combined payload as a file so curl reads it via @file — keeps
   // the whole network path on the injectable exec seam (no stdin plumbing).
@@ -549,12 +607,15 @@ function drainSpool(deps: WatchdogDeps, exec: Exec, ctx: WatchdogContext, log: L
     unlinkSync(payloadPath);
   } catch {}
   if (ok) {
-    for (const f of files) {
+    for (const f of included) {
       try {
         unlinkSync(path.join(spoolDir(deps.stateDir), f));
       } catch {}
     }
-    log.info("watchdog_spool_drained", { files: files.length });
+    log.info("watchdog_spool_drained", {
+      files: included.length,
+      pending: files.length - included.length,
+    });
   }
 }
 
@@ -580,6 +641,11 @@ async function healDaemonArtifacts(
     }
   }
   // Missing daemon binary with our own hardlink alive: repair-download.
+  // stateDir is deliberately OMITTED: the watchdog must not perform
+  // endpoint-override migrations, and its no-op restart would otherwise
+  // write a phantom "endpoint_override" journal entry that journal-explains
+  // (masks) real crash respawns. The manifest GET rides curl via the
+  // fetchImpl seam — Bun fetch stays banned in this process.
   if (!existsSync(ctx.execPath) && ctx.endpoint) {
     log.warn("watchdog_daemon_binary_missing", { execPath: ctx.execPath });
     try {
@@ -587,9 +653,9 @@ async function healDaemonArtifacts(
       await checkForUpdate({
         log,
         endpoint: ctx.endpoint,
-        stateDir: deps.stateDir,
         execPath: ctx.execPath,
         allowMissingExec: true,
+        fetchImpl: curlFetchImpl(exec),
         restart: () => {}, // KeepAlive's failing respawn loop picks it up
       });
     } catch (err: unknown) {
@@ -664,12 +730,13 @@ function executeWatchdogDirective(
 ): void {
   let result: "ok" | "failed" = "ok";
   let detail = "";
+  const kill = deps.kill ?? ((pid: number, sig: NodeJS.Signals) => process.kill(pid, sig));
   const daemonPid = labelPid(exec, uid, DAEMON_LABEL);
   switch (directive.verb) {
     case "restart": {
       if (daemonPid !== null) {
         try {
-          process.kill(daemonPid, "SIGTERM");
+          kill(daemonPid, "SIGTERM");
           detail = `sigterm ${daemonPid}`;
         } catch (err: unknown) {
           result = "failed";
@@ -738,153 +805,6 @@ function executeWatchdogDirective(
   }
 }
 
-// --- daemon-side install (called from main() only — never runDaemon(), so
-// tests and the CI update-gate can never touch a real launchd) ------------------
-
-/**
- * Renders the watchdog LaunchAgent plist. MUST stay byte-converged with
- * render_watchdog_plist in scripts/plist-templates.sh (single-sourced shape;
- * the installer and this renderer write identical bytes so the mutual
- * missing/corrupt heal never fights the installer's copy).
- */
-export function renderWatchdogPlist(home: string): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>${WATCHDOG_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${home}/.local/bin/anara-leaderboard.watchdog</string>
-        <string>watchdog</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>HOME</key>
-        <string>${home}</string>
-        <key>PATH</key>
-        <string>${home}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    </dict>
-    <!-- One-shot checker on launchd's clock: StartInterval fires while awake
-         (collided/asleep firings are dropped, never queued) and RunAtLoad
-         covers login. Deliberately NO KeepAlive - the watchdog must stay a
-         short-lived one-shot; a resident copy would share the daemon's
-         wedgeable-runtime failure domain. -->
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StartInterval</key>
-    <integer>${WATCHDOG_INTERVAL_SEC}</integer>
-    <key>ProcessType</key>
-    <string>Background</string>
-    <key>StandardOutPath</key>
-    <string>${home}/Library/Logs/anara-leaderboard/watchdog.log</string>
-    <key>StandardErrorPath</key>
-    <string>${home}/Library/Logs/anara-leaderboard/watchdog.log</string>
-</dict>
-</plist>
-`;
-}
-
-export type WatchdogInstallStatus = "installed" | "already" | "failed" | "btm_disabled" | "skipped";
-
-export interface EnsureDeps {
-  home?: string;
-  exec?: Exec;
-  execPath?: string;
-  env?: NodeJS.ProcessEnv;
-}
-
-/**
- * First-boot duties from the daemon (idempotent, best-effort, hard-capped —
- * each launchctl call has a short timeout and one attempt; a failure is
- * reported in the next checkin and retried next boot):
- *   refresh the .watchdog hardlink → snapshot our plist for mutual heal →
- *   write the watchdog plist → enable → bootstrap → verify.
- * Skipped entirely under TOKENLEADER_WATCHDOG_DISABLED=1 (CI update-gate,
- * tests) and when the daemon plist doesn't exist (dev / env-run daemons).
- */
-export function ensureWatchdogInstalled(
-  log: Logger,
-  stateDir: string,
-  deps: EnsureDeps = {},
-): WatchdogInstallStatus {
-  const env = deps.env ?? process.env;
-  if (env.TOKENLEADER_WATCHDOG_DISABLED === "1") return "skipped";
-  if (process.platform !== "darwin" && !deps.exec) return "skipped";
-  const home = deps.home ?? homedir();
-  const exec = deps.exec ?? defaultExec;
-  const daemonPlist = path.join(home, "Library", "LaunchAgents", `${DAEMON_LABEL}.plist`);
-  if (!existsSync(daemonPlist)) return "skipped";
-
-  const uid = process.getuid?.() ?? 501;
-  const execPath = deps.execPath ?? process.execPath;
-  const binDir = path.join(home, ".local", "bin");
-  const hardlink = path.join(binDir, "anara-leaderboard.watchdog");
-
-  // 1. Hardlink refresh: the watchdog's spawnability must not share fate with
-  // the daemon binary (deletion, rollback to a pre-watchdog version).
-  try {
-    if (path.basename(execPath) === "anara-leaderboard") {
-      try {
-        unlinkSync(hardlink);
-      } catch {}
-      linkSync(execPath, hardlink);
-    }
-  } catch (err: unknown) {
-    log.warn("watchdog_hardlink_failed", { err: String((err as Error)?.message ?? err) });
-  }
-
-  // 2. Snapshot our own plist so the watchdog can restore it if it vanishes.
-  try {
-    copyFileSync(daemonPlist, path.join(stateDir, "daemon.plist.bak"));
-  } catch {
-    // mutual heal loses its source; non-fatal
-  }
-
-  // 3. Plist write (only when content drifted — keeps mtime stable).
-  const plistPath = path.join(home, "Library", "LaunchAgents", `${WATCHDOG_LABEL}.plist`);
-  const want = renderWatchdogPlist(home);
-  let drifted = true;
-  try {
-    drifted = readFileSync(plistPath, "utf8") !== want;
-  } catch {
-    // missing — write below
-  }
-  if (drifted) {
-    try {
-      writeFileSync(`${plistPath}.new`, want, { mode: 0o600 });
-      renameSync(`${plistPath}.new`, plistPath);
-    } catch (err: unknown) {
-      log.warn("watchdog_plist_write_failed", { err: String((err as Error)?.message ?? err) });
-      return "failed";
-    }
-  }
-
-  // 4. enable (clears stale disable records — the phantom-record lesson from
-  // the installer) then bootstrap; "already bootstrapped" is success.
-  exec("launchctl", ["enable", `gui/${uid}/${WATCHDOG_LABEL}`], 2_000);
-  const alreadyLoaded = labelLoaded(exec, uid, WATCHDOG_LABEL);
-  if (!alreadyLoaded) {
-    const b = exec("launchctl", ["bootstrap", `gui/${uid}`, plistPath], 2_000);
-    if (!b.ok && !/already|in progress|37/.test(b.err ?? "")) {
-      // 5. Verify: a bootstrap that "succeeded" but left no registration is
-      // the Background Task Management disable toggle — no local heal exists;
-      // report so a human gets alerted.
-      if (!labelLoaded(exec, uid, WATCHDOG_LABEL)) {
-        log.warn("watchdog_bootstrap_failed", { err: b.err });
-        return "failed";
-      }
-    }
-  }
-  if (!labelLoaded(exec, uid, WATCHDOG_LABEL)) {
-    log.warn("watchdog_btm_disabled", {});
-    return "btm_disabled";
-  }
-  log.info("watchdog_installed", { plist: plistPath, alreadyLoaded });
-  return alreadyLoaded ? "already" : "installed";
-}
-
 // --- curl helpers (Bun fetch is banned in this process) ------------------------
 
 function curlJson(
@@ -894,7 +814,10 @@ function curlJson(
   headers: Record<string, string>,
   body: unknown,
 ): Record<string, unknown> | null {
-  const args = [...CURL_ARGS, "-X", method, "-H", "Content-Type: application/json"];
+  // --fail: a 4xx/5xx must read as a FAILED checkin (curl exits 22), never
+  // as ok-with-empty-directive — a 403 secret mismatch or an old server's
+  // 404 would otherwise report checkinOk=true forever.
+  const args = [...CURL_ARGS, "--fail", "-X", method, "-H", "Content-Type: application/json"];
   for (const [k, v] of Object.entries(headers)) args.push("-H", `${k}: ${v}`);
   args.push("--data-binary", JSON.stringify(body), url);
   const r = exec("curl", args, 15_000);
@@ -904,4 +827,36 @@ function curlJson(
   } catch {
     return {};
   }
+}
+
+/**
+ * A minimal GET-only fetch adapter over curl for checkForUpdate's manifest
+ * request (the repair path). `-i` captures the status line + headers so the
+ * updater's etag/304 handling keeps working; there is no -L, so exactly one
+ * header block precedes the body.
+ */
+export function curlFetchImpl(exec: Exec): typeof fetch {
+  return (async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const args = [...CURL_ARGS, "-i"];
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    for (const [k, v] of Object.entries(headers)) args.push("-H", `${k}: ${v}`);
+    args.push(String(url));
+    const r = exec("curl", args, 15_000);
+    if (!r.ok) throw new Error(`curl: ${r.err ?? "failed"}`);
+    const sep = r.stdout.indexOf("\r\n\r\n");
+    const rawHead = sep >= 0 ? r.stdout.slice(0, sep) : r.stdout;
+    const body = sep >= 0 ? r.stdout.slice(sep + 4) : "";
+    const lines = rawHead.split("\r\n");
+    const status = Number.parseInt(lines[0]?.split(" ")[1] ?? "0", 10) || 0;
+    const h = new Headers();
+    for (const line of lines.slice(1)) {
+      const i = line.indexOf(":");
+      if (i > 0) h.set(line.slice(0, i).trim(), line.slice(i + 1).trim());
+    }
+    // Response() rejects null-body statuses with a body argument.
+    return new Response(status === 204 || status === 304 ? null : body, {
+      status,
+      headers: h,
+    });
+  }) as typeof fetch;
 }

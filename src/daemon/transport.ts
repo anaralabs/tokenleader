@@ -93,6 +93,19 @@ async function defaultSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** Short hostname → device label ("Krishs-MacBook-Pro.local" →
+ *  "krishs-macbook-pro"). Sent as X-Tokenleader-Device; the server treats
+ *  it as cosmetic. undefined when nothing survives the cleanup. Lives here
+ *  (not main.ts) so the watchdog can share it without an import cycle. */
+export function deviceLabelFromHost(host: string): string | undefined {
+  const s = (host.split(".")[0] ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+  return s.length > 0 ? s : undefined;
+}
+
 export function chunk<T>(arr: T[], size: number): T[][] {
   if (size <= 0) return [arr];
   const out: T[][] = [];

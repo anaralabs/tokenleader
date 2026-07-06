@@ -423,7 +423,7 @@ write_plist_and_register() {
     <key>ProcessType</key>
     <string>Background</string>
     <key>StandardOutPath</key>
-    <string>\${HOME}/Library/Logs/anara-leaderboard/stdout.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>\${HOME}/Library/Logs/anara-leaderboard/stderr.log</string>
     <key>WorkingDirectory</key>

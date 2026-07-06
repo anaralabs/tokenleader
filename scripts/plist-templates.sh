@@ -53,8 +53,11 @@ render_daemon_plist() {
     <integer>30</integer>
     <key>ProcessType</key>
     <string>Background</string>
+    <!-- stdout duplicates the jsonl file sink and grew unbounded (launchd
+         never rotates these); stderr stays a real file to catch crash output
+         that never reaches the logger. -->
     <key>StandardOutPath</key>
-    <string>${home}/Library/Logs/anara-leaderboard/stdout.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
     <string>${home}/Library/Logs/anara-leaderboard/stderr.log</string>
     <key>WorkingDirectory</key>

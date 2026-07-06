@@ -18,9 +18,16 @@ import { healInstalledPlist } from "./plist-heal";
 import { loadOrCreateSecret } from "./secret";
 import { applyRescanGeneration, ensureStateDir, loadState, saveState } from "./state";
 import { tick } from "./tick";
-import { DEFAULT_BATCH_SIZE, postCheckin, postDirectiveAck, type TransportOpts } from "./transport";
+import {
+  DEFAULT_BATCH_SIZE,
+  deviceLabelFromHost,
+  postCheckin,
+  postDirectiveAck,
+  type TransportOpts,
+} from "./transport";
 import { checkForUpdate, pickArch, RESTART_EXIT_CODE } from "./update";
-import { ensureWatchdogInstalled, runWatchdog, type WatchdogInstallStatus } from "./watchdog";
+import { resolveWatchdogStateDir, runWatchdog } from "./watchdog";
+import { ensureWatchdogInstalled, type WatchdogInstallStatus } from "./watchdog-install";
 
 export interface ResolvedConfig {
   user: string;
@@ -188,17 +195,7 @@ export async function ensureCliSymlink(execPath: string = process.execPath): Pro
   }
 }
 
-/** Short hostname → device label ("Krishs-MacBook-Pro.local" →
- *  "krishs-macbook-pro"). Sent as X-Tokenleader-Device; the server treats
- *  it as cosmetic. undefined when nothing survives the cleanup. */
-export function deviceLabelFromHost(host: string): string | undefined {
-  const s = (host.split(".")[0] ?? "")
-    .toLowerCase()
-    .replace(/[^a-z0-9._-]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 32);
-  return s.length > 0 ? s : undefined;
-}
+export { deviceLabelFromHost } from "./transport";
 
 /**
  * Boot-time endpoint precedence: `<stateDir>/endpoint` (written by the
@@ -269,8 +266,6 @@ export interface RunDeps {
   executeDirectiveImpl?: typeof executeDirective;
   // Source of "now" for the update scheduler. Defaults to Date.now.
   nowImpl?: () => number;
-  // First-update delay in ms; default 30_000 (production). Tests use 0.
-  initialUpdateDelayMs?: number;
   // Random source 0..1 for the update-interval jitter. Tests pin it.
   random?: () => number;
   // Watchdog install outcome from main(), reported in checkins.
@@ -289,6 +284,43 @@ export const DRIFT_EXIT_MIN_OVERSHOOT_MS = 30 * 60_000;
 // per-machine jitter (0-24h) so a fleet never recycles in lockstep.
 export const RECYCLE_AFTER_MS = 7 * 24 * 60 * 60_000;
 export const RECYCLE_JITTER_MAX_MS = 24 * 60 * 60_000;
+
+/** Monotonic count of daemon boots (crash-loop signal for the classifier —
+ *  the journal only explains DELIBERATE exits; boots it can't explain are
+ *  crashes). Best-effort: an unreadable file restarts the count. */
+async function bumpBootCount(stateDir: string): Promise<number> {
+  const p = path.join(stateDir, "boot-count");
+  let n = 0;
+  try {
+    n = Number.parseInt(await fsp.readFile(p, "utf8"), 10);
+    if (!Number.isFinite(n) || n < 0) n = 0;
+  } catch {
+    // first boot
+  }
+  n += 1;
+  try {
+    await fsp.writeFile(p, String(n));
+  } catch {
+    // count restarts next boot; harmless
+  }
+  return n;
+}
+
+/** Free space on the state volume, or null where statfs is unavailable. */
+async function diskFreeMb(stateDir: string): Promise<number | null> {
+  try {
+    const statfs = (
+      fsp as unknown as {
+        statfs?: (p: string) => Promise<{ bavail: number; bsize: number }>;
+      }
+    ).statfs;
+    if (!statfs) return null;
+    const s = await statfs(stateDir);
+    return Math.round((s.bavail * s.bsize) / (1024 * 1024));
+  } catch {
+    return null;
+  }
+}
 
 async function recycleJitterMs(stateDir: string, rnd: () => number): Promise<number> {
   const p = path.join(stateDir, "recycle-jitter");
@@ -316,7 +348,6 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
   const checkinFn = deps.postCheckinImpl ?? postCheckin;
   const directiveFn = deps.executeDirectiveImpl ?? executeDirective;
   const now = deps.nowImpl ?? Date.now;
-  const initialUpdateDelayMs = deps.initialUpdateDelayMs ?? 30_000;
   const rnd = deps.random ?? Math.random;
 
   await ensureStateDir(cfg.stateDir);
@@ -460,17 +491,20 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
 
   const recycleJitter = await recycleJitterMs(cfg.stateDir, rnd);
   let lastDriftMs = 0;
+  const bootCount = await bumpBootCount(cfg.stateDir);
 
-  const buildCheckinBody = (): CheckinBody => {
+  const buildCheckinBody = async (): Promise<CheckinBody> => {
     const snap = hb.snapshot();
     const ws = deps.watchdogStatus;
     return {
       uptime_s: Math.round((Date.now() - bootAt) / 1000),
       tick_seq: snap.tick_seq,
+      interval_s: cfg.intervalSec,
+      boot_count: bootCount,
       consec_failures: snap.consec_failures,
       last_error: snap.last_error,
       last_update_result: lastUpdateResult,
-      disk_free_mb: null,
+      disk_free_mb: await diskFreeMb(cfg.stateDir),
       drift_ms: lastDriftMs,
       heartbeat_write_failures: hb.writeFailures,
       exit_journal_tail: journalTail(cfg.stateDir, Date.now() - 24 * 60 * 60_000).slice(-20),
@@ -540,7 +574,7 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
     // it mattered; the status body is what lets the fleet classifier tell
     // healthy/degraded/crash-looping apart (docs/resilience.md).
     if (!ac.signal.aborted) {
-      const ci = await checkinFn(cfg.user, transport, ac.signal, buildCheckinBody());
+      const ci = await checkinFn(cfg.user, transport, ac.signal, await buildCheckinBody());
       directive ??= ci.directive;
     }
 
@@ -606,7 +640,7 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
     const overshoot = Date.now() - sleepStart - sleepMs;
     lastDriftMs = Math.max(0, overshoot);
     if (!ac.signal.aborted && overshoot > Math.max(3 * intervalMs, DRIFT_EXIT_MIN_OVERSHOOT_MS)) {
-      log.warn("clock_drift", { sleepMs, overshootMs: overshoot });
+      log.warn("clock_skew", { sleepMs, overshootMs: overshoot });
       deliberateExit("clock_drift");
     }
   }
@@ -660,9 +694,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   // would only add launchd log spam with no one to react to it.
   if (sub === "watchdog") {
     if (process.platform !== "darwin") return 0;
-    const stateDir =
-      process.env.TOKENLEADER_STATE_DIR?.trim() ||
-      path.join(homedir(), ".local", "share", "anara-leaderboard");
+    const stateDir = resolveWatchdogStateDir(process.env, homedir());
     try {
       const r = await runWatchdog({ log, stateDir, logDir: LOG_DIR });
       log.debug("watchdog_run_done", { action: r.action, staleRuns: r.staleRuns });

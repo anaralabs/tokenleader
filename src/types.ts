@@ -72,6 +72,11 @@ export interface DirectiveAck {
 export interface CheckinBody {
   uptime_s: number;
   tick_seq: number;
+  /** Configured tick cadence — the fleet classifier scales its staleness
+   *  thresholds per device so slow-cadence daemons are never misread. */
+  interval_s?: number;
+  /** Monotonic count of daemon boots on this machine (crash-loop signal). */
+  boot_count?: number;
   consec_failures: number;
   last_error: string | null;
   last_update_result: string | null;
@@ -92,6 +97,8 @@ export interface WatchdogCheckinBody {
   kills_recent: number;
   degraded: boolean;
   spool_pending: number;
+  /** The watchdog's own counter file was unreadable this run. */
+  state_corrupt?: boolean;
 }
 
 export interface FileState {

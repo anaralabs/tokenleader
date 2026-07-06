@@ -4,18 +4,13 @@ import { promises as fsp } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Logger } from "./log";
-import {
-  createHeartbeat,
-  journalExit,
-  writeUpdateMarker,
-} from "./heartbeat";
+import { createHeartbeat, journalExit, writeUpdateMarker } from "./heartbeat";
 import {
   DAEMON_LABEL,
   emptyWatchdogState,
   type Exec,
   FUSE_RESPAWNS,
   loadWatchdogState,
-  renderWatchdogPlist,
   runWatchdog,
   saveWatchdogState,
   STALE_RUNS_MIN,
@@ -24,6 +19,7 @@ import {
   WATCHDOG_LABEL,
   type WatchdogDeps,
 } from "./watchdog";
+import { renderWatchdogPlist } from "./watchdog-install";
 
 const nullLog: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -205,11 +201,16 @@ describe("fuse (respawns, not kills)", () => {
 
 describe("watchdog state file", () => {
   test("corrupt state fails closed toward detection (one stale observation pre-recorded)", async () => {
-    const dir = await makeTmpDir();
-    await fsp.writeFile(path.join(dir, "watchdog.json"), "{nope");
-    const { state, corrupt } = loadWatchdogState(dir);
-    expect(corrupt).toBe(true);
-    expect(state.consecUnchanged).toBe(1);
+    const h = await makeHarness();
+    const hb = createHeartbeat(h.stateDir, "dev", 4242);
+    hb.tickStart();
+    await fsp.writeFile(path.join(h.stateDir, "watchdog.json"), "{nope");
+    expect(loadWatchdogState(h.stateDir).corrupt).toBe(true);
+    // The run after corruption records the heartbeat as one stale observation
+    // instead of "freshly changed" — a repeatedly-corrupting state file can
+    // only DELAY detection by re-observation, never erase it.
+    await runWatchdog(h.deps);
+    expect(loadWatchdogState(h.stateDir).state.consecUnchanged).toBe(1);
     // Missing state is a clean first run, not a corruption.
     const dir2 = await makeTmpDir();
     expect(loadWatchdogState(dir2)).toEqual({ state: emptyWatchdogState(), corrupt: false });
@@ -233,7 +234,9 @@ describe("self-clean", () => {
     const r = await runWatchdog(h.deps);
     expect(r.action).toBe("self_clean");
     expect(
-      h.execCalls.some((c) => c[0] === "launchctl" && c[1] === "bootout" && c[2]?.endsWith(WATCHDOG_LABEL)),
+      h.execCalls.some(
+        (c) => c[0] === "launchctl" && c[1] === "bootout" && c[2]?.endsWith(WATCHDOG_LABEL),
+      ),
     ).toBe(true);
   });
 });

@@ -64,7 +64,8 @@ remains a v0.7 candidate once the watchdog has field data.
 - tick start and tick end (success *or* failure),
 - every 200 files inside the parse loop,
 - after every batch POST,
-- after every Cursor-cloud page fetch.
+- bracketing the Cursor-cloud walk (its worst legitimate case, 25 pages x
+  30s timeout ≈ 12.5 min, stays inside the 16-min staleness threshold).
 
 Content: `{ pid, wall_ms, tick_seq, version, consec_failures, last_error }`.
 Disk writes were empirically alive during the wedge; sockets were not. The
@@ -130,9 +131,12 @@ fetch is banned in the watchdog entirely.
 1. Assert own domain (`gui/$UID`); exit quietly otherwise.
 2. Read heartbeat + own state → staleness/identity decision → ladder.
 3. Boot-time self-heal: daemon binary missing → re-download via manifest
-   (curl + sha256, reusing the update path); daemon plist missing → rewrite
-   (file-only); daemon job absent from launchd → `launchctl enable` then
-   `bootstrap` (a *different* label — safe).
+   (curl + sha256, reusing the update path — the manifest GET rides a
+   curl-backed fetch adapter, and the repair call omits the state dir: the
+   watchdog never performs endpoint-override migrations and never writes
+   journal entries for restarts that didn't happen); daemon plist missing →
+   rewrite (file-only); daemon job absent from launchd → `launchctl enable`
+   then `bootstrap` (a *different* label — safe).
 4. Checkin: POST ~200B to `/watchdog-checkin` — `{device, daemon_pid_alive,
    heartbeat_age_runs, kills_recent, degraded, spool_pending}` — and execute
    any directive in the response (`restart`, `upload_logs`, `sample`,
@@ -150,14 +154,17 @@ and continue.
 ## In-process layers (kept, demoted, cut)
 
 - **Drift detector (kept):** each tick compares wall-elapsed vs expected
-  sleep; > 3x interval while not asleep → log `clock_skew`, flush heartbeat,
-  exit(75) with journal entry. Catches *late-but-alive* timers, which the
-  watchdog cannot see (a late tick still refreshes the heartbeat). Sleep
-  computation clamped to `[0, intervalMs]`.
+  sleep; overshoot past max(3x interval, 30 min) → log `clock_skew`, flush
+  heartbeat, exit(75) with journal entry. (The 30-min floor keeps short naps
+  from restarting the daemon at every wake; a long sleep DOES trigger it,
+  deliberately — a fresh process at wake is the churn-reset that prevents
+  the wedge from ever accumulating.) Catches *late-but-alive* timers, which
+  the watchdog cannot see (a late tick still refreshes the heartbeat).
 - **Lifetime recycling (demoted):** exit(75) after **7 days + 0–24h
   persisted per-machine jitter**, checked between ticks only, suppressed
-  while `update_in_progress` or a directive is pending, always
-  journal-explained. Hygiene against slow runtime rot; the watchdog is the
+  while `update_in_progress`, always journal-explained. (Directives cannot
+  race it: they execute at the end of the iteration, before the next
+  recycle check runs.) Hygiene against slow runtime rot; the watchdog is the
   actual wedge-killer.
 - **Unconditional checkin (kept):** `/checkin` fires after *every* tick —
   success, quiet, or failure (previously only quiet ticks). Expanded body:

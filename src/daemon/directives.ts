@@ -19,7 +19,7 @@ import type { DaemonDirective } from "../types";
 import { journalExit } from "./heartbeat";
 import { LOG_FILE, type Logger } from "./log";
 import { RESTART_EXIT_CODE } from "./update";
-import { ensureWatchdogInstalled } from "./watchdog";
+import { ensureWatchdogInstalled } from "./watchdog-install";
 
 // Matches the server's DIAG_LOG_MAX_BYTES headroom (256KB cap server-side).
 const LOG_TAIL_BYTES = 64 * 1024;
