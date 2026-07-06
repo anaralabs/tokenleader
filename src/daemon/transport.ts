@@ -1,4 +1,11 @@
-import type { DaemonDirective, IngestRequest, IngestResponse, TokenEvent } from "../types";
+import type {
+  CheckinBody,
+  DaemonDirective,
+  DirectiveAck,
+  IngestRequest,
+  IngestResponse,
+  TokenEvent,
+} from "../types";
 import { log } from "./log";
 
 export const USER_AGENT = "tokenleader-daemon/0.1.0";
@@ -38,6 +45,10 @@ export interface TransportOpts {
   // client behavior (same contract as `join`).
   link?: string;
   batchSize?: number;
+  // Liveness progress hook: fired after every accepted batch POST so the
+  // heartbeat file advances DURING long flushes (fresh-install replay must
+  // never look wedged to the watchdog — docs/resilience.md).
+  onProgress?: () => void;
   // Test/DI hooks. Real callers don't pass these.
   fetchImpl?: typeof fetch;
   sleepMs?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -287,6 +298,7 @@ export async function postCheckin(
   user: string,
   opts: TransportOpts,
   signal?: AbortSignal,
+  body?: CheckinBody,
 ): Promise<{ ok: boolean; directive?: DaemonDirective }> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const url = `${opts.endpoint.replace(/\/+$/, "")}/checkin`;
@@ -303,7 +315,11 @@ export async function postCheckin(
           "X-Tokenleader-Version": opts.version ?? "dev",
           "X-Tokenleader-Arch": opts.arch ?? "",
           ...(opts.device ? { "X-Tokenleader-Device": opts.device } : {}),
+          // The status body is additive: old servers never read a /checkin
+          // body, new servers treat it as optional (docs/resilience.md).
+          ...(body ? { "Content-Type": "application/json" } : {}),
         },
+        ...(body ? { body: JSON.stringify(body) } : {}),
       },
       CHECKIN_TIMEOUT_MS,
       signal,
@@ -323,6 +339,46 @@ export async function postCheckin(
   } catch (err: unknown) {
     log.debug("checkin_failed", { url, err: String((err as Error)?.message ?? err) });
     return { ok: false };
+  }
+}
+
+/**
+ * Report a directive's outcome. Completion is the ack, not the handout —
+ * the server re-queues un-acked directives, which closes the "update swap
+ * eats the directive" hole for every verb. Any non-200 (old server) is
+ * benign; the directive then just re-runs after its TTL re-queue.
+ */
+export async function postDirectiveAck(
+  user: string,
+  ack: DirectiveAck,
+  opts: TransportOpts,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const url = `${opts.endpoint.replace(/\/+$/, "")}/directives/ack`;
+  try {
+    const res = await fetchWithTimeout(
+      fetchImpl,
+      url,
+      {
+        method: "POST",
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Content-Type": "application/json",
+          "X-Tokenleader-Secret": opts.secret,
+          "X-Tokenleader-User": user,
+          ...(opts.device ? { "X-Tokenleader-Device": opts.device } : {}),
+        },
+        body: JSON.stringify(ack),
+      },
+      CHECKIN_TIMEOUT_MS,
+      signal,
+    );
+    if (!res.ok) log.debug("directive_ack_http", { url, status: res.status });
+    return res.ok;
+  } catch (err: unknown) {
+    log.debug("directive_ack_failed", { url, err: String((err as Error)?.message ?? err) });
+    return false;
   }
 }
 
@@ -361,6 +417,7 @@ export async function postEvents(
     }
     inserted += r.inserted;
     duplicates += r.duplicates;
+    opts.onProgress?.();
     // Keep the first directive seen this flush; anything else still queued
     // arrives on a later tick's response.
     directive ??= r.directive;

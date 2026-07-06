@@ -1204,7 +1204,7 @@ describe("runDaemon", () => {
     expect(ticks).toBeGreaterThanOrEqual(3);
   });
 
-  test("quiet ticks heartbeat via /checkin; a delivered directive executes", async () => {
+  test("every tick checks in; a delivered directive executes", async () => {
     const dir = await makeTmpDir();
     const ac = new AbortController();
     let ticks = 0;
@@ -1225,16 +1225,16 @@ describe("runDaemon", () => {
         signal: ac.signal,
         tickImpl: async (state) => {
           ticks++;
-          // Tick 1 posts events (ingest is the liveness signal — no
-          // heartbeat); tick 2 is quiet (heartbeat fires).
-          const events = ticks === 1 ? 5 : 0;
+          // Checkins are unconditional now (a sick-but-alive daemon must
+          // never go server-dark), so even this posting tick checks in and
+          // picks up the directive.
           return {
             state,
             result: {
               scannedFiles: 0,
               eligibleFiles: 0,
-              eventsPosted: events,
-              inserted: events,
+              eventsPosted: 5,
+              inserted: 5,
               duplicates: 0,
               posted: true,
               newFiles: 0,
@@ -1251,12 +1251,12 @@ describe("runDaemon", () => {
         },
       },
     );
-    expect(ticks).toBe(2);
+    expect(ticks).toBe(1);
     expect(checkins).toEqual(["krish"]);
     expect(executed).toEqual(["upload_logs"]);
   });
 
-  test("a directive on the tick's ingest response executes without a heartbeat", async () => {
+  test("an ingest-delivered directive wins over the checkin's", async () => {
     const dir = await makeTmpDir();
     const ac = new AbortController();
     const executed: number[] = [];
@@ -1297,8 +1297,10 @@ describe("runDaemon", () => {
         },
       },
     );
+    // The ingest-delivered directive wins; the (now unconditional) checkin
+    // still fires but its (empty) directive never overrides the tick's.
     expect(executed).toEqual([4]);
-    expect(checkinCalls).toBe(0);
+    expect(checkinCalls).toBe(1);
   });
 
   test("boot applies the one-time rescan (offsets reset, generation stamped, saved BEFORE the first tick)", async () => {

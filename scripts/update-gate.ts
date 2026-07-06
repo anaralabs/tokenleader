@@ -55,8 +55,11 @@ await fsp.copyFile(releaseBin, execPath);
 await fsp.chmod(execPath, 0o755);
 
 // Sandbox HOME: no transcript files to scan, no real state touched. The
-// first update check fires ~30s after boot (initialUpdateDelayMs), so a
-// healthy cycle completes well inside the timeout.
+// first update check now runs BEFORE the first tick, so a healthy cycle
+// completes even faster than the old ~30s-delayed schedule. The watchdog
+// install is explicitly disabled: this gate's contract is the UPDATE path,
+// and the runner's real launchd must never gain a label pointing into a
+// sandbox that gets rm -rf'd at gate end.
 const child = spawn(execPath, [], {
   env: {
     ...process.env,
@@ -67,6 +70,7 @@ const child = spawn(execPath, [], {
     TOKENLEADER_LOG_DIR: path.join(sandbox, "logs"),
     TOKENLEADER_INTERVAL_SEC: "5",
     TOKENLEADER_UPDATE_INTERVAL_SEC: "60",
+    TOKENLEADER_WATCHDOG_DISABLED: "1",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });

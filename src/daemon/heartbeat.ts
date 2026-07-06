@@ -136,7 +136,10 @@ export function journalExit(stateDir: string, reason: string, code: number): voi
     }
     if (size + line.length > JOURNAL_MAX_BYTES) {
       const tail = readJournal(stateDir).slice(-JOURNAL_KEEP_TAIL);
-      atomicWriteSync(file, tail.map((e) => JSON.stringify(e)).join("\n") + (tail.length ? "\n" : ""));
+      atomicWriteSync(
+        file,
+        tail.map((e) => JSON.stringify(e)).join("\n") + (tail.length ? "\n" : ""),
+      );
     }
     appendFileSync(file, line);
   } catch {

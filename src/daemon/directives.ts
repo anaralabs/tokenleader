@@ -16,8 +16,10 @@
 
 import { promises as fsp } from "node:fs";
 import type { DaemonDirective } from "../types";
+import { journalExit } from "./heartbeat";
 import { LOG_FILE, type Logger } from "./log";
 import { RESTART_EXIT_CODE } from "./update";
+import { ensureWatchdogInstalled } from "./watchdog";
 
 // Matches the server's DIAG_LOG_MAX_BYTES headroom (256KB cap server-side).
 const LOG_TAIL_BYTES = 64 * 1024;
@@ -28,6 +30,13 @@ export interface DirectiveDeps {
   endpoint: string;
   secret: string;
   user: string;
+  /** State dir for the exit journal + watchdog reinstall. When unset the
+   *  restart exits unjournaled (test callers). */
+  stateDir?: string;
+  /** Completion report — POSTed BEFORE any exit so a restart directive is
+   *  acked by the process it terminates. Failures are benign (old server:
+   *  the TTL re-queue just re-delivers). */
+  ack?: (result: "ok" | "failed", detail?: string) => Promise<void>;
   // Test seams. Real callers leave these undefined.
   fetchImpl?: typeof fetch;
   exit?: (code: number) => void;
@@ -97,17 +106,34 @@ export async function executeDirective(d: DaemonDirective, deps: DirectiveDeps):
     case "restart": {
       // Same contract as the post-update restart: a non-zero exit is
       // respawned under both plist generations. Logger is synchronous, so
-      // exiting right after the log line is safe.
+      // exiting right after the log line is safe. Ack + journal first —
+      // process.exit runs no finally blocks.
       log.info("directive_restart", { id: d.id, code: RESTART_EXIT_CODE });
+      await deps.ack?.("ok");
+      if (deps.stateDir) journalExit(deps.stateDir, "restart_directive", RESTART_EXIT_CODE);
       (deps.exit ?? process.exit)(RESTART_EXIT_CODE);
       return;
     }
     case "upload_logs": {
       log.info("directive_upload_logs", { id: d.id });
       await uploadLogs(deps);
+      await deps.ack?.("ok");
+      return;
+    }
+    case "reinstall_watchdog": {
+      // Re-assert the watchdog install (enable clears stale BTM/disable
+      // records; plist + bootstrap re-run idempotently).
+      log.info("directive_reinstall_watchdog", { id: d.id });
+      if (!deps.stateDir) {
+        await deps.ack?.("failed", "no state dir");
+        return;
+      }
+      const status = ensureWatchdogInstalled(log, deps.stateDir);
+      await deps.ack?.(status === "failed" || status === "btm_disabled" ? "failed" : "ok", status);
       return;
     }
     default:
       log.warn("directive_unknown_verb", { id: d.id, verb: d.verb });
+      await deps.ack?.("failed", `unknown verb: ${d.verb}`);
   }
 }
