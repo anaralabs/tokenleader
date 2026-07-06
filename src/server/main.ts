@@ -4,7 +4,13 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { Hono } from "hono";
 import type { Context, MiddlewareHandler } from "hono";
-import type { MessageType, Source, TokenEvent } from "../types.ts";
+import type {
+  CheckinBody,
+  MessageType,
+  Source,
+  TokenEvent,
+  WatchdogCheckinBody,
+} from "../types.ts";
 import { renderAdminHtml } from "./admin-html.ts";
 import { brandedTitle, defaultFaviconSvg, defaultLogoSvg, injectBranding } from "./branding.ts";
 import { mountApiV1 } from "./api-v1.ts";
@@ -13,7 +19,22 @@ import { normalizeCompany } from "./company.ts";
 import { BinaryMirror, normalizeArch } from "./binary-mirror.ts";
 import { ConfigError, echoConfig, parseServerConfig, type ServerConfig } from "./config.ts";
 import { CursorMirror } from "./cursor-mirror.ts";
-import { type Bucket, type DeviceInfo, DIRECTIVE_VERBS, type DirectiveVerb, Store } from "./db.ts";
+import {
+  type Bucket,
+  type DeviceInfo,
+  DIRECTIVE_VERBS,
+  type DirectiveVerb,
+  directiveState,
+  Store,
+} from "./db.ts";
+import {
+  ALERT_SWEEP_INTERVAL_MS,
+  classifyDevice,
+  collectDeviceSignals,
+  sanitizeCheckinBody,
+  sanitizeWatchdogBody,
+  sweepFleetAlerts,
+} from "./fleet.ts";
 import { renderInstallScript, renderUninstallScript } from "./install-script.ts";
 import { PricingCache, computeRowCostUsd, roundUsd } from "./pricing.ts";
 import { parseStatsRange } from "./range.ts";
@@ -28,6 +49,12 @@ const MAX_EVENTS_PER_REQUEST = 1000;
 // Cap on a /diag/logs upload (the daemon sends a 64KB tail; headroom for
 // multi-byte truncation and future growth without letting anyone bloat the DB).
 const DIAG_LOG_MAX_BYTES = 256 * 1024;
+// Cap on a /checkin or /watchdog-checkin JSON body. Real bodies are a few
+// hundred bytes; anything larger is ignored wholesale (never an error — the
+// heartbeat stamp matters more than its garnish).
+const CHECKIN_BODY_MAX_BYTES = 64 * 1024;
+// Cap on a directive-ack detail string (free-form failure context).
+const ACK_DETAIL_MAX_CHARS = 1024;
 // Ceiling on a single event's self-reported cost ($100). costUsdMicros is
 // authenticated but client-supplied; without a cap a daemon could inflate
 // leaderboard cost arbitrarily. No realistic single Cursor request approaches
@@ -212,6 +239,18 @@ export interface BuildOptions {
    *  `<dataDir>/brand/` for operator logo.svg / favicon.svg. Unset → the
    *  built-in neutral marks always serve. */
   dataDir?: string;
+  /** Slack-style webhook (TOKENLEADER_ALERT_WEBHOOK) the fleet alert sweep
+   *  POSTs {text} to. Unset → decisions are still logged and heal
+   *  directives still queue; nothing is pushed. */
+  alertWebhook?: string;
+  /** Fleet-wide alert kill switch for planned rollbacks. Unset → the
+   *  TOKENLEADER_ALERT_SUPPRESS env var is consulted at each sweep. */
+  alertSuppress?: boolean;
+  /** False = don't schedule the 5-minute fleet alert sweep (tests invoke
+   *  sweepFleetAlerts directly with a pinned clock). */
+  scheduleAlertSweep?: boolean;
+  /** Test seam for the alert webhook POST. */
+  alertFetch?: typeof fetch;
 }
 
 const DAILY_MS = 24 * 60 * 60 * 1000;
@@ -1009,6 +1048,7 @@ export function buildApp(opts: BuildOptions) {
   // of tiny indexed reads.
   app.get("/stats/fleet", (c) => {
     const latest = currentDaemonVersion();
+    const nowMs = Date.now();
     const uninstalled = new Set(store.listUninstalledUsers().map((u) => u.user));
     const devicesByUser = new Map<string, DeviceInfo[]>();
     for (const { user, device } of store.listFleetDevices()) {
@@ -1025,6 +1065,11 @@ export function buildApp(opts: BuildOptions) {
           version: d.version,
           arch: d.arch,
           lastSeen: d.lastSeen,
+          watchdogLastSeen: d.watchdogLastSeen,
+          // v0.6 liveness classification (fleet.ts) — version-aware: a
+          // device that never sent a watchdog checkin is judged on
+          // lastSeen alone, so the un-migrated fleet can't read as WEDGED.
+          state: classifyDevice(collectDeviceSignals(store, d), nowMs),
           // Tri-state: true = on latest, false = stale/not-reporting, null =
           // can't compare (no published manifest yet — boot window or no GH
           // token). null must NOT render as "stale".
@@ -1328,12 +1373,14 @@ export function buildApp(opts: BuildOptions) {
       if (opts.joinToken) {
         const join = c.req.header("x-tokenleader-join") ?? "";
         if (!join || !timingSafeEqStr(join, opts.joinToken)) {
+          noteAuthFailure(c, "/ingest", firstUser);
           return c.json({ error: "join_required" }, 403);
         }
       }
       const claimed = store.claimUserSecret(firstUser, presentedHash, Date.now(), deviceLabel);
       if (claimed === null) {
         // Another machine won the claim race between our read and write.
+        noteAuthFailure(c, "/ingest", firstUser);
         return c.json({ error: `secret mismatch for user '${firstUser}'` }, 403);
       }
       deviceId = claimed;
@@ -1358,9 +1405,11 @@ export function buildApp(opts: BuildOptions) {
       } else {
         const linkHeader = c.req.header("x-tokenleader-link") ?? "";
         if (linkHeader.length === 0) {
+          noteAuthFailure(c, "/ingest", firstUser);
           return c.json({ error: `secret mismatch for user '${firstUser}'` }, 403);
         }
         if (!consumeLinkCode(firstUser, linkHeader)) {
+          noteAuthFailure(c, "/ingest", firstUser);
           return c.json({ error: `link code invalid or expired for user '${firstUser}'` }, 403);
         }
         deviceId = store.linkUserDevice(firstUser, presentedHash, Date.now(), deviceLabel);
@@ -1425,8 +1474,9 @@ export function buildApp(opts: BuildOptions) {
     if (result.inserted > 0) invalidateStatsCache();
     // Piggyback a pending directive on the response — a busy daemon posts
     // events every tick and may never hit /checkin. Old daemons ignore the
-    // extra field.
-    const directive = store.takeDirective(firstUser, Date.now());
+    // extra field. Device-scoped: this machine only ever receives
+    // directives aimed at it (or at any of the user's devices).
+    const directive = store.takeDirective(firstUser, deviceId, Date.now());
     // Only surface `skipped` when some row was dropped — an all-valid batch
     // keeps the exact {inserted, duplicates} shape older daemons expect.
     const payload: Record<string, unknown> =
@@ -1437,10 +1487,119 @@ export function buildApp(opts: BuildOptions) {
 
   // Heartbeat for daemons with nothing to post: stamps the device's
   // last_seen/version (so an idle-but-alive daemon is distinguishable from
-  // a dead one) and delivers any pending directive. Auth is EXISTING
-  // devices only — no claim, no re-claim, no link redemption; identity
-  // changes stay exclusively on /ingest.
-  app.post("/checkin", (c) => {
+  // a dead one), journals the checkin, and delivers any pending directive.
+  // Auth is EXISTING devices only — no claim, no re-claim, no link
+  // redemption; identity changes stay exclusively on /ingest.
+  //
+  // v0.6 daemons attach an optional CheckinBody JSON (uptime, failures,
+  // exit-journal tail — the fleet classifier's food). WIRE COMPAT: a
+  // header-only request (every pre-0.6 daemon) behaves exactly as before,
+  // and ANY body problem — bad JSON, wrong shape, oversized — is ignored,
+  // never an error. The heartbeat matters more than its garnish.
+  app.post("/checkin", async (c) => {
+    const user = (c.req.header("x-tokenleader-user") ?? "").trim();
+    if (!/^[a-z0-9._-]{1,64}$/.test(user)) {
+      return c.json({ error: "invalid or missing X-Tokenleader-User" }, 400);
+    }
+    const auth = authDevice(c, user);
+    if (!auth) {
+      noteAuthFailure(c, "/checkin", user);
+      return c.json({ error: "unknown user or secret mismatch" }, 403);
+    }
+    let body: CheckinBody | null = null;
+    try {
+      const raw = await c.req.text();
+      if (raw.length > 0 && raw.length <= CHECKIN_BODY_MAX_BYTES) {
+        body = sanitizeCheckinBody(JSON.parse(raw));
+      }
+    } catch {
+      // absent/garbled bodies never fail the heartbeat
+    }
+    const nowMs = Date.now();
+    try {
+      const dVerRaw = (c.req.header("x-tokenleader-version") ?? "").trim();
+      const dVer =
+        dVerRaw.length > 0 && dVerRaw.toLowerCase() !== "dev" ? dVerRaw.slice(0, 64) : null;
+      const dArch = (c.req.header("x-tokenleader-arch") ?? "").trim();
+      store.recordDeviceCheckIn(
+        user,
+        auth.deviceId,
+        dVer,
+        dArch.length > 0 ? dArch.slice(0, 16) : null,
+        deviceLabelFrom(c.req.header("x-tokenleader-device")),
+        nowMs,
+      );
+      // Cadence journal + latest structured body: what the fleet
+      // classifier reads (uptime resets = restarts; the exit-journal tail
+      // explains the deliberate ones).
+      store.appendCheckinHistory(
+        user,
+        auth.deviceId,
+        "daemon",
+        dVer,
+        body?.uptime_s ?? null,
+        nowMs,
+      );
+      if (body) {
+        store.saveDeviceCheckinState(user, auth.deviceId, "daemon", JSON.stringify(body), nowMs);
+      }
+    } catch {
+      // fleet tracking is non-critical; the heartbeat itself still counts
+    }
+    const directive = store.takeDirective(user, auth.deviceId, Date.now());
+    return c.json(directive ? { ok: true, directive } : { ok: true });
+  });
+
+  // The watchdog's ~200B curl checkin — the SECOND liveness channel, and
+  // the directive path that still works when the daemon is wedged,
+  // crash-looping, or rolled back (docs/resilience.md). Auth is EXACTLY
+  // /checkin's: existing device secrets only. The WatchdogCheckinBody is
+  // optional and best-effort — any parse/shape failure is ignored and the
+  // checkin still counts (a watchdog must never be told its report was
+  // refused). Deliberately never touches last_seen/version/arch: those
+  // describe the daemon, and blending the channels would blind WEDGED.
+  app.post("/watchdog-checkin", async (c) => {
+    const user = (c.req.header("x-tokenleader-user") ?? "").trim();
+    if (!/^[a-z0-9._-]{1,64}$/.test(user)) {
+      return c.json({ error: "invalid or missing X-Tokenleader-User" }, 400);
+    }
+    const auth = authDevice(c, user);
+    if (!auth) {
+      noteAuthFailure(c, "/watchdog-checkin", user);
+      return c.json({ error: "unknown user or secret mismatch" }, 403);
+    }
+    let body: WatchdogCheckinBody | null = null;
+    try {
+      const raw = await c.req.text();
+      if (raw.length > 0 && raw.length <= CHECKIN_BODY_MAX_BYTES) {
+        body = sanitizeWatchdogBody(JSON.parse(raw));
+      }
+    } catch {
+      // garbled bodies never fail the checkin
+    }
+    const nowMs = Date.now();
+    try {
+      store.recordWatchdogCheckIn(auth.deviceId, nowMs);
+      const wVersion =
+        body !== null && body.watchdog_version.length > 0 ? body.watchdog_version : null;
+      store.appendCheckinHistory(user, auth.deviceId, "watchdog", wVersion, null, nowMs);
+      if (body) {
+        store.saveDeviceCheckinState(user, auth.deviceId, "watchdog", JSON.stringify(body), nowMs);
+      }
+    } catch {
+      // liveness bookkeeping is non-critical; the 200 + directive still count
+    }
+    const directive = store.takeDirective(user, auth.deviceId, Date.now());
+    return c.json(directive ? { ok: true, directive } : { ok: true });
+  });
+
+  // Executed-ack: the completion signal for a directive — delivery alone
+  // no longer finishes one (an executor can die between receipt and
+  // action; un-acked directives re-queue once on TTL, see db.ts). Same
+  // device auth as /checkin; either executor (daemon or watchdog) may ack.
+  // Shape errors are 400s, never 500s — but only v0.6+ clients speak this
+  // route, so strictness costs nothing on the wire.
+  app.post("/directives/ack", async (c) => {
     const user = (c.req.header("x-tokenleader-user") ?? "").trim();
     if (!/^[a-z0-9._-]{1,64}$/.test(user)) {
       return c.json({ error: "invalid or missing X-Tokenleader-User" }, 400);
@@ -1449,27 +1608,38 @@ export function buildApp(opts: BuildOptions) {
     if (!auth) {
       return c.json({ error: "unknown user or secret mismatch" }, 403);
     }
+    let body: unknown;
     try {
-      const dVer = (c.req.header("x-tokenleader-version") ?? "").trim();
-      const dArch = (c.req.header("x-tokenleader-arch") ?? "").trim();
-      store.recordDeviceCheckIn(
-        user,
-        auth.deviceId,
-        dVer.length > 0 && dVer.toLowerCase() !== "dev" ? dVer.slice(0, 64) : null,
-        dArch.length > 0 ? dArch.slice(0, 16) : null,
-        deviceLabelFrom(c.req.header("x-tokenleader-device")),
-        Date.now(),
-      );
+      body = await c.req.json();
     } catch {
-      // fleet tracking is non-critical; the heartbeat itself still counts
+      return c.json({ error: "invalid json body" }, 400);
     }
-    const directive = store.takeDirective(user, Date.now());
-    return c.json(directive ? { ok: true, directive } : { ok: true });
+    const b = (body && typeof body === "object" ? body : {}) as Record<string, unknown>;
+    if (!isFiniteInt(b.id)) return c.json({ error: "body.id must be an integer" }, 400);
+    if (b.result !== "ok" && b.result !== "failed") {
+      return c.json({ error: "body.result must be 'ok' | 'failed'" }, 400);
+    }
+    if (b.executedBy !== "daemon" && b.executedBy !== "watchdog") {
+      return c.json({ error: "body.executedBy must be 'daemon' | 'watchdog'" }, 400);
+    }
+    const detail = typeof b.detail === "string" ? b.detail.slice(0, ACK_DETAIL_MAX_CHARS) : null;
+    const r = store.ackDirective(
+      user,
+      b.id,
+      { result: b.result, detail, executedBy: b.executedBy },
+      Date.now(),
+    );
+    if (r === null) {
+      return c.json({ error: `unknown directive ${b.id} for user '${user}'` }, 404);
+    }
+    // First ack wins; replays are acknowledged (idempotent), never rewrite.
+    return c.json({ ok: true, id: b.id, duplicate: r === "duplicate" });
   });
 
   // Log-tail upload (the upload_logs directive's payload). Same auth as
   // /checkin. Body is plain text, capped server-side so a misbehaving
-  // client can't bloat the DB; one row per user (newest replaces).
+  // client can't bloat the DB; one row per (user, device) — newest
+  // replaces, and two laptops no longer overwrite each other.
   app.post("/diag/logs", async (c) => {
     const user = (c.req.header("x-tokenleader-user") ?? "").trim();
     if (!/^[a-z0-9._-]{1,64}$/.test(user)) {
@@ -1477,11 +1647,12 @@ export function buildApp(opts: BuildOptions) {
     }
     const auth = authDevice(c, user);
     if (!auth) {
+      noteAuthFailure(c, "/diag/logs", user);
       return c.json({ error: "unknown user or secret mismatch" }, 403);
     }
     const body = (await c.req.text()).slice(0, DIAG_LOG_MAX_BYTES);
     if (body.length === 0) return c.json({ error: "empty body" }, 400);
-    store.saveDiagLog(user, body, Date.now());
+    store.saveDiagLog(user, auth.deviceId, body, Date.now());
     return c.json({ ok: true, bytes: body.length });
   });
 
@@ -1544,6 +1715,42 @@ export function buildApp(opts: BuildOptions) {
     if (secret.length === 0) return null;
     const hash = createHash("sha256").update(secret).digest("hex");
     return store.authenticateDevice(user, hash);
+  };
+
+  // 403 forensics: TOFU-secret loss used to be invisible server-side (the
+  // machine just retried forever while its fleet row went stale). Every
+  // device-auth failure on the reporting routes leaves a capped trace —
+  // the claimed user + device label are UNAUTHENTICATED hints recorded for
+  // triage, never trusted for anything else. Best-effort: recording must
+  // never change the response.
+  const noteAuthFailure = (c: Context, route: string, user: string): void => {
+    try {
+      store.recordAuthFailure(
+        route,
+        user,
+        deviceLabelFrom(c.req.header("x-tokenleader-device")),
+        Date.now(),
+      );
+    } catch {
+      // forensics only — the 403 stands on its own
+    }
+  };
+
+  // Resolve an operator-supplied device reference — numeric id or label
+  // (labels are stored lowercased) — to one of the user's ACTIVE devices.
+  // Shared by /admin/directives (device targeting) and /admin/diag/logs.
+  const resolveDeviceRef = (user: string, ref: unknown): DeviceInfo | null => {
+    const devices = store.listUserDevices(user);
+    if (typeof ref === "number" && Number.isInteger(ref)) {
+      return devices.find((d) => d.id === ref) ?? null;
+    }
+    if (typeof ref === "string" && ref.trim().length > 0) {
+      const s = ref.trim().toLowerCase();
+      const byLabel = devices.find((d) => d.label === s);
+      if (byLabel) return byLabel;
+      if (/^\d+$/.test(s)) return devices.find((d) => d.id === Number(s)) ?? null;
+    }
+    return null;
   };
 
   const parseUserBody = async (
@@ -1635,10 +1842,14 @@ export function buildApp(opts: BuildOptions) {
     return linkCodeResponse(c, user);
   });
 
-  // --- directives: zero-touch remote actions for alive daemons -------------
-  // Enqueue. Body { user, verb }. The user's next /checkin or /ingest
-  // response carries it exactly once; the daemon executes from its own
-  // allowlist. Undelivered directives expire after 24h.
+  // --- directives: zero-touch remote actions ------------------------------
+  // Enqueue. Body { user, verb, device? }. device (label or id) pins
+  // delivery to one machine — the alert sweep and operators heal a specific
+  // wedged laptop, not whichever device polls first; omitted = any of the
+  // user's devices. The next /checkin, /ingest, or /watchdog-checkin
+  // response carries it exactly once; executors run from their own
+  // allowlists and ack via POST /directives/ack. Undelivered directives
+  // expire after 24h (one re-queue for delivered-but-unacked, see db.ts).
   app.post("/admin/directives", async (c) => {
     const denied = requireAdmin(c);
     if (denied) return denied;
@@ -1652,28 +1863,100 @@ export function buildApp(opts: BuildOptions) {
     if (store.getUserSecretRow(user) === null) {
       return c.json({ error: `unknown user '${user}'` }, 404);
     }
-    const id = store.enqueueDirective(user, verb as DirectiveVerb, Date.now());
-    return c.json({ id, user, verb });
+    const deviceRef = parsed.body.device;
+    let deviceId: number | null = null;
+    if (deviceRef !== undefined && deviceRef !== null) {
+      const dev = resolveDeviceRef(user, deviceRef);
+      if (!dev) {
+        return c.json({ error: `unknown device for user '${user}'` }, 404);
+      }
+      deviceId = dev.id;
+    }
+    const id = store.enqueueDirective(user, verb as DirectiveVerb, Date.now(), deviceId);
+    return c.json(deviceId === null ? { id, user, verb } : { id, user, verb, deviceId });
   });
 
-  // Recent directives for a user (delivered_at null = still pending).
+  // Recent directives for a user with their full lifecycle: pending →
+  // delivered (awaiting ack) → executed (result/executed_by stamped) or
+  // expired; requeued_at marks the one TTL retry. `state` is derived
+  // server-side so operators don't re-implement the timestamp algebra.
   app.get("/admin/directives", (c) => {
     const denied = requireAdmin(c);
     if (denied) return denied;
     const user = (c.req.query("user") ?? "").trim();
     if (user.length === 0) return c.json({ error: "user query param required" }, 400);
-    return c.json({ directives: store.listDirectives(user) });
+    const nowMs = Date.now();
+    return c.json({
+      directives: store
+        .listDirectives(user)
+        .map((d) => ({ ...d, state: directiveState(d, nowMs) })),
+    });
   });
 
-  // Read a user's uploaded log tail (the upload_logs directive's result).
+  // Read an uploaded log tail (the upload_logs directive's result).
+  // ?user= alone returns the user's most recent upload across devices
+  // (falling back to the legacy pre-v0.6 single-row table); &device=
+  // (label or id) narrows to one machine.
   app.get("/admin/diag/logs", (c) => {
     const denied = requireAdmin(c);
     if (denied) return denied;
     const user = (c.req.query("user") ?? "").trim();
     if (user.length === 0) return c.json({ error: "user query param required" }, 400);
+    const deviceRef = (c.req.query("device") ?? "").trim();
+    if (deviceRef.length > 0) {
+      const dev = resolveDeviceRef(user, deviceRef);
+      if (!dev) return c.json({ error: `unknown device for user '${user}'` }, 404);
+      const row = store.getDiagLogForDevice(user, dev.id);
+      if (!row) {
+        return c.json({ error: `no log upload from '${user}' device '${deviceRef}'` }, 404);
+      }
+      return c.json({
+        user,
+        deviceId: dev.id,
+        deviceLabel: dev.label,
+        uploadedAt: row.uploadedAt,
+        content: row.content,
+      });
+    }
     const row = store.getDiagLog(user);
     if (!row) return c.json({ error: `no log upload from '${user}'` }, 404);
-    return c.json({ user, uploadedAt: row.uploadedAt, content: row.content });
+    return c.json({
+      user,
+      deviceId: row.deviceId,
+      uploadedAt: row.uploadedAt,
+      content: row.content,
+    });
+  });
+
+  // Failed-auth trace (the 403 forensics of /ingest, /checkin,
+  // /watchdog-checkin, /diag/logs). ?user= narrows to one claimed handle.
+  // TOFU-secret loss now leaves evidence instead of an eternally-stale
+  // fleet row and a silently retrying machine.
+  app.get("/admin/auth-failures", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const user = (c.req.query("user") ?? "").trim();
+    return c.json({ failures: store.listAuthFailures(user.length > 0 ? user : null) });
+  });
+
+  // Mark a user uninstalled without their machine's cooperation — for
+  // laptops that were wiped/reimaged and can never run the uninstall
+  // script. Ends the eternal-stale-row noise: the user leaves /stats/fleet
+  // and the alert sweep, and their (non-barred) secret may seamlessly
+  // re-claim on a future reinstall. Body { user }.
+  app.post("/admin/mark-uninstalled", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const parsed = await parseUserBody(c);
+    if (!parsed.ok) return parsed.res;
+    const user = parsed.body.user as string;
+    const nowMs = Date.now();
+    if (!store.adminMarkUninstalled(user, nowMs)) {
+      return c.json({ error: `unknown user '${user}'` }, 404);
+    }
+    // The uninstalled list is baked into the cached /stats/admin payload.
+    invalidateStatsCache();
+    return c.json({ ok: true, user, uninstalledAt: nowMs });
   });
 
   // --- categories: admin-defined groups + per-user assignment --------------
@@ -1953,6 +2236,32 @@ export function buildApp(opts: BuildOptions) {
     });
   }
 
+  // Fleet alert sweep (docs/resilience.md): every 5 minutes classify every
+  // active device; WEDGED/DEGRADED/DARK held > 1h pages the operator
+  // webhook (6h dedup per device+state) and WEDGED auto-queues a
+  // device-targeted restart. Server timers are fine here — the daemon-side
+  // ban on timer-based liveness is about the daemon's own runtime; a
+  // missed sweep only delays an alert. Suppression is consulted per sweep.
+  // No immediate first run: fresh state right after boot is classification
+  // noise, and test apps must never sweep mid-test.
+  let alertSweepTimer: ReturnType<typeof setInterval> | null = null;
+  if (opts.scheduleAlertSweep !== false) {
+    alertSweepTimer = setInterval(() => {
+      sweepFleetAlerts({
+        store,
+        webhookUrl: opts.alertWebhook ?? null,
+        suppressed: opts.alertSuppress ?? process.env.TOKENLEADER_ALERT_SUPPRESS === "1",
+        ...(opts.alertFetch ? { fetchImpl: opts.alertFetch } : {}),
+      }).catch((err) => {
+        console.warn(`[tokenleader] fleet alert sweep failed: ${err}`);
+      });
+    }, ALERT_SWEEP_INTERVAL_MS);
+    // Don't keep the process alive purely for this timer.
+    if (typeof alertSweepTimer === "object" && alertSweepTimer && "unref" in alertSweepTimer) {
+      (alertSweepTimer as { unref?: () => void }).unref?.();
+    }
+  }
+
   return {
     app,
     store,
@@ -1962,6 +2271,7 @@ export function buildApp(opts: BuildOptions) {
     cursorMirror,
     stop: async () => {
       if (refreshTimer) clearInterval(refreshTimer);
+      if (alertSweepTimer) clearInterval(alertSweepTimer);
       mirror?.stop();
       // Awaited: a cursor tick can be mid-insertMany; the store must not
       // be closed until it drains.
@@ -2019,6 +2329,11 @@ if (import.meta.main) {
   if (cfg.cursorToken !== undefined) buildOpts.cursorToken = cfg.cursorToken;
   if (cfg.cursorUserMap !== undefined) buildOpts.cursorUserMap = cfg.cursorUserMap;
   if (cfg.companyAliases !== undefined) buildOpts.companyAliases = cfg.companyAliases;
+  // Alert plumbing is read straight from env (not parseServerConfig — no
+  // validation to do on a webhook URL, and the suppress toggle is
+  // re-consulted at every sweep anyway). Unset webhook = log-only sweep.
+  const alertWebhook = (process.env.TOKENLEADER_ALERT_WEBHOOK ?? "").trim();
+  if (alertWebhook.length > 0) buildOpts.alertWebhook = alertWebhook;
   const rt = buildApp(buildOpts);
   echoConfig(cfg);
   console.log(

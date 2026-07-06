@@ -1,11 +1,16 @@
 // Directive channel + heartbeat: /checkin stamps liveness for daemons with
-// nothing to post and delivers single-shot directives; /diag/logs stores a
-// log tail; /admin/directives enqueues. Identity changes (claim/re-claim/
-// link) must stay exclusively on /ingest — /checkin only ever authenticates
+// nothing to post and delivers single-shot directives; /watchdog-checkin is
+// the second channel that still works when the daemon is wedged;
+// /directives/ack completes a directive (delivery alone no longer does);
+// /diag/logs stores a per-device log tail; /admin/directives enqueues (with
+// optional device targeting). Identity changes (claim/re-claim/link) must
+// stay exclusively on /ingest — the checkin routes only ever authenticate
 // EXISTING devices.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { createTestApp, jsonOf, makeTokenEvent } from "../test-helpers.ts";
 import type { TokenEvent } from "../types.ts";
+import { DIRECTIVE_TTL_MS } from "./db.ts";
 
 const SECRET = "hb-machine-secret";
 const ADMIN = "admin-tok";
@@ -206,5 +211,376 @@ describe("/diag/logs", () => {
       }),
     );
     expect(none.status).toBe(404);
+  });
+
+  test("per-device: two machines keep separate tails; &device= selects; unknown device 404", async () => {
+    await claim("nyla", SECRET);
+    const second = "nyla-second-secret";
+    store.linkUserDevice("nyla", sha256Hex(second), Date.now(), "imac");
+
+    const upload = (secret: string, content: string) =>
+      app.request(
+        new Request("http://x/diag/logs", {
+          method: "POST",
+          headers: { "x-tokenleader-secret": secret, "x-tokenleader-user": "nyla" },
+          body: content,
+        }),
+      );
+    expect((await upload(SECRET, "tail-from-first")).status).toBe(200);
+    // Distinct uploaded_at: real uploads are minutes apart; the "newest
+    // across devices" read below must not hinge on a same-ms tie.
+    await Bun.sleep(2);
+    expect((await upload(second, "tail-from-imac")).status).toBe(200);
+
+    const read = (qs: string) =>
+      app.request(
+        new Request(`http://x/admin/diag/logs?${qs}`, {
+          headers: { authorization: `Bearer ${ADMIN}` },
+        }),
+      );
+    // No device param → newest upload across devices (the imac's).
+    const latest = await jsonOf(await read("user=nyla"));
+    expect(latest.content).toBe("tail-from-imac");
+    expect(typeof latest.deviceId).toBe("number");
+
+    // &device= by label narrows to one machine — the first device's tail
+    // was NOT overwritten by the imac's upload.
+    const byLabel = await jsonOf(await read("user=nyla&device=imac"));
+    expect(byLabel.content).toBe("tail-from-imac");
+    expect(byLabel.deviceLabel).toBe("imac");
+    const firstId = store.listUserDevices("nyla")[0]!.id;
+    const byId = await jsonOf(await read(`user=nyla&device=${firstId}`));
+    expect(byId.content).toBe("tail-from-first");
+
+    expect((await read("user=nyla&device=ghost-machine")).status).toBe(404);
+  });
+});
+
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+function watchdogCheckinReq(
+  user: string,
+  secret: string,
+  body?: string,
+  headers: Record<string, string> = {},
+): Request {
+  return new Request("http://x/watchdog-checkin", {
+    method: "POST",
+    headers: { "x-tokenleader-secret": secret, "x-tokenleader-user": user, ...headers },
+    ...(body !== undefined ? { body } : {}),
+  });
+}
+
+function ackReq(user: string, secret: string, body: unknown): Request {
+  return new Request("http://x/directives/ack", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-tokenleader-secret": secret,
+      "x-tokenleader-user": user,
+    },
+    body: typeof body === "string" ? body : JSON.stringify(body),
+  });
+}
+
+describe("v0.6 directive verbs", () => {
+  test("watchdog verbs pass the admin allowlist", async () => {
+    await claim("pax", SECRET);
+    for (const verb of ["reinstall_watchdog", "sample", "upload_state"]) {
+      const res = await app.request(adminEnqueue("pax", verb));
+      expect(res.status).toBe(200);
+      expect((await jsonOf(res)).verb).toBe(verb);
+    }
+  });
+});
+
+describe("per-device directive targeting", () => {
+  test("a device-pinned directive is only handed to that device; NULL goes to anyone", async () => {
+    await claim("orla", SECRET);
+    const imacSecret = "orla-imac-secret";
+    const imacId = store.linkUserDevice("orla", sha256Hex(imacSecret), Date.now(), "imac");
+
+    // Target the imac by label.
+    const enq = await app.request(
+      new Request("http://x/admin/directives", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN}` },
+        body: JSON.stringify({ user: "orla", verb: "restart", device: "imac" }),
+      }),
+    );
+    expect(enq.status).toBe(200);
+    expect((await jsonOf(enq)).deviceId).toBe(imacId);
+
+    // The first machine polls: nothing for it.
+    const other = await jsonOf(await app.request(checkinReq("orla", SECRET)));
+    expect(other.directive).toBeUndefined();
+    // The imac polls: delivered.
+    const target = await jsonOf(await app.request(checkinReq("orla", imacSecret)));
+    expect(target.directive.verb).toBe("restart");
+
+    // Untargeted directives still reach any device.
+    await app.request(adminEnqueue("orla", "upload_logs"));
+    const any = await jsonOf(await app.request(checkinReq("orla", SECRET)));
+    expect(any.directive.verb).toBe("upload_logs");
+  });
+
+  test("device targeting by numeric id; unknown device is 404", async () => {
+    await claim("piotr", SECRET);
+    const deviceId = store.listUserDevices("piotr")[0]!.id;
+    const byId = await app.request(
+      new Request("http://x/admin/directives", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN}` },
+        body: JSON.stringify({ user: "piotr", verb: "restart", device: deviceId }),
+      }),
+    );
+    expect(byId.status).toBe(200);
+    expect((await jsonOf(byId)).deviceId).toBe(deviceId);
+
+    const unknown = await app.request(
+      new Request("http://x/admin/directives", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${ADMIN}` },
+        body: JSON.stringify({ user: "piotr", verb: "restart", device: "no-such-machine" }),
+      }),
+    );
+    expect(unknown.status).toBe(404);
+  });
+});
+
+describe("executed-ack lifecycle (/directives/ack)", () => {
+  test("delivery leaves a directive open; the ack completes it", async () => {
+    await claim("quinn", SECRET);
+    const { id } = await jsonOf(await app.request(adminEnqueue("quinn", "restart")));
+    const delivered = await jsonOf(await app.request(checkinReq("quinn", SECRET)));
+    expect(delivered.directive.id).toBe(id);
+
+    const adminList = async () =>
+      (
+        await jsonOf(
+          await app.request(
+            new Request("http://x/admin/directives?user=quinn", {
+              headers: { authorization: `Bearer ${ADMIN}` },
+            }),
+          ),
+        )
+      ).directives[0];
+
+    // Delivered but un-acked: lifecycle says so.
+    let row = await adminList();
+    expect(row.state).toBe("delivered");
+    expect(row.executed_at).toBeNull();
+
+    const ack = await app.request(
+      ackReq("quinn", SECRET, { id, result: "ok", executedBy: "daemon", detail: "restarted" }),
+    );
+    expect(ack.status).toBe(200);
+    expect((await jsonOf(ack)).duplicate).toBe(false);
+
+    row = await adminList();
+    expect(row.state).toBe("executed");
+    expect(row.executed_at).toBeGreaterThan(0);
+    expect(row.result).toBe("ok");
+    expect(row.detail).toBe("restarted");
+    expect(row.executed_by).toBe("daemon");
+
+    // Replayed ack: idempotent, first write stands.
+    const replay = await jsonOf(
+      await app.request(ackReq("quinn", SECRET, { id, result: "failed", executedBy: "watchdog" })),
+    );
+    expect(replay.ok).toBe(true);
+    expect(replay.duplicate).toBe(true);
+    expect((await adminList()).result).toBe("ok");
+  });
+
+  test("ack validation: wrong secret 403, foreign id 404, garbage 400 (never 500)", async () => {
+    await claim("rene", SECRET);
+    const { id } = await jsonOf(await app.request(adminEnqueue("rene", "upload_logs")));
+    await app.request(checkinReq("rene", SECRET));
+
+    expect(
+      (await app.request(ackReq("rene", "intruder", { id, result: "ok", executedBy: "daemon" })))
+        .status,
+    ).toBe(403);
+    // Another user cannot ack rene's directive even with valid auth.
+    await claim("sana", SECRET);
+    expect(
+      (await app.request(ackReq("sana", SECRET, { id, result: "ok", executedBy: "daemon" })))
+        .status,
+    ).toBe(404);
+    expect(
+      (
+        await app.request(
+          ackReq("rene", SECRET, { id: 999_999, result: "ok", executedBy: "daemon" }),
+        )
+      ).status,
+    ).toBe(404);
+    expect((await app.request(ackReq("rene", SECRET, "{{{not json"))).status).toBe(400);
+    expect(
+      (await app.request(ackReq("rene", SECRET, { id, result: "shrug", executedBy: "daemon" })))
+        .status,
+    ).toBe(400);
+    expect(
+      (await app.request(ackReq("rene", SECRET, { id, result: "ok", executedBy: "cron" }))).status,
+    ).toBe(400);
+  });
+});
+
+describe("directive TTL re-queue (once, then expire)", () => {
+  test("delivered-but-unacked re-queues exactly once after the TTL", async () => {
+    await claim("tomo", SECRET);
+    const { id } = await jsonOf(await app.request(adminEnqueue("tomo", "restart")));
+    const first = await jsonOf(await app.request(checkinReq("tomo", SECRET)));
+    expect(first.directive.id).toBe(id);
+
+    // Simulate a full TTL passing with no ack (the executor died mid-run).
+    store.db
+      .prepare("UPDATE pending_directives SET delivered_at = ? WHERE id = ?")
+      .run(Date.now() - DIRECTIVE_TTL_MS - 60_000, id);
+    const requeued = await jsonOf(await app.request(checkinReq("tomo", SECRET)));
+    expect(requeued.directive.id).toBe(id);
+
+    // The retry is spent (requeued_at set): a second TTL lapse expires it.
+    store.db
+      .prepare("UPDATE pending_directives SET delivered_at = ?, requeued_at = ? WHERE id = ?")
+      .run(Date.now() - DIRECTIVE_TTL_MS - 60_000, Date.now() - DIRECTIVE_TTL_MS - 60_000, id);
+    const third = await jsonOf(await app.request(checkinReq("tomo", SECRET)));
+    expect(third.directive).toBeUndefined();
+  });
+});
+
+describe("/watchdog-checkin", () => {
+  test("stamps watchdog_last_seen without touching the daemon channel", async () => {
+    await claim("uli", SECRET);
+    const before = store.listUserDevices("uli")[0]!;
+    expect(before.watchdogLastSeen).toBeNull();
+
+    const res = await app.request(watchdogCheckinReq("uli", SECRET));
+    expect(res.status).toBe(200);
+    expect((await jsonOf(res)).ok).toBe(true);
+
+    const after = store.listUserDevices("uli")[0]!;
+    expect(after.watchdogLastSeen).toBeGreaterThan(Date.now() - 5_000);
+    expect(after.lastSeen).toBe(before.lastSeen); // daemon channel untouched
+  });
+
+  test("auth mirrors /checkin: unknown user 403 (never claims), bad handle 400", async () => {
+    const res = await app.request(watchdogCheckinReq("phantom", "phantom-secret"));
+    expect(res.status).toBe(403);
+    expect(store.getUserSecretRow("phantom")).toBeNull();
+    expect((await app.request(watchdogCheckinReq("Not A Handle!", SECRET))).status).toBe(400);
+  });
+
+  test("optional body is persisted; garbage bodies are ignored, still 200", async () => {
+    await claim("vito", SECRET);
+    const deviceId = store.listUserDevices("vito")[0]!.id;
+
+    const good = await app.request(
+      watchdogCheckinReq(
+        "vito",
+        SECRET,
+        JSON.stringify({
+          watchdog_version: "v0.6.0",
+          daemon_pid_alive: true,
+          heartbeat_age_runs: 2,
+          kills_recent: 0,
+          degraded: false,
+          spool_pending: 1,
+        }),
+      ),
+    );
+    expect(good.status).toBe(200);
+    const stored = store.getDeviceCheckinState(deviceId, "watchdog");
+    expect(stored).not.toBeNull();
+    expect(JSON.parse(stored!.body).heartbeat_age_runs).toBe(2);
+    const history = store.recentCheckinHistory(deviceId, "watchdog");
+    expect(history.length).toBe(1);
+    expect(history[0]!.version).toBe("v0.6.0");
+
+    // Garbage body: 200, prior stored state untouched.
+    const garbage = await app.request(watchdogCheckinReq("vito", SECRET, "{{{{ not json"));
+    expect(garbage.status).toBe(200);
+    expect((await jsonOf(garbage)).ok).toBe(true);
+    expect(
+      JSON.parse(store.getDeviceCheckinState(deviceId, "watchdog")!.body).heartbeat_age_runs,
+    ).toBe(2);
+    // The checkin still counted (that's the point of ignoring the body).
+    expect(store.recentCheckinHistory(deviceId, "watchdog").length).toBe(2);
+  });
+
+  test("delivers directives — the heal path for a wedged daemon", async () => {
+    await claim("wren", SECRET);
+    await app.request(adminEnqueue("wren", "sample"));
+    const body = await jsonOf(await app.request(watchdogCheckinReq("wren", SECRET)));
+    expect(body.directive.verb).toBe("sample");
+  });
+});
+
+describe("/checkin body persistence (v0.6)", () => {
+  test("a CheckinBody is stored per device and uptime lands in the history journal", async () => {
+    await claim("xena", SECRET);
+    const deviceId = store.listUserDevices("xena")[0]!.id;
+    const res = await app.request(
+      new Request("http://x/checkin", {
+        method: "POST",
+        headers: {
+          "x-tokenleader-secret": SECRET,
+          "x-tokenleader-user": "xena",
+          "x-tokenleader-version": "v0.6.0",
+        },
+        body: JSON.stringify({
+          uptime_s: 4321,
+          tick_seq: 7,
+          consec_failures: 1,
+          last_error: "batch_post_failed",
+          last_update_result: null,
+          disk_free_mb: 12000,
+          drift_ms: 220,
+          heartbeat_write_failures: 0,
+          exit_journal_tail: [{ ts: Date.now() - 60_000, reason: "update_swap", code: 75 }],
+          watchdog_installed: true,
+        }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    expect((await jsonOf(res)).ok).toBe(true);
+
+    const stored = store.getDeviceCheckinState(deviceId, "daemon");
+    expect(stored).not.toBeNull();
+    const parsed = JSON.parse(stored!.body);
+    expect(parsed.uptime_s).toBe(4321);
+    expect(parsed.last_error).toBe("batch_post_failed");
+    expect(parsed.exit_journal_tail.length).toBe(1);
+
+    const history = store.recentCheckinHistory(deviceId, "daemon");
+    expect(history[history.length - 1]!.uptime_s).toBe(4321);
+    expect(history[history.length - 1]!.version).toBe("v0.6.0");
+  });
+
+  test("WIRE COMPAT: header-only and garbage-body checkins behave exactly like today", async () => {
+    await claim("yuri", SECRET);
+    const deviceId = store.listUserDevices("yuri")[0]!.id;
+
+    // Header-only (every pre-0.6 daemon).
+    const bare = await app.request(checkinReq("yuri", SECRET));
+    expect(bare.status).toBe(200);
+    expect(await jsonOf<{ ok: boolean }>(bare)).toEqual({ ok: true });
+    expect(store.getDeviceCheckinState(deviceId, "daemon")).toBeNull();
+
+    // Garbage body: ignored wholesale, same response shape, never a 500.
+    const garbage = await app.request(
+      new Request("http://x/checkin", {
+        method: "POST",
+        headers: { "x-tokenleader-secret": SECRET, "x-tokenleader-user": "yuri" },
+        body: "\x00\x01 not json at all",
+      }),
+    );
+    expect(garbage.status).toBe(200);
+    expect(await jsonOf<{ ok: boolean }>(garbage)).toEqual({ ok: true });
+    expect(store.getDeviceCheckinState(deviceId, "daemon")).toBeNull();
+    // Both checkins still stamped the cadence journal.
+    expect(store.recentCheckinHistory(deviceId, "daemon").length).toBe(2);
   });
 });

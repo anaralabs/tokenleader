@@ -77,17 +77,23 @@ CREATE TABLE IF NOT EXISTS daemon_status (
 -- deliberate /devices/revoke path (vs left via uninstall) — its secret can
 -- never auto-reclaim the handle, so a revoked machine's still-running
 -- daemon can't resurrect itself.
+-- watchdog_last_seen is the SECOND liveness channel (docs/resilience.md):
+-- stamped only by /watchdog-checkin, never by daemon traffic, so the fleet
+-- classifier can tell "daemon wedged, watchdog alive" from "machine dark".
+-- NULL = this device never ran a v0.6 watchdog; pre-existing DBs get the
+-- column via migrateWatchdogLastSeen.
 CREATE TABLE IF NOT EXISTS user_devices (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  username    TEXT NOT NULL,
-  secret_hash TEXT NOT NULL,
-  label       TEXT,
-  version     TEXT,
-  arch        TEXT,
-  added_at    INTEGER NOT NULL,
-  last_seen   INTEGER,
-  revoked_at  INTEGER,
-  barred      INTEGER NOT NULL DEFAULT 0
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  username           TEXT NOT NULL,
+  secret_hash        TEXT NOT NULL,
+  label              TEXT,
+  version            TEXT,
+  arch               TEXT,
+  added_at           INTEGER NOT NULL,
+  last_seen          INTEGER,
+  revoked_at         INTEGER,
+  barred             INTEGER NOT NULL DEFAULT 0,
+  watchdog_last_seen INTEGER
 );
 CREATE INDEX IF NOT EXISTS user_devices_user ON user_devices (username);
 
@@ -98,28 +104,121 @@ CREATE TABLE IF NOT EXISTS server_meta (
   value TEXT NOT NULL
 );
 
--- Single-shot remote directives for ALIVE daemons (the zero-touch recovery
--- channel — no MDM, no SSH). An operator enqueues a verb via
--- /admin/directives; the next /checkin or /ingest response for that user
--- carries it (delivered_at stamped atomically, so exactly one daemon ever
--- receives it) and the daemon executes an allowlisted action client-side.
+-- Single-shot remote directives (the zero-touch recovery channel — no MDM,
+-- no SSH). An operator enqueues a verb via /admin/directives; the next
+-- /checkin, /ingest, or /watchdog-checkin response for that user carries it
+-- (delivered_at stamped atomically, so exactly one executor ever receives
+-- it) and the executor runs an allowlisted action client-side.
+-- v0.6 lifecycle (docs/resilience.md): delivery no longer completes a
+-- directive — the executed-ack (POST /directives/ack) does, stamping
+-- executed_at/result/executed_by. A delivered-but-never-acked directive
+-- re-queues ONCE after DIRECTIVE_TTL_MS (requeued_at records the second
+-- eligibility window), then expires. device_id NULL = any of the user's
+-- devices may take it; non-NULL pins delivery to one machine. Pre-existing
+-- DBs get the new columns via migrateDirectiveLifecycle.
 CREATE TABLE IF NOT EXISTS pending_directives (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   username     TEXT NOT NULL,
   verb         TEXT NOT NULL,
   created_at   INTEGER NOT NULL,
-  delivered_at INTEGER
+  delivered_at INTEGER,
+  device_id    INTEGER,
+  executed_at  INTEGER,
+  result       TEXT,
+  detail       TEXT,
+  executed_by  TEXT,
+  requeued_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS pending_directives_user
   ON pending_directives (username, delivered_at);
 
--- Latest diagnostic log tail per user (payload of the upload_logs
--- directive). One row per user — a new upload replaces the old, and the
--- route caps the size, so the table never grows past users × cap.
+-- Legacy per-user diagnostic log tail. Superseded by diag_logs_v2 (keyed by
+-- device, so two laptops no longer overwrite each other); kept so a server
+-- rollback finds its table. No longer written; read only as a fallback for
+-- pre-migration uploads.
 CREATE TABLE IF NOT EXISTS diag_logs (
   username    TEXT PRIMARY KEY,
   uploaded_at INTEGER NOT NULL,
   content     TEXT NOT NULL
+);
+
+-- Latest diagnostic log tail per (user, device) — payload of the
+-- upload_logs directive. One row per device (a new upload replaces the
+-- old) and the route caps the size, so the table never grows past
+-- devices × cap.
+CREATE TABLE IF NOT EXISTS diag_logs_v2 (
+  username    TEXT NOT NULL,
+  device_id   INTEGER NOT NULL,
+  uploaded_at INTEGER NOT NULL,
+  content     TEXT NOT NULL,
+  PRIMARY KEY (username, device_id)
+);
+
+-- Append-only checkin cadence journal, one row per /checkin ('daemon') or
+-- /watchdog-checkin ('watchdog') — cadence gaps are diagnosable after the
+-- fact instead of being overwritten by the latest stamp. Capped at
+-- CHECKIN_HISTORY_PER_DEVICE rows per device (pruned on insert). uptime_s
+-- rides along from CheckinBody so the fleet classifier can spot restarts
+-- (uptime resets) without extra columns.
+CREATE TABLE IF NOT EXISTS checkin_history (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  username  TEXT NOT NULL,
+  device_id INTEGER NOT NULL,
+  ts        INTEGER NOT NULL,
+  kind      TEXT NOT NULL,
+  version   TEXT,
+  uptime_s  INTEGER
+);
+CREATE INDEX IF NOT EXISTS checkin_history_device ON checkin_history (device_id, id);
+
+-- Latest structured checkin body per (device, channel): kind 'daemon'
+-- stores a sanitized CheckinBody, kind 'watchdog' a sanitized
+-- WatchdogCheckinBody, both as JSON. One row per pair — the fleet
+-- classifier only ever needs the newest observation; cadence lives in
+-- checkin_history.
+CREATE TABLE IF NOT EXISTS device_checkin_state (
+  device_id  INTEGER NOT NULL,
+  kind       TEXT NOT NULL,
+  username   TEXT NOT NULL,
+  updated_at INTEGER NOT NULL,
+  body       TEXT NOT NULL,
+  PRIMARY KEY (device_id, kind)
+);
+
+-- Failed device-auth attempts (403s on /ingest, /checkin,
+-- /watchdog-checkin, /diag/logs). TOFU-secret loss previously vanished
+-- without a trace — the daemon retried forever and the server logged
+-- nothing durable. Capped at AUTH_FAILURES_MAX rows (pruned on insert);
+-- username is the CLAIMED handle (unauthenticated input), never proof.
+CREATE TABLE IF NOT EXISTS auth_failures (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  username     TEXT NOT NULL,
+  device_label TEXT,
+  route        TEXT NOT NULL,
+  ts           INTEGER NOT NULL
+);
+
+-- One row per fleet alert actually pushed to the operator webhook — the
+-- dedup source ("don't re-alert the same device+state within 6h") must
+-- survive server restarts or every deploy re-pages the whole dark fleet.
+CREATE TABLE IF NOT EXISTS fleet_alerts (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id  INTEGER NOT NULL,
+  username   TEXT NOT NULL,
+  state      TEXT NOT NULL,
+  alerted_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS fleet_alerts_device ON fleet_alerts (device_id, state, alerted_at);
+
+-- Sweep-observed classification per device: since = when the current
+-- state was first observed, giving the alert sweep its "in state > 1h"
+-- gate without re-deriving state history. Updated only by the sweep.
+CREATE TABLE IF NOT EXISTS device_fleet_state (
+  device_id  INTEGER PRIMARY KEY,
+  username   TEXT NOT NULL,
+  state      TEXT NOT NULL,
+  since      INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 `;
 
@@ -230,6 +329,43 @@ function migrateCostUsdMicros(db: Database): void {
   const cols = db.prepare<{ name: string }, []>("PRAGMA table_info(events)").all();
   if (!cols.some((c) => c.name === "costUsdMicros")) {
     db.exec("ALTER TABLE events ADD COLUMN costUsdMicros INTEGER");
+  }
+}
+
+/**
+ * Migration: add `watchdog_last_seen` to user_devices (the second liveness
+ * channel, stamped only by /watchdog-checkin). Idempotent. NULL back-fills
+ * pre-migration rows correctly: those devices have never sent a watchdog
+ * checkin, which is exactly what NULL means to the fleet classifier.
+ */
+function migrateWatchdogLastSeen(db: Database): void {
+  const cols = db.prepare<{ name: string }, []>("PRAGMA table_info(user_devices)").all();
+  if (!cols.some((c) => c.name === "watchdog_last_seen")) {
+    db.exec("ALTER TABLE user_devices ADD COLUMN watchdog_last_seen INTEGER");
+  }
+}
+
+/**
+ * Migration: add the v0.6 lifecycle columns to pending_directives
+ * (device targeting + executed-ack + one-shot re-queue). Idempotent; all
+ * nullable, so pre-migration rows keep their exact delivery semantics
+ * until acked or expired.
+ */
+function migrateDirectiveLifecycle(db: Database): void {
+  const cols = db.prepare<{ name: string }, []>("PRAGMA table_info(pending_directives)").all();
+  const have = new Set(cols.map((c) => c.name));
+  const wanted: Array<[string, string]> = [
+    ["device_id", "INTEGER"],
+    ["executed_at", "INTEGER"],
+    ["result", "TEXT"],
+    ["detail", "TEXT"],
+    ["executed_by", "TEXT"],
+    ["requeued_at", "INTEGER"],
+  ];
+  for (const [name, type] of wanted) {
+    if (!have.has(name)) {
+      db.exec(`ALTER TABLE pending_directives ADD COLUMN ${name} ${type}`);
+    }
   }
 }
 
@@ -406,6 +542,7 @@ export interface UserDeviceRow {
   last_seen: number | null;
   revoked_at: number | null;
   barred: number;
+  watchdog_last_seen: number | null;
 }
 
 interface DirectiveRow {
@@ -416,8 +553,28 @@ interface DirectiveRow {
 export interface DirectiveListRow {
   id: number;
   verb: string;
+  device_id: number | null;
+  device_label: string | null;
   created_at: number;
   delivered_at: number | null;
+  executed_at: number | null;
+  result: string | null;
+  detail: string | null;
+  executed_by: string | null;
+  requeued_at: number | null;
+}
+
+/** Directive lifecycle: executed (acked) > delivered (awaiting ack) >
+ *  expired (aged out of its eligibility window, incl. the one re-queue) >
+ *  pending. Derived, never stored — the timestamps are the truth. */
+export function directiveState(
+  row: Pick<DirectiveListRow, "created_at" | "delivered_at" | "executed_at" | "requeued_at">,
+  now: number,
+): "pending" | "delivered" | "executed" | "expired" {
+  if (row.executed_at !== null) return "executed";
+  if (row.delivered_at !== null) return "delivered";
+  if ((row.requeued_at ?? row.created_at) <= now - DIRECTIVE_TTL_MS) return "expired";
+  return "pending";
 }
 
 interface DiagLogRow {
@@ -425,14 +582,53 @@ interface DiagLogRow {
   content: string;
 }
 
+interface DiagLogV2Row {
+  device_id: number;
+  uploaded_at: number;
+  content: string;
+}
+
+export interface CheckinHistoryRow {
+  ts: number;
+  kind: string;
+  version: string | null;
+  uptime_s: number | null;
+}
+
+export interface AuthFailureRow {
+  username: string;
+  device_label: string | null;
+  route: string;
+  ts: number;
+}
+
 // A directive older than this is stale — the machine it targeted was
 // offline the whole window, so silently running it days later would be a
 // surprise, not a recovery. Undelivered + expired rows are simply skipped.
-const DIRECTIVE_TTL_MS = 24 * 60 * 60 * 1000;
+// A DELIVERED directive that was never acked re-queues once after the same
+// window (requeued_at restarts eligibility), then expires for good.
+export const DIRECTIVE_TTL_MS = 24 * 60 * 60 * 1000;
 
-/** Daemon actions an operator may enqueue. Enforced at the /admin route AND
- *  re-checked by the daemon's own allowlist before executing. */
-export const DIRECTIVE_VERBS = ["restart", "upload_logs"] as const;
+/** checkin_history cap, per device (prune-on-insert). 500 daemon rows ≈
+ *   41h of 5-min ticks; watchdog rows share the same cap per device. */
+const CHECKIN_HISTORY_PER_DEVICE = 500;
+
+/** auth_failures cap, global (prune-on-insert). Forensics, not analytics —
+ *  the recent trace is what matters. */
+const AUTH_FAILURES_MAX = 1000;
+
+/** Actions an operator may enqueue. Enforced at the /admin route AND
+ *  re-checked by each executor's own allowlist before running: the daemon
+ *  handles restart/upload_logs; the v0.6 watchdog additionally executes
+ *  reinstall_watchdog, sample, and upload_state (docs/resilience.md) —
+ *  the server only validates membership here. */
+export const DIRECTIVE_VERBS = [
+  "restart",
+  "upload_logs",
+  "reinstall_watchdog",
+  "sample",
+  "upload_state",
+] as const;
 export type DirectiveVerb = (typeof DIRECTIVE_VERBS)[number];
 
 /** Camel-cased device row for API surfaces; never carries the hash. */
@@ -443,6 +639,8 @@ export interface DeviceInfo {
   arch: string | null;
   addedAt: number;
   lastSeen: number | null;
+  /** Last /watchdog-checkin stamp; null = never (pre-0.6 device). */
+  watchdogLastSeen: number | null;
 }
 
 /** Default exclusive upper bound for "lifetime" ranges. 2^53-1 ms ≈ year
@@ -461,6 +659,7 @@ function deviceInfo(r: UserDeviceRow): DeviceInfo {
     arch: r.arch,
     addedAt: r.added_at,
     lastSeen: r.last_seen,
+    watchdogLastSeen: r.watchdog_last_seen,
   };
 }
 
@@ -546,11 +745,37 @@ export class Store {
   private readonly revokeAllDevicesStmt: Statement;
   private readonly deviceCheckInStmt: Statement;
   private readonly setDeviceLabelStmt: Statement;
+  private readonly watchdogCheckInStmt: Statement;
   private readonly enqueueDirectiveStmt: Statement;
+  private readonly requeueDirectivesStmt: Statement;
   private readonly takeDirectiveStmt: Statement<DirectiveRow, [Record<string, string | number>]>;
+  private readonly ackDirectiveStmt: Statement;
+  private readonly directiveOwnerStmt: Statement<{ id: number }, [number, string]>;
+  private readonly hasRecentDirectiveStmt: Statement<
+    { id: number },
+    [Record<string, string | number>]
+  >;
   private readonly listDirectivesStmt: Statement<DirectiveListRow, [string, number]>;
-  private readonly saveDiagLogStmt: Statement;
   private readonly getDiagLogStmt: Statement<DiagLogRow, [string]>;
+  private readonly saveDiagLogV2Stmt: Statement;
+  private readonly getDiagLogV2Stmt: Statement<DiagLogV2Row, [string, number]>;
+  private readonly latestDiagLogV2Stmt: Statement<DiagLogV2Row, [string]>;
+  private readonly appendCheckinHistoryStmt: Statement;
+  private readonly pruneCheckinHistoryStmt: Statement;
+  private readonly recentCheckinHistoryStmt: Statement<CheckinHistoryRow, [number, string, number]>;
+  private readonly saveDeviceCheckinStateStmt: Statement;
+  private readonly getDeviceCheckinStateStmt: Statement<
+    { updated_at: number; body: string },
+    [number, string]
+  >;
+  private readonly insertAuthFailureStmt: Statement;
+  private readonly pruneAuthFailuresStmt: Statement;
+  private readonly listAuthFailuresStmt: Statement<AuthFailureRow, [number]>;
+  private readonly listAuthFailuresForUserStmt: Statement<AuthFailureRow, [string, number]>;
+  private readonly lastFleetAlertStmt: Statement<{ alerted_at: number }, [number, string]>;
+  private readonly insertFleetAlertStmt: Statement;
+  private readonly getDeviceFleetStateStmt: Statement<{ state: string; since: number }, [number]>;
+  private readonly upsertDeviceFleetStateStmt: Statement;
   private readonly setUserCompanyStmt: Statement;
   private readonly getUserCompanyStmt: Statement<{ company: string | null }, [string]>;
   private readonly userMessageCountsAllStmt: Statement<UserMessageCountsRow, [number, number]>;
@@ -620,7 +845,9 @@ export class Store {
     migrateCompany(this.db);
     migrateCategoryId(this.db);
     migrateCostUsdMicros(this.db);
+    migrateWatchdogLastSeen(this.db);
     migrateUserDevices(this.db);
+    migrateDirectiveLifecycle(this.db);
 
     this.insertStmt = this.db.prepare(
       `INSERT INTO events (user, source, sessionId, messageId, requestId, timestamp,
@@ -943,39 +1170,161 @@ export class Store {
     this.setDeviceLabelStmt = this.db.prepare(
       "UPDATE user_devices SET label = $label WHERE id = $id AND label IS NULL",
     );
+    // The watchdog channel stamps ONLY watchdog_last_seen — never last_seen,
+    // version, or arch: those describe the daemon, and blending the channels
+    // would blind the "daemon silent, watchdog alive" (WEDGED) classifier.
+    this.watchdogCheckInStmt = this.db.prepare(
+      "UPDATE user_devices SET watchdog_last_seen = $now WHERE id = $id",
+    );
     this.enqueueDirectiveStmt = this.db.prepare(
-      `INSERT INTO pending_directives (username, verb, created_at)
-       VALUES ($username, $verb, $created_at)`,
+      `INSERT INTO pending_directives (username, verb, created_at, device_id)
+       VALUES ($username, $verb, $created_at, $device_id)`,
+    );
+    // The one-shot re-queue: delivered but never acked for a full TTL →
+    // eligible again exactly once (requeued_at both restarts the
+    // eligibility window and marks the retry as spent).
+    this.requeueDirectivesStmt = this.db.prepare(
+      `UPDATE pending_directives
+          SET delivered_at = NULL, requeued_at = $now
+        WHERE username = $username
+          AND delivered_at IS NOT NULL
+          AND executed_at IS NULL
+          AND requeued_at IS NULL
+          AND delivered_at <= $expired`,
     );
     // Single-statement claim: the subquery + UPDATE…RETURNING is atomic in
     // SQLite, so with several devices posting under one handle exactly one
-    // of them receives each directive.
+    // of them receives each directive. device_id NULL = any device may
+    // take; non-NULL rows are only handed to the targeted device.
     this.takeDirectiveStmt = this.db.prepare(
       `UPDATE pending_directives
           SET delivered_at = $now
         WHERE id = (SELECT id FROM pending_directives
                      WHERE username = $username
                        AND delivered_at IS NULL
-                       AND created_at > $cutoff
+                       AND executed_at IS NULL
+                       AND (device_id IS NULL OR device_id = $device_id)
+                       AND COALESCE(requeued_at, created_at) > $cutoff
                      ORDER BY id
                      LIMIT 1)
         RETURNING id, verb`,
     );
+    // First ack wins (executed_at IS NULL guard); replays are reported as
+    // duplicates by ackDirective, never overwrites.
+    this.ackDirectiveStmt = this.db.prepare(
+      `UPDATE pending_directives
+          SET executed_at = $now, result = $result, detail = $detail,
+              executed_by = $executed_by
+        WHERE id = $id AND username = $username AND executed_at IS NULL`,
+    );
+    this.directiveOwnerStmt = this.db.prepare(
+      "SELECT id FROM pending_directives WHERE id = ? AND username = ?",
+    );
+    // Heal-loop guard for the alert sweep: is there already a live (or
+    // recently executed) directive of this verb aimed at this device?
+    this.hasRecentDirectiveStmt = this.db.prepare(
+      `SELECT id FROM pending_directives
+        WHERE username = $username
+          AND verb = $verb
+          AND (device_id IS NULL OR device_id = $device_id)
+          AND ((executed_at IS NULL AND COALESCE(requeued_at, created_at) > $cutoff)
+               OR executed_at > $recent)
+        LIMIT 1`,
+    );
     this.listDirectivesStmt = this.db.prepare(
-      `SELECT id, verb, created_at, delivered_at
-         FROM pending_directives
+      `SELECT p.id, p.verb, p.device_id, d.label AS device_label, p.created_at,
+              p.delivered_at, p.executed_at, p.result, p.detail, p.executed_by,
+              p.requeued_at
+         FROM pending_directives p
+         LEFT JOIN user_devices d ON d.id = p.device_id
+        WHERE p.username = ?
+        ORDER BY p.id DESC
+        LIMIT ?`,
+    );
+    this.getDiagLogStmt = this.db.prepare(
+      "SELECT uploaded_at, content FROM diag_logs WHERE username = ?",
+    );
+    this.saveDiagLogV2Stmt = this.db.prepare(
+      `INSERT INTO diag_logs_v2 (username, device_id, uploaded_at, content)
+       VALUES ($username, $device_id, $uploaded_at, $content)
+       ON CONFLICT (username, device_id) DO UPDATE
+         SET uploaded_at = excluded.uploaded_at, content = excluded.content`,
+    );
+    this.getDiagLogV2Stmt = this.db.prepare(
+      "SELECT device_id, uploaded_at, content FROM diag_logs_v2 WHERE username = ? AND device_id = ?",
+    );
+    this.latestDiagLogV2Stmt = this.db.prepare(
+      `SELECT device_id, uploaded_at, content FROM diag_logs_v2
+        WHERE username = ?
+        ORDER BY uploaded_at DESC, rowid DESC
+        LIMIT 1`,
+    );
+    this.appendCheckinHistoryStmt = this.db.prepare(
+      `INSERT INTO checkin_history (username, device_id, ts, kind, version, uptime_s)
+       VALUES ($username, $device_id, $ts, $kind, $version, $uptime_s)`,
+    );
+    this.pruneCheckinHistoryStmt = this.db.prepare(
+      `DELETE FROM checkin_history
+        WHERE device_id = $device_id
+          AND id NOT IN (SELECT id FROM checkin_history
+                          WHERE device_id = $device_id
+                          ORDER BY id DESC
+                          LIMIT $keep)`,
+    );
+    this.recentCheckinHistoryStmt = this.db.prepare(
+      `SELECT ts, kind, version, uptime_s FROM checkin_history
+        WHERE device_id = ? AND kind = ?
+        ORDER BY id DESC
+        LIMIT ?`,
+    );
+    this.saveDeviceCheckinStateStmt = this.db.prepare(
+      `INSERT INTO device_checkin_state (device_id, kind, username, updated_at, body)
+       VALUES ($device_id, $kind, $username, $updated_at, $body)
+       ON CONFLICT (device_id, kind) DO UPDATE
+         SET username = excluded.username, updated_at = excluded.updated_at,
+             body = excluded.body`,
+    );
+    this.getDeviceCheckinStateStmt = this.db.prepare(
+      "SELECT updated_at, body FROM device_checkin_state WHERE device_id = ? AND kind = ?",
+    );
+    this.insertAuthFailureStmt = this.db.prepare(
+      `INSERT INTO auth_failures (username, device_label, route, ts)
+       VALUES ($username, $device_label, $route, $ts)`,
+    );
+    this.pruneAuthFailuresStmt = this.db.prepare(
+      `DELETE FROM auth_failures
+        WHERE id NOT IN (SELECT id FROM auth_failures ORDER BY id DESC LIMIT $keep)`,
+    );
+    this.listAuthFailuresStmt = this.db.prepare(
+      `SELECT username, device_label, route, ts FROM auth_failures
+        ORDER BY id DESC
+        LIMIT ?`,
+    );
+    this.listAuthFailuresForUserStmt = this.db.prepare(
+      `SELECT username, device_label, route, ts FROM auth_failures
         WHERE username = ?
         ORDER BY id DESC
         LIMIT ?`,
     );
-    this.saveDiagLogStmt = this.db.prepare(
-      `INSERT INTO diag_logs (username, uploaded_at, content)
-       VALUES ($username, $uploaded_at, $content)
-       ON CONFLICT (username) DO UPDATE
-         SET uploaded_at = excluded.uploaded_at, content = excluded.content`,
+    this.lastFleetAlertStmt = this.db.prepare(
+      `SELECT alerted_at FROM fleet_alerts
+        WHERE device_id = ? AND state = ?
+        ORDER BY alerted_at DESC
+        LIMIT 1`,
     );
-    this.getDiagLogStmt = this.db.prepare(
-      "SELECT uploaded_at, content FROM diag_logs WHERE username = ?",
+    this.insertFleetAlertStmt = this.db.prepare(
+      `INSERT INTO fleet_alerts (device_id, username, state, alerted_at)
+       VALUES ($device_id, $username, $state, $alerted_at)`,
+    );
+    this.getDeviceFleetStateStmt = this.db.prepare(
+      "SELECT state, since FROM device_fleet_state WHERE device_id = ?",
+    );
+    this.upsertDeviceFleetStateStmt = this.db.prepare(
+      `INSERT INTO device_fleet_state (device_id, username, state, since, updated_at)
+       VALUES ($device_id, $username, $state, $since, $updated_at)
+       ON CONFLICT (device_id) DO UPDATE
+         SET username = excluded.username, state = excluded.state,
+             since = excluded.since, updated_at = excluded.updated_at`,
     );
     // UPDATE (not upsert): /ingest only calls this after a successful
     // claim/auth, so the user_secrets row always exists.
@@ -1522,18 +1871,30 @@ export class Store {
   }
 
   /** Remove the TOFU claim + every device row for a user (so the next
-   *  post claims fresh). */
+   *  post claims fresh), plus the per-device forensics keyed to those
+   *  rows — orphaned device ids would mis-attach to a future device. */
   clearUserSecret(user: string): number {
-    this.db.prepare("DELETE FROM user_devices WHERE username = ?").run(user);
+    for (const table of [
+      "user_devices",
+      "checkin_history",
+      "device_checkin_state",
+      "diag_logs_v2",
+      "fleet_alerts",
+      "device_fleet_state",
+    ]) {
+      this.db.prepare(`DELETE FROM ${table} WHERE username = ?`).run(user);
+    }
     const r = this.db.prepare("DELETE FROM user_secrets WHERE username = ?").run(user);
     return Number(r.changes);
   }
 
-  /** Nuclear: drop and recreate all tables. */
+  /** Nuclear: drop and recreate all tables. The device-keyed forensics
+   *  tables go with user_devices — their device ids die with it. */
   clearFull(): void {
     this.cachedCount = null;
     this.db.exec(
-      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices; DROP TABLE IF EXISTS categories;",
+      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices; DROP TABLE IF EXISTS categories; " +
+        "DROP TABLE IF EXISTS checkin_history; DROP TABLE IF EXISTS device_checkin_state; DROP TABLE IF EXISTS diag_logs_v2; DROP TABLE IF EXISTS fleet_alerts; DROP TABLE IF EXISTS device_fleet_state; DROP TABLE IF EXISTS auth_failures;",
     );
     // server_meta survives (other keys may be unrelated state), but the
     // cursor watermark must go or cleared Cursor history never re-imports.
@@ -1781,25 +2142,96 @@ export class Store {
     this.setDeviceLabelStmt.run({ $id: deviceId, $label: this.dedupedLabel(user, label) });
   }
 
-  /** Queue a directive for the user's next check-in. Returns its id. */
-  enqueueDirective(username: string, verb: DirectiveVerb, now: number): number {
-    this.enqueueDirectiveStmt.run({ $username: username, $verb: verb, $created_at: now });
+  /** Queue a directive for the user's next check-in. deviceId pins delivery
+   *  to one machine; null = any of the user's devices. Returns its id. */
+  enqueueDirective(
+    username: string,
+    verb: DirectiveVerb,
+    now: number,
+    deviceId: number | null = null,
+  ): number {
+    this.enqueueDirectiveStmt.run({
+      $username: username,
+      $verb: verb,
+      $created_at: now,
+      $device_id: deviceId,
+    });
     return Number(
       this.db.prepare<{ id: number }, []>("SELECT last_insert_rowid() AS id").get()?.id ?? 0,
     );
   }
 
   /**
-   * Claim the oldest undelivered, unexpired directive for a user (stamping
-   * delivered_at) — or null. Called from /checkin and /ingest responses.
+   * Claim the oldest eligible directive for (user, device) — stamping
+   * delivered_at — or null. A directive is eligible when undelivered,
+   * un-acked, unexpired, and either untargeted (device_id NULL) or aimed
+   * at this device. Delivered-but-never-acked rows past the TTL are first
+   * re-queued (once). Called from /checkin, /ingest, and /watchdog-checkin.
    */
-  takeDirective(username: string, now: number): { id: number; verb: string } | null {
-    const row = this.takeDirectiveStmt.get({
+  takeDirective(
+    username: string,
+    deviceId: number,
+    now: number,
+  ): { id: number; verb: string } | null {
+    const tx = this.db.transaction((): DirectiveRow | null => {
+      this.requeueDirectivesStmt.run({
+        $username: username,
+        $now: now,
+        $expired: now - DIRECTIVE_TTL_MS,
+      });
+      return this.takeDirectiveStmt.get({
+        $username: username,
+        $device_id: deviceId,
+        $now: now,
+        $cutoff: now - DIRECTIVE_TTL_MS,
+      });
+    });
+    const row = tx();
+    return row ? { id: row.id, verb: row.verb } : null;
+  }
+
+  /**
+   * Executed-ack: what actually completes a directive (delivery alone never
+   * does). First ack wins; a replay reports "duplicate" without overwriting;
+   * an id that doesn't belong to this user is null (the route 404s).
+   */
+  ackDirective(
+    username: string,
+    id: number,
+    ack: { result: "ok" | "failed"; detail: string | null; executedBy: "daemon" | "watchdog" },
+    now: number,
+  ): "acked" | "duplicate" | null {
+    const res = this.ackDirectiveStmt.run({
+      $id: id,
       $username: username,
       $now: now,
-      $cutoff: now - DIRECTIVE_TTL_MS,
+      $result: ack.result,
+      $detail: ack.detail,
+      $executed_by: ack.executedBy,
     });
-    return row ? { id: row.id, verb: row.verb } : null;
+    if (res.changes > 0) return "acked";
+    return this.directiveOwnerStmt.get(id, username) ? "duplicate" : null;
+  }
+
+  /** Is a directive of this verb already live for (user, device) — pending,
+   *  in flight, or executed within `recentMs`? The alert sweep's guard
+   *  against stacking heal directives on a machine that isn't recovering. */
+  hasRecentDirective(
+    username: string,
+    deviceId: number,
+    verb: DirectiveVerb,
+    now: number,
+    recentMs: number,
+  ): boolean {
+    return Boolean(
+      this.hasRecentDirectiveStmt.get({
+        $username: username,
+        $device_id: deviceId,
+        $verb: verb,
+        $cutoff: now - DIRECTIVE_TTL_MS,
+        $recent: now - recentMs,
+      }),
+    );
   }
 
   /** Recent directives for a user, newest first (admin visibility). */
@@ -1807,14 +2239,175 @@ export class Store {
     return this.listDirectivesStmt.all(username, limit);
   }
 
-  /** Store (replace) a user's uploaded log tail. Caller caps the size. */
-  saveDiagLog(username: string, content: string, now: number): void {
-    this.saveDiagLogStmt.run({ $username: username, $uploaded_at: now, $content: content });
+  /** Store (replace) a device's uploaded log tail. Caller caps the size. */
+  saveDiagLog(username: string, deviceId: number, content: string, now: number): void {
+    this.saveDiagLogV2Stmt.run({
+      $username: username,
+      $device_id: deviceId,
+      $uploaded_at: now,
+      $content: content,
+    });
   }
 
-  getDiagLog(username: string): { uploadedAt: number; content: string } | null {
+  /** One device's log tail, or null. */
+  getDiagLogForDevice(
+    username: string,
+    deviceId: number,
+  ): { deviceId: number; uploadedAt: number; content: string } | null {
+    const row = this.getDiagLogV2Stmt.get(username, deviceId);
+    return row
+      ? { deviceId: row.device_id, uploadedAt: row.uploaded_at, content: row.content }
+      : null;
+  }
+
+  /** A user's most recent log tail across devices, falling back to the
+   *  legacy single-row diag_logs table for pre-v0.6 uploads (deviceId null). */
+  getDiagLog(
+    username: string,
+  ): { deviceId: number | null; uploadedAt: number; content: string } | null {
+    const v2 = this.latestDiagLogV2Stmt.get(username);
+    if (v2) return { deviceId: v2.device_id, uploadedAt: v2.uploaded_at, content: v2.content };
     const row = this.getDiagLogStmt.get(username);
-    return row ? { uploadedAt: row.uploaded_at, content: row.content } : null;
+    return row ? { deviceId: null, uploadedAt: row.uploaded_at, content: row.content } : null;
+  }
+
+  /** Stamp a watchdog checkin (the second liveness channel). Deliberately
+   *  never touches last_seen/version/arch — those belong to the daemon. */
+  recordWatchdogCheckIn(deviceId: number, now: number): void {
+    this.watchdogCheckInStmt.run({ $id: deviceId, $now: now });
+  }
+
+  /** Append one checkin observation (kind 'daemon' | 'watchdog') and prune
+   *  the device's journal to the per-device cap. */
+  appendCheckinHistory(
+    username: string,
+    deviceId: number,
+    kind: "daemon" | "watchdog",
+    version: string | null,
+    uptimeS: number | null,
+    ts: number,
+  ): void {
+    this.appendCheckinHistoryStmt.run({
+      $username: username,
+      $device_id: deviceId,
+      $ts: ts,
+      $kind: kind,
+      $version: version,
+      $uptime_s: uptimeS,
+    });
+    this.pruneCheckinHistoryStmt.run({
+      $device_id: deviceId,
+      $keep: CHECKIN_HISTORY_PER_DEVICE,
+    });
+  }
+
+  /** A device's newest history rows for one channel, ASCENDING by time (the
+   *  order the crash-loop scan wants). */
+  recentCheckinHistory(
+    deviceId: number,
+    kind: "daemon" | "watchdog",
+    limit = 50,
+  ): CheckinHistoryRow[] {
+    return this.recentCheckinHistoryStmt.all(deviceId, kind, limit).reverse();
+  }
+
+  /** Upsert the latest sanitized checkin body for (device, channel). */
+  saveDeviceCheckinState(
+    username: string,
+    deviceId: number,
+    kind: "daemon" | "watchdog",
+    body: string,
+    now: number,
+  ): void {
+    this.saveDeviceCheckinStateStmt.run({
+      $device_id: deviceId,
+      $kind: kind,
+      $username: username,
+      $updated_at: now,
+      $body: body,
+    });
+  }
+
+  /** The latest stored body for (device, channel), or null. */
+  getDeviceCheckinState(
+    deviceId: number,
+    kind: "daemon" | "watchdog",
+  ): { updatedAt: number; body: string } | null {
+    const row = this.getDeviceCheckinStateStmt.get(deviceId, kind);
+    return row ? { updatedAt: row.updated_at, body: row.body } : null;
+  }
+
+  /** Record a failed device auth (403 trace). username is the CLAIMED
+   *  handle from the request — unauthenticated input, kept for forensics. */
+  recordAuthFailure(route: string, username: string, deviceLabel: string | null, ts: number): void {
+    this.insertAuthFailureStmt.run({
+      $username: username,
+      $device_label: deviceLabel,
+      $route: route,
+      $ts: ts,
+    });
+    this.pruneAuthFailuresStmt.run({ $keep: AUTH_FAILURES_MAX });
+  }
+
+  /** Recent auth failures, newest first; user narrows to one handle. */
+  listAuthFailures(user: string | null, limit = 100): AuthFailureRow[] {
+    return user === null
+      ? this.listAuthFailuresStmt.all(limit)
+      : this.listAuthFailuresForUserStmt.all(user, limit);
+  }
+
+  /** When was this (device, state) last alerted? null = never. */
+  lastFleetAlertAt(deviceId: number, state: string): number | null {
+    return this.lastFleetAlertStmt.get(deviceId, state)?.alerted_at ?? null;
+  }
+
+  /** Record a delivered fleet alert (the 6h dedup source). */
+  recordFleetAlert(deviceId: number, username: string, state: string, now: number): void {
+    this.insertFleetAlertStmt.run({
+      $device_id: deviceId,
+      $username: username,
+      $state: state,
+      $alerted_at: now,
+    });
+  }
+
+  /**
+   * Sweep bookkeeping: record the device's current classification and
+   * return when that state was FIRST observed (`since`). A state change
+   * resets the clock; a repeat observation keeps it — giving the alert
+   * sweep its "in state > 1h" gate.
+   */
+  observeDeviceFleetState(deviceId: number, username: string, state: string, now: number): number {
+    const tx = this.db.transaction((): number => {
+      const prior = this.getDeviceFleetStateStmt.get(deviceId);
+      const since = prior && prior.state === state ? prior.since : now;
+      this.upsertDeviceFleetStateStmt.run({
+        $device_id: deviceId,
+        $username: username,
+        $state: state,
+        $since: since,
+        $updated_at: now,
+      });
+      return since;
+    });
+    return tx();
+  }
+
+  /**
+   * Admin escape hatch (POST /admin/mark-uninstalled): a machine that was
+   * wiped without running the uninstall script leaves an eternally-stale
+   * fleet row. Revokes every active device (barred=false — the same secret
+   * may seamlessly reinstall) and sets uninstalled_at, i.e. exactly the
+   * state the uninstall script would have left. False = unknown user.
+   */
+  adminMarkUninstalled(user: string, now: number): boolean {
+    const tx = this.db.transaction((): boolean => {
+      if (!this.getUserSecretStmt.get(user)) return false;
+      this.revokeAllDevicesStmt.run({ $username: user, $revoked_at: now });
+      this.markUserUninstalledStmt.run({ $username: user, $uninstalled_at: now });
+      return true;
+    });
+    return tx();
   }
 
   listClaimedUsers(): Array<{ user: string; claimedAt: number }> {
