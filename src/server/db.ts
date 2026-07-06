@@ -220,6 +220,20 @@ CREATE TABLE IF NOT EXISTS device_fleet_state (
   since      INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+-- Sweep-observed boolean conditions ORTHOGONAL to the FleetState machine
+-- (a device can be HEALTHY yet report watchdog_installed=false — the
+-- WATCHDOG_MISSING flag). since = first observation of the current streak;
+-- the row is deleted the moment the condition clears, so a recurrence
+-- starts a fresh "held > 1h" clock. Updated only by the sweep.
+CREATE TABLE IF NOT EXISTS device_flag_state (
+  device_id  INTEGER NOT NULL,
+  flag       TEXT NOT NULL,
+  username   TEXT NOT NULL,
+  since      INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (device_id, flag)
+);
 `;
 
 /**
@@ -631,6 +645,15 @@ export const DIRECTIVE_VERBS = [
 ] as const;
 export type DirectiveVerb = (typeof DIRECTIVE_VERBS)[number];
 
+/** Verbs ONLY the watchdog executor can run (`sample` needs a live process
+ *  outside the wedged daemon; `upload_state` reads the watchdog's own state
+ *  file). A daemon handed one would terminally ack it 'failed: unknown
+ *  verb' before the watchdog ever saw it — takeDirective keeps them off
+ *  daemon channels. Everything else is available to BOTH executors: the
+ *  watchdog can restart/upload_logs too, and reinstall_watchdog from the
+ *  watchdog harmlessly re-enables its own label. */
+export const WATCHDOG_ONLY_VERBS = ["sample", "upload_state"] as const;
+
 /** Camel-cased device row for API surfaces; never carries the hash. */
 export interface DeviceInfo {
   id: number;
@@ -776,6 +799,9 @@ export class Store {
   private readonly insertFleetAlertStmt: Statement;
   private readonly getDeviceFleetStateStmt: Statement<{ state: string; since: number }, [number]>;
   private readonly upsertDeviceFleetStateStmt: Statement;
+  private readonly getDeviceFlagStmt: Statement<{ since: number }, [number, string]>;
+  private readonly upsertDeviceFlagStmt: Statement;
+  private readonly clearDeviceFlagStmt: Statement;
   private readonly setUserCompanyStmt: Statement;
   private readonly getUserCompanyStmt: Statement<{ company: string | null }, [string]>;
   private readonly userMessageCountsAllStmt: Statement<UserMessageCountsRow, [number, number]>;
@@ -1195,7 +1221,11 @@ export class Store {
     // Single-statement claim: the subquery + UPDATE…RETURNING is atomic in
     // SQLite, so with several devices posting under one handle exactly one
     // of them receives each directive. device_id NULL = any device may
-    // take; non-NULL rows are only handed to the targeted device.
+    // take; non-NULL rows are only handed to the targeted device. The
+    // channel dimension keeps watchdog-only verbs off daemon handouts —
+    // the daemon would terminally ack them before the watchdog ever saw
+    // them; the watchdog itself may take ANY verb. WATCHDOG_ONLY_VERBS is
+    // a fixed const list — never user input, so the splice is safe.
     this.takeDirectiveStmt = this.db.prepare(
       `UPDATE pending_directives
           SET delivered_at = $now
@@ -1204,6 +1234,8 @@ export class Store {
                        AND delivered_at IS NULL
                        AND executed_at IS NULL
                        AND (device_id IS NULL OR device_id = $device_id)
+                       AND (verb NOT IN (${WATCHDOG_ONLY_VERBS.map((v) => `'${v}'`).join(", ")})
+                            OR $channel = 'watchdog')
                        AND COALESCE(requeued_at, created_at) > $cutoff
                      ORDER BY id
                      LIMIT 1)
@@ -1325,6 +1357,19 @@ export class Store {
        ON CONFLICT (device_id) DO UPDATE
          SET username = excluded.username, state = excluded.state,
              since = excluded.since, updated_at = excluded.updated_at`,
+    );
+    this.getDeviceFlagStmt = this.db.prepare(
+      "SELECT since FROM device_flag_state WHERE device_id = ? AND flag = ?",
+    );
+    this.upsertDeviceFlagStmt = this.db.prepare(
+      `INSERT INTO device_flag_state (device_id, flag, username, since, updated_at)
+       VALUES ($device_id, $flag, $username, $since, $updated_at)
+       ON CONFLICT (device_id, flag) DO UPDATE
+         SET username = excluded.username, since = excluded.since,
+             updated_at = excluded.updated_at`,
+    );
+    this.clearDeviceFlagStmt = this.db.prepare(
+      "DELETE FROM device_flag_state WHERE device_id = ? AND flag = ?",
     );
     // UPDATE (not upsert): /ingest only calls this after a successful
     // claim/auth, so the user_secrets row always exists.
@@ -2166,11 +2211,15 @@ export class Store {
    * delivered_at — or null. A directive is eligible when undelivered,
    * un-acked, unexpired, and either untargeted (device_id NULL) or aimed
    * at this device. Delivered-but-never-acked rows past the TTL are first
-   * re-queued (once). Called from /checkin, /ingest, and /watchdog-checkin.
+   * re-queued (once). `channel` names the executor asking: /checkin and
+   * /ingest pass 'daemon', /watchdog-checkin 'watchdog' — watchdog-only
+   * verbs (WATCHDOG_ONLY_VERBS) are invisible to daemon channels so they
+   * can never be terminally acked 'unknown verb' by the wrong executor.
    */
   takeDirective(
     username: string,
     deviceId: number,
+    channel: "daemon" | "watchdog",
     now: number,
   ): { id: number; verb: string } | null {
     const tx = this.db.transaction((): DirectiveRow | null => {
@@ -2182,6 +2231,7 @@ export class Store {
       return this.takeDirectiveStmt.get({
         $username: username,
         $device_id: deviceId,
+        $channel: channel,
         $now: now,
         $cutoff: now - DIRECTIVE_TTL_MS,
       });
@@ -2385,6 +2435,38 @@ export class Store {
         $device_id: deviceId,
         $username: username,
         $state: state,
+        $since: since,
+        $updated_at: now,
+      });
+      return since;
+    });
+    return tx();
+  }
+
+  /**
+   * Sweep bookkeeping for boolean conditions ORTHOGONAL to the FleetState
+   * machine (e.g. WATCHDOG_MISSING — a device can be HEALTHY yet report
+   * watchdog_installed=false). Present: keep the streak's original `since`
+   * and return it (the "held > 1h" gate). Absent: drop the row and return
+   * null, so the next occurrence starts a fresh clock.
+   */
+  observeDeviceFlag(
+    deviceId: number,
+    username: string,
+    flag: string,
+    present: boolean,
+    now: number,
+  ): number | null {
+    const tx = this.db.transaction((): number | null => {
+      if (!present) {
+        this.clearDeviceFlagStmt.run(deviceId, flag);
+        return null;
+      }
+      const since = this.getDeviceFlagStmt.get(deviceId, flag)?.since ?? now;
+      this.upsertDeviceFlagStmt.run({
+        $device_id: deviceId,
+        $flag: flag,
+        $username: username,
         $since: since,
         $updated_at: now,
       });

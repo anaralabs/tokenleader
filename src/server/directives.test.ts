@@ -296,6 +296,54 @@ describe("v0.6 directive verbs", () => {
   });
 });
 
+describe("directive channels: watchdog-only verbs never ride a daemon handout", () => {
+  // A daemon handed `sample` would ack it 'failed: unknown verb' —
+  // terminally completing it without the watchdog ever seeing it. Daemon
+  // channels (/checkin, /ingest) must not even be OFFERED those verbs.
+  test("sample skips /checkin and /ingest but is delivered on /watchdog-checkin", async () => {
+    await claim("zane", SECRET);
+    await app.request(adminEnqueue("zane", "sample"));
+
+    const viaCheckin = await jsonOf(await app.request(checkinReq("zane", SECRET)));
+    expect(viaCheckin.directive).toBeUndefined();
+    const viaIngest = await jsonOf(
+      await app.request(
+        new Request("http://x/ingest", {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-tokenleader-secret": SECRET },
+          body: JSON.stringify({ events: [makeEvent("zane")] }),
+        }),
+      ),
+    );
+    expect(viaIngest.directive).toBeUndefined();
+
+    const viaWatchdog = await jsonOf(await app.request(watchdogCheckinReq("zane", SECRET)));
+    expect(viaWatchdog.directive.verb).toBe("sample");
+  });
+
+  test("a daemon claims the oldest verb it CAN run, skipping an older watchdog-only row", async () => {
+    await claim("aria", SECRET);
+    await app.request(adminEnqueue("aria", "upload_state")); // older, watchdog-only
+    await app.request(adminEnqueue("aria", "restart")); // newer, daemon-runnable
+
+    const viaCheckin = await jsonOf(await app.request(checkinReq("aria", SECRET)));
+    expect(viaCheckin.directive.verb).toBe("restart");
+    // The watchdog then drains the older watchdog-only directive.
+    const viaWatchdog = await jsonOf(await app.request(watchdogCheckinReq("aria", SECRET)));
+    expect(viaWatchdog.directive.verb).toBe("upload_state");
+  });
+
+  test("the watchdog may take ANY verb — daemon verbs included", async () => {
+    await claim("bram", SECRET);
+    await app.request(adminEnqueue("bram", "restart"));
+    await app.request(adminEnqueue("bram", "reinstall_watchdog"));
+    const first = await jsonOf(await app.request(watchdogCheckinReq("bram", SECRET)));
+    expect(first.directive.verb).toBe("restart");
+    const second = await jsonOf(await app.request(watchdogCheckinReq("bram", SECRET)));
+    expect(second.directive.verb).toBe("reinstall_watchdog");
+  });
+});
+
 describe("per-device directive targeting", () => {
   test("a device-pinned directive is only handed to that device; NULL goes to anyone", async () => {
     await claim("orla", SECRET);
