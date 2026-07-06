@@ -13,3 +13,4 @@ state.json
 .env.local
 .env.*.local
 *.tsbuildinfo
+.claude/
