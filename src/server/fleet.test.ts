@@ -7,17 +7,23 @@
 // and the WEDGED → device-targeted restart auto-heal.
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createTestApp, jsonOf, makeTokenEvent } from "../test-helpers.ts";
-import type { CheckinBody, WatchdogCheckinBody } from "../types.ts";
+import type { WatchdogCheckinBody } from "../types.ts";
 import {
   ALERT_DEDUP_MS,
   ALERT_STATE_MIN_AGE_MS,
   classifyDevice,
   countUnexplainedResets,
   CRASH_LOOP_THRESHOLD,
+  type DaemonCheckinState,
   type DeviceSignals,
+  lateThresholdMs,
+  PRE_WATCHDOG_DARK_MS,
   sanitizeCheckinBody,
   sanitizeWatchdogBody,
+  staleHeartbeatRunsFor,
   sweepFleetAlerts,
+  watchdogCapableVersion,
+  wedgeThresholdMs,
 } from "./fleet.ts";
 
 const MIN = 60 * 1000;
@@ -37,7 +43,7 @@ function makeWatchdogBody(overrides: Partial<WatchdogCheckinBody> = {}): Watchdo
   };
 }
 
-function makeCheckinBody(overrides: Partial<CheckinBody> = {}): CheckinBody {
+function makeCheckinBody(overrides: Partial<DaemonCheckinState> = {}): DaemonCheckinState {
   return {
     uptime_s: 3600,
     tick_seq: 12,
@@ -49,6 +55,7 @@ function makeCheckinBody(overrides: Partial<CheckinBody> = {}): CheckinBody {
     heartbeat_write_failures: 0,
     exit_journal_tail: [],
     watchdog_installed: true,
+    interval_s: 300,
     ...overrides,
   };
 }
@@ -206,6 +213,67 @@ describe("classifyDevice", () => {
   });
 });
 
+describe("classifyDevice scales its bars with the device's own interval_s", () => {
+  // TOKENLEADER_INTERVAL_SEC stretches to 24h; a fixed 30-minute wedge bar
+  // would classify a healthy hourly-cadence daemon WEDGED and auto-restart
+  // it forever. Bars: late = 3 ticks, wedge = 3 ticks + 15 min, both
+  // floored at the default-cadence values.
+  const hourly = makeCheckinBody({ interval_s: 3600 });
+
+  test("threshold helpers: scaled for slow cadences, floored for fast ones", () => {
+    expect(lateThresholdMs(300)).toBe(15 * MIN);
+    expect(wedgeThresholdMs(300)).toBe(30 * MIN);
+    expect(lateThresholdMs(5)).toBe(15 * MIN); // floor, never below default
+    expect(wedgeThresholdMs(5)).toBe(30 * MIN);
+    expect(lateThresholdMs(3600)).toBe(3 * HOUR);
+    expect(wedgeThresholdMs(3600)).toBe(3 * HOUR + 15 * MIN);
+    expect(staleHeartbeatRunsFor(300)).toBe(8); // the client fuse's floor
+    expect(staleHeartbeatRunsFor(3600)).toBe(90); // 3 ticks in 120s firings
+  });
+
+  test("45min of silence WEDGES a default-cadence daemon but is HEALTHY at interval_s=3600", () => {
+    const silent45m = { lastSeen: NOW - 45 * MIN, watchdogLastSeen: NOW - 2 * MIN };
+    expect(classifyDevice(signals(silent45m), NOW)).toBe("WEDGED");
+    expect(classifyDevice(signals({ ...silent45m, checkin: hourly }), NOW)).toBe("HEALTHY");
+  });
+
+  test("the scaled ladder: LATE past 3 ticks, WEDGED only past 3 ticks + 15min", () => {
+    const live = { watchdogLastSeen: NOW - 2 * MIN, checkin: hourly };
+    expect(classifyDevice(signals({ ...live, lastSeen: NOW - 190 * MIN }), NOW)).toBe("LATE");
+    expect(classifyDevice(signals({ ...live, lastSeen: NOW - 200 * MIN }), NOW)).toBe("WEDGED");
+  });
+
+  test("stale-heartbeat runs mirror the client watchdog's staleRunsFor", () => {
+    // 50 unchanged 120s firings is a frozen heartbeat at the default
+    // cadence but routine for an hourly tick (heartbeats move on progress).
+    const fresh = { lastSeen: NOW - 2 * MIN, watchdogLastSeen: NOW - 2 * MIN, checkin: hourly };
+    expect(
+      classifyDevice(
+        signals({ ...fresh, watchdog: makeWatchdogBody({ heartbeat_age_runs: 50 }) }),
+        NOW,
+      ),
+    ).toBe("HEALTHY");
+    expect(
+      classifyDevice(
+        signals({ ...fresh, watchdog: makeWatchdogBody({ heartbeat_age_runs: 90 }) }),
+        NOW,
+      ),
+    ).toBe("HEARTBEAT_IO");
+  });
+});
+
+describe("watchdogCapableVersion", () => {
+  test("v0.6.0+ ships the watchdog; dev/unknown/older builds never do", () => {
+    expect(watchdogCapableVersion("v0.6.0")).toBe(true);
+    expect(watchdogCapableVersion("0.6.1")).toBe(true);
+    expect(watchdogCapableVersion("v1.0.0")).toBe(true);
+    expect(watchdogCapableVersion("v0.5.9")).toBe(false);
+    expect(watchdogCapableVersion("dev")).toBe(false);
+    expect(watchdogCapableVersion("")).toBe(false);
+    expect(watchdogCapableVersion(null)).toBe(false);
+  });
+});
+
 describe("countUnexplainedResets", () => {
   const history = [
     { ts: NOW - 200 * MIN, uptime_s: 900 },
@@ -263,6 +331,19 @@ describe("body sanitizers", () => {
     expect(out!.drift_ms).toBe(-1500);
     expect(out!.exit_journal_tail.length).toBe(2);
     expect(out!.exit_journal_tail[1]!.reason.length).toBe(128);
+  });
+
+  test("sanitizeCheckinBody: interval_s is clamped to the daemon's own config bounds", () => {
+    // Absent/mistyped → the 5-minute default (pre-reporting daemons must
+    // classify exactly as before).
+    expect(sanitizeCheckinBody({})!.interval_s).toBe(300);
+    expect(sanitizeCheckinBody({ interval_s: "3600" })!.interval_s).toBe(300);
+    expect(sanitizeCheckinBody({ interval_s: Number.NaN })!.interval_s).toBe(300);
+    expect(sanitizeCheckinBody({ interval_s: 3600 })!.interval_s).toBe(3600);
+    // A lying body can't stretch thresholds past the config clamp [5, 86400].
+    expect(sanitizeCheckinBody({ interval_s: 1 })!.interval_s).toBe(5);
+    expect(sanitizeCheckinBody({ interval_s: 1e9 })!.interval_s).toBe(86400);
+    expect(sanitizeCheckinBody({ interval_s: 600.4 })!.interval_s).toBe(600);
   });
 
   test("sanitizeWatchdogBody: coerces a partial body, rejects non-objects", () => {
@@ -492,5 +573,204 @@ describe("sweepFleetAlerts", () => {
     expect(retried.find((d) => d.user === "vera")!.action).toBe("alerted");
     expect(hook.calls.some((c) => c.text.includes("vera/imac"))).toBe(true);
     expect(store.listDirectives("vera").length).toBe(0);
+  });
+
+  // Park every user claimed by an earlier test in HEALTHY so cross-test
+  // sweeps stay quiet (fresh lastSeen, no watchdog, version null).
+  const PRIOR_USERS = ["sam", "tess", "ugo", "vera"];
+  function park(users: string[], t: number): void {
+    for (const u of users) setTimes(u, t, null);
+  }
+
+  test("HEARTBEAT_IO pages after the 1h gate but NEVER queues a restart", async () => {
+    const deviceId = await claim("wanda", "studio");
+    const t0 = Date.now();
+    park(PRIOR_USERS, t0);
+    // Daemon checkins fresh while a fresh watchdog swears the heartbeat
+    // file is frozen — the disk contradiction that alerts and never kills.
+    const setIo = (now: number): void => {
+      setTimes("wanda", now - 2 * MIN, now - 2 * MIN);
+      store.saveDeviceCheckinState(
+        "wanda",
+        deviceId,
+        "watchdog",
+        JSON.stringify(makeWatchdogBody({ heartbeat_age_runs: 9 })),
+        now,
+      );
+    };
+    setIo(t0);
+    const hook = webhookStub();
+    const sweep = (now: number) =>
+      sweepFleetAlerts({
+        store,
+        webhookUrl: "https://hooks.example/x",
+        suppressed: false,
+        now,
+        fetchImpl: hook.fetchImpl,
+        log: quiet,
+      });
+
+    const first = await sweep(t0);
+    const w0 = first.find((d) => d.user === "wanda")!;
+    expect(w0.state).toBe("HEARTBEAT_IO");
+    expect(w0.action).toBe("observed");
+
+    const t1 = t0 + ALERT_STATE_MIN_AGE_MS + MIN;
+    setIo(t1);
+    const second = await sweep(t1);
+    const w1 = second.find((d) => d.user === "wanda")!;
+    expect(w1.action).toBe("alerted");
+    expect(w1.healQueued).toBe(false);
+    expect(hook.calls.some((c) => c.text.includes("HEARTBEAT_IO"))).toBe(true);
+    // "Alerts and never kills": no restart directive, ever.
+    expect(store.listDirectives("wanda").filter((d) => d.verb === "restart").length).toBe(0);
+  });
+
+  test("convergence: a fresh v0.6 daemon with a silent watchdog gets ONE reinstall_watchdog", async () => {
+    const deviceId = await claim("yves", "mbp14");
+    const t0 = Date.now();
+    park([...PRIOR_USERS, "wanda"], t0);
+    store.db
+      .prepare("UPDATE user_devices SET version = ? WHERE username = ?")
+      .run("v0.6.0", "yves");
+    setTimes("yves", t0 - 2 * MIN, null); // daemon fresh, watchdog NEVER
+    const sweep = (now: number) =>
+      sweepFleetAlerts({ store, webhookUrl: null, suppressed: false, now, log: quiet });
+    const reinstalls = () =>
+      store.listDirectives("yves").filter((d) => d.verb === "reinstall_watchdog");
+
+    await sweep(t0);
+    expect(reinstalls().length).toBe(1);
+    expect(reinstalls()[0]!.device_id).toBe(deviceId);
+    // Next sweep: the live directive dedups — nudged, not spammed.
+    await sweep(t0 + 5 * MIN);
+    expect(reinstalls().length).toBe(1);
+    // A watchdog checkin inside the 10-min window ends the nudging even
+    // past the directive-dedup horizon.
+    store.db
+      .prepare("UPDATE pending_directives SET executed_at = ?, result = 'ok' WHERE username = ?")
+      .run(t0, "yves");
+    const t1 = t0 + ALERT_DEDUP_MS + MIN;
+    setTimes("yves", t1 - 2 * MIN, t1 - 5 * MIN);
+    await sweep(t1);
+    expect(reinstalls().length).toBe(1);
+
+    // Pre-0.6 and unknown builds are NEVER queued (no poking a dev build).
+    await claim("zola", "old-imac");
+    store.db
+      .prepare("UPDATE user_devices SET version = ? WHERE username = ?")
+      .run("v0.5.9", "zola");
+    setTimes("zola", t0 - 2 * MIN, null);
+    await sweep(t0 + 10 * MIN);
+    expect(store.listDirectives("zola").length).toBe(0);
+  });
+
+  test("WATCHDOG_MISSING: watchdog_installed=false pages after 1h, dedups, resets on recovery", async () => {
+    const deviceId = await claim("noor", "air13");
+    const t0 = Date.now();
+    park([...PRIOR_USERS, "wanda", "yves", "zola"], t0);
+    const report = (now: number): void => {
+      setTimes("noor", now - 2 * MIN, null);
+      store.saveDeviceCheckinState(
+        "noor",
+        deviceId,
+        "daemon",
+        JSON.stringify(makeCheckinBody({ watchdog_installed: false })),
+        now,
+      );
+    };
+    const hook = webhookStub();
+    const sweep = (now: number) =>
+      sweepFleetAlerts({
+        store,
+        webhookUrl: "https://hooks.example/x",
+        suppressed: false,
+        now,
+        fetchImpl: hook.fetchImpl,
+        log: quiet,
+      });
+    const noorCalls = () => hook.calls.filter((c) => c.text.includes("noor/air13"));
+
+    report(t0);
+    const first = await sweep(t0);
+    const n0 = first.find((d) => d.user === "noor")!;
+    expect(n0.state).toBe("WATCHDOG_MISSING"); // the device itself is HEALTHY
+    expect(n0.action).toBe("observed");
+    expect(noorCalls().length).toBe(0);
+
+    // Held past the 1h gate: pages once, then dedups.
+    const t1 = t0 + ALERT_STATE_MIN_AGE_MS + MIN;
+    report(t1);
+    const second = await sweep(t1);
+    expect(second.find((d) => d.user === "noor")!.action).toBe("alerted");
+    expect(noorCalls().length).toBe(1);
+    expect(noorCalls()[0]!.text).toContain("watchdog_installed=false");
+    const t2 = t1 + 5 * MIN;
+    report(t2);
+    expect((await sweep(t2)).find((d) => d.user === "noor")!.action).toBe("deduped");
+    expect(noorCalls().length).toBe(1);
+
+    // The watchdog comes alive: the flag clears entirely...
+    const t3 = t2 + 5 * MIN;
+    report(t3);
+    setTimes("noor", t3 - 2 * MIN, t3 - 2 * MIN);
+    expect((await sweep(t3)).find((d) => d.user === "noor")).toBeUndefined();
+    // ...and a relapse (watchdog silent again, past its 15-min freshness)
+    // starts a FRESH 1h clock instead of paging at once.
+    const t4 = t3 + 20 * MIN;
+    report(t4);
+    expect((await sweep(t4)).find((d) => d.user === "noor")!.action).toBe("observed");
+  });
+
+  test("born-dark pre-watchdog devices page ONCE, forever deduped until revived", async () => {
+    await claim("odin", "relic");
+    const t0 = Date.now();
+    const others = [...PRIOR_USERS, "wanda", "yves", "zola", "noor"];
+    // Dead a month before the sweep ever observed it (the deploy-day case).
+    setTimes("odin", t0 - 30 * 24 * HOUR, null);
+    const hook = webhookStub();
+    const sweep = (now: number) => {
+      park(others, now);
+      return sweepFleetAlerts({
+        store,
+        webhookUrl: "https://hooks.example/x",
+        suppressed: false,
+        now,
+        fetchImpl: hook.fetchImpl,
+        log: quiet,
+      });
+    };
+    const odinCalls = () => hook.calls.filter((c) => c.text.includes("odin/relic"));
+
+    const first = await sweep(t0);
+    expect(first.find((d) => d.user === "odin")!.action).toBe("observed"); // 1h gate
+    const t1 = t0 + ALERT_STATE_MIN_AGE_MS + MIN;
+    const second = await sweep(t1);
+    expect(second.find((d) => d.user === "odin")!.action).toBe("alerted");
+    expect(odinCalls().length).toBe(1);
+    expect(odinCalls()[0]!.text).toContain("will not re-page");
+    // Way past the 6h dedup window: STILL deduped — no deploy-day storm.
+    const t2 = t1 + 2 * ALERT_DEDUP_MS;
+    const third = await sweep(t2);
+    expect(third.find((d) => d.user === "odin")!.action).toBe("deduped");
+    expect(odinCalls().length).toBe(1);
+
+    // Revival: one fresh checkin resets the streak.
+    const t3 = t2 + 5 * MIN;
+    setTimes("odin", t3 - 2 * MIN, null);
+    expect((await sweep(t3)).find((d) => d.user === "odin")).toBeUndefined(); // HEALTHY
+
+    // Dying AGAIN under our watch is a WATCHED crossing (the sweep sees the
+    // DARK transition as it happens) — normal 6h dedup, it re-pages.
+    const died = t3 - 2 * MIN;
+    const t4 = died + PRE_WATCHDOG_DARK_MS + 5 * MIN; // first sweep past the bar
+    const darkAgain = await sweep(t4);
+    expect(darkAgain.find((d) => d.user === "odin")!.state).toBe("DARK");
+    expect(darkAgain.find((d) => d.user === "odin")!.action).toBe("observed");
+    const t5 = t4 + ALERT_STATE_MIN_AGE_MS + MIN;
+    const paged = await sweep(t5);
+    expect(paged.find((d) => d.user === "odin")!.action).toBe("alerted");
+    expect(odinCalls().length).toBe(2);
+    expect(odinCalls()[1]!.text).not.toContain("will not re-page");
   });
 });

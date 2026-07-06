@@ -1475,8 +1475,9 @@ export function buildApp(opts: BuildOptions) {
     // Piggyback a pending directive on the response — a busy daemon posts
     // events every tick and may never hit /checkin. Old daemons ignore the
     // extra field. Device-scoped: this machine only ever receives
-    // directives aimed at it (or at any of the user's devices).
-    const directive = store.takeDirective(firstUser, deviceId, Date.now());
+    // directives aimed at it (or at any of the user's devices). Channel
+    // 'daemon': watchdog-only verbs never ride an ingest response.
+    const directive = store.takeDirective(firstUser, deviceId, "daemon", Date.now());
     // Only surface `skipped` when some row was dropped — an all-valid batch
     // keeps the exact {inserted, duplicates} shape older daemons expect.
     const payload: Record<string, unknown> =
@@ -1546,7 +1547,7 @@ export function buildApp(opts: BuildOptions) {
     } catch {
       // fleet tracking is non-critical; the heartbeat itself still counts
     }
-    const directive = store.takeDirective(user, auth.deviceId, Date.now());
+    const directive = store.takeDirective(user, auth.deviceId, "daemon", Date.now());
     return c.json(directive ? { ok: true, directive } : { ok: true });
   });
 
@@ -1589,7 +1590,9 @@ export function buildApp(opts: BuildOptions) {
     } catch {
       // liveness bookkeeping is non-critical; the 200 + directive still count
     }
-    const directive = store.takeDirective(user, auth.deviceId, Date.now());
+    // Channel 'watchdog': the one executor that may take ANY verb —
+    // including the watchdog-only ones a daemon channel never sees.
+    const directive = store.takeDirective(user, auth.deviceId, "watchdog", Date.now());
     return c.json(directive ? { ok: true, directive } : { ok: true });
   });
 
