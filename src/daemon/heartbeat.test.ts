@@ -94,10 +94,10 @@ describe("exit journal", () => {
   test("size cap rewrites to the newest tail instead of growing forever", async () => {
     const dir = await makeTmpDir();
     // Oversize the journal well past the 64KB cap, then append once more.
-    for (let i = 0; i < 1200; i++) journalExit(dir, `reason-${i}`, 75);
+    for (let i = 0; i < 3000; i++) journalExit(dir, `reason-${i}`, 75);
     const entries = readJournal(dir);
-    expect(entries.length).toBeLessThan(1200);
-    expect(entries[entries.length - 1]!.reason).toBe("reason-1199");
+    expect(entries.length).toBeLessThan(3000);
+    expect(entries[entries.length - 1]!.reason).toBe("reason-2999");
   });
 });
 
