@@ -49,14 +49,16 @@ set -euo pipefail
 
 SERVER_URL="\${TOKENLEADER_INSTALL_URL:-${serverUrlLiteral}}"
 LABEL="${LABEL}"
+WATCHDOG_LABEL="\${LABEL}.watchdog"
 DOMAIN="gui/\$(id -u)"
 LOG_DIR="\$HOME/Library/Logs/anara-leaderboard"
 STDERR_LOG="\$LOG_DIR/stderr.log"
 STDOUT_LOG="\$LOG_DIR/stdout.log"
 BIN_DST="\$HOME/.local/bin/anara-leaderboard"
 PLIST="\$HOME/Library/LaunchAgents/\${LABEL}.plist"
+WATCHDOG_PLIST="\$HOME/Library/LaunchAgents/\${WATCHDOG_LABEL}.plist"
 STATE_DIR="\$HOME/.local/share/anara-leaderboard"
-TOTAL_STEPS=5
+TOTAL_STEPS=6
 
 # --- color setup ----------------------------------------------------------
 # Only emit ANSI when stdout is an interactive TTY. curl|bash usually keeps
@@ -325,6 +327,30 @@ do_codesign() {
   step_ok
 }
 
+# --- launchctl registration discipline -------------------------------------
+# Shared by the daemon and watchdog labels. launchctl bootout is ASYNC:
+# bootstrapping too soon fails with "service already loaded", so wait for the
+# old instance to disappear, then enable + bootstrap with retries. The final
+# verdict is \`launchctl print\` (is the job loaded?), NOT bootstrap's exit
+# code — a mid-retry "already loaded" IS success, which keeps re-runs over
+# half-installed states idempotent. All targets pinned to gui/\$UID.
+register_launch_agent() {
+  # register_launch_agent <label> <plist-path>
+  local label="\$1"
+  local plist="\$2"
+  launchctl bootout "\$DOMAIN/\$label" 2>/dev/null || true
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    launchctl print "\$DOMAIN/\$label" >/dev/null 2>&1 || break
+    sleep 0.5
+  done
+  launchctl enable "\$DOMAIN/\$label" 2>/dev/null || true
+  for _i in 1 2 3 4 5; do
+    if launchctl bootstrap "\$DOMAIN" "\$plist" 2>/dev/null; then break; fi
+    sleep 1
+  done
+  launchctl print "\$DOMAIN/\$label" >/dev/null 2>&1
+}
+
 # --- step 4: launchagent --------------------------------------------------
 write_plist_and_register() {
   step_start 4 "Registering LaunchAgent"
@@ -410,32 +436,84 @@ PLIST_EOF
     step_fail "generated plist failed plutil -lint (see \$PLIST)"
   fi
 
-  # launchctl bootout is ASYNC: bootstrapping too soon fails with "service
-  # already loaded". Wait for the old instance to disappear, then bootstrap
-  # with retries.
-  launchctl bootout "\$DOMAIN/\$LABEL" 2>/dev/null || true
-  for _i in 1 2 3 4 5 6 7 8 9 10; do
-    launchctl print "\$DOMAIN/\$LABEL" >/dev/null 2>&1 || break
-    sleep 0.5
-  done
-  launchctl enable "\$DOMAIN/\$LABEL" 2>/dev/null || true
-  _bootstrapped=""
-  for _i in 1 2 3 4 5; do
-    if launchctl bootstrap "\$DOMAIN" "\$PLIST" 2>/dev/null; then _bootstrapped=1; break; fi
-    sleep 1
-  done
-  if [ -z "\$_bootstrapped" ]; then
+  if ! register_launch_agent "\$LABEL" "\$PLIST"; then
     step_fail "launchctl bootstrap failed (run 'launchctl bootstrap \$DOMAIN \$PLIST' for the error)"
   fi
   launchctl kickstart -k "\$DOMAIN/\$LABEL" >/dev/null 2>&1 || true
   step_ok
 }
 
-# --- step 5: start daemon -------------------------------------------------
+# --- step 5: watchdog launchagent ------------------------------------------
+# Second half of the v0.6.0 "Never Silent" watchdog pair (docs/resilience.md).
+# The plist points at a HARDLINK of the daemon binary so a deleted or
+# rolled-back daemon binary can't take the watchdog down with it. The XML is
+# byte-identical to scripts/plist-templates.sh render_watchdog_plist and the
+# daemon's renderer in src/daemon/watchdog.ts — change one, change all.
+# Same registration discipline as the daemon label; a registration failure
+# is a warning, not a failure — the daemon re-registers the watchdog at
+# every boot and the server queues reinstall_watchdog for silent devices.
+write_watchdog_plist_and_register() {
+  step_start 5 "Registering watchdog"
+  # Same filesystem as \$BIN_DST by construction; -f replaces a stale link.
+  if ! ln -f "\$BIN_DST" "\$BIN_DST.watchdog" 2>/dev/null; then
+    step_warn "couldn't hardlink \$BIN_DST.watchdog (daemon retries at every boot)"
+    return 0
+  fi
+
+  cat >"\$WATCHDOG_PLIST" <<WATCHDOG_PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sh.anara.leaderboard.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>\${HOME}/.local/bin/anara-leaderboard.watchdog</string>
+        <string>watchdog</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>\${HOME}</string>
+        <key>PATH</key>
+        <string>\${HOME}/.local/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <!-- One-shot checker on launchd's clock: StartInterval fires while awake
+         (collided/asleep firings are dropped, never queued) and RunAtLoad
+         covers login. Deliberately NO KeepAlive - the watchdog must stay a
+         short-lived one-shot; a resident copy would share the daemon's
+         wedgeable-runtime failure domain. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>120</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>\${HOME}/Library/Logs/anara-leaderboard/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>\${HOME}/Library/Logs/anara-leaderboard/watchdog.log</string>
+</dict>
+</plist>
+WATCHDOG_PLIST_EOF
+  chmod 600 "\$WATCHDOG_PLIST"
+  if ! plutil -lint "\$WATCHDOG_PLIST" >/dev/null 2>&1; then
+    step_fail "generated watchdog plist failed plutil -lint (see \$WATCHDOG_PLIST)"
+  fi
+
+  if register_launch_agent "\$WATCHDOG_LABEL" "\$WATCHDOG_PLIST"; then
+    step_ok
+  else
+    step_warn "watchdog not registered (daemon retries at every boot; try 'launchctl print \$DOMAIN/\$WATCHDOG_LABEL')"
+  fi
+}
+
+# --- step 6: start daemon -------------------------------------------------
 # Don't block on "tick_done" — a first sync can take 10-60s on big
 # histories. Confirm the process is running; sync continues in background.
 wait_for_first_tick() {
-  step_start 5 "Starting daemon"
+  step_start 6 "Starting daemon"
   launchctl kickstart -k "\$DOMAIN/\$LABEL" >/dev/null 2>&1 || true
 
   local deadline=\$(( \$(date +%s) + 5 ))
@@ -608,6 +686,7 @@ ${joinWarning}ensure_dirs
 do_download
 do_codesign
 write_plist_and_register
+write_watchdog_plist_and_register
 wait_for_first_tick
 print_summary
 `;
@@ -652,9 +731,12 @@ fi
 printf "\\n  %stokenleader uninstaller%s\\n\\n" "\$C_BOLD" "\$C_RESET"
 
 LABEL="${LABEL}"
+WATCHDOG_LABEL="\${LABEL}.watchdog"
 DOMAIN="gui/\$(id -u)"
 PLIST="\$HOME/Library/LaunchAgents/\${LABEL}.plist"
+WATCHDOG_PLIST="\$HOME/Library/LaunchAgents/\${WATCHDOG_LABEL}.plist"
 BIN="\$HOME/.local/bin/anara-leaderboard"
+BIN_WATCHDOG="\$BIN.watchdog"
 STATE_DIR="\$HOME/.local/share/anara-leaderboard"
 LOG_DIR="\$HOME/Library/Logs/anara-leaderboard"
 SECRET_FILE="\$STATE_DIR/secret"
@@ -695,11 +777,28 @@ notify_server_uninstall() {
 }
 notify_server_uninstall
 
+# Watchdog FIRST: its boot-time self-heal re-bootstraps an absent daemon
+# label, so booting the daemon out first invites a resurrection race.
+# Pre-v0.6.0 installs have no watchdog — absence of each is fine.
+info "Stopping watchdog LaunchAgent (if running)..."
+if launchctl bootout "\$DOMAIN/\$WATCHDOG_LABEL" 2>/dev/null; then
+  ok  "Booted out \$WATCHDOG_LABEL."
+else
+  info "\$WATCHDOG_LABEL was not loaded (pre-v0.6.0 install, or already gone)."
+fi
+
 info "Stopping LaunchAgent (if running)..."
 if launchctl bootout "\$DOMAIN/\$LABEL" 2>/dev/null; then
   ok  "Booted out \$LABEL."
 else
   warn "\$LABEL was not loaded (or bootout failed); continuing."
+fi
+
+if [ -f "\$WATCHDOG_PLIST" ]; then
+  rm -f "\$WATCHDOG_PLIST"
+  ok "Removed \$WATCHDOG_PLIST"
+else
+  info "No plist at \$WATCHDOG_PLIST"
 fi
 
 if [ -f "\$PLIST" ]; then
@@ -714,6 +813,13 @@ if [ -f "\$BIN" ]; then
   ok "Removed \$BIN"
 else
   info "No binary at \$BIN"
+fi
+
+# The .watchdog hardlink shares the daemon binary's inode; remove it too or
+# the watchdog's plist would keep a runnable copy alive after uninstall.
+if [ -f "\$BIN_WATCHDOG" ]; then
+  rm -f "\$BIN_WATCHDOG"
+  ok "Removed \$BIN_WATCHDOG"
 fi
 
 # The CLI-name symlink the installer (or daemon) created beside the binary.
