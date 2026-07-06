@@ -177,6 +177,30 @@ describe("fuse (respawns, not kills)", () => {
     expect(loadWatchdogState(h.stateDir).state.degraded).toBe(false);
   });
 
+  test("fast crash loops are caught via heartbeat-pid churn even when label sampling never sees a live pid", async () => {
+    const h = await makeHarness();
+    h.daemonPid.value = null; // each incarnation dies within seconds — the
+    // 120s label samples always miss it, but every boot writes a heartbeat.
+    for (let pid = 100; pid < 100 + FUSE_RESPAWNS + 1; pid++) {
+      const hb = createHeartbeat(h.stateDir, "dev", pid);
+      hb.progress(); // boot write only: tick_seq 0 = never completed a tick
+      await runWatchdog(h.deps);
+    }
+    expect(loadWatchdogState(h.stateDir).state.degraded).toBe(true);
+  });
+
+  test("a respawn whose daemon completes a healthy tick clears the fuse memory", async () => {
+    const h = await makeHarness();
+    for (let pid = 200; pid < 200 + FUSE_RESPAWNS + 2; pid++) {
+      const hb = createHeartbeat(h.stateDir, "dev", pid);
+      hb.tickStart();
+      hb.tickEnd(true); // tick_seq 1, no failures — genuine recovery
+      h.daemonPid.value = pid;
+      await runWatchdog(h.deps);
+    }
+    expect(loadWatchdogState(h.stateDir).state.degraded).toBe(false);
+  });
+
   test("unexplained respawn churn hits the fuse and stops the ladder", async () => {
     const h = await makeHarness();
     const hb = createHeartbeat(h.stateDir, "dev", 4242);
