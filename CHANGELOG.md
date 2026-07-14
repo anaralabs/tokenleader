@@ -9,6 +9,29 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [0.6.1] - 2026-07-14
+
+Codex usage was systematically UNDER-counted (~46% of input and cache-read
+tokens, ~24% of output, measured over 47 real gpt-5.6 sessions): the parser
+treated `last_token_usage` as session-cumulative when it is per-turn, so
+whenever no bucket happened to regress turn-over-turn, only the difference
+between two per-turn values survived. Surfaced by the gpt-5.6 launch (thanks
+@andrew for the report) but affects all Codex data since at least June.
+
+### Fixed
+- **Codex parser: `last_token_usage` is per-turn, not cumulative.** It is now
+  emitted directly as that event's usage; cumulative-delta tracking (with
+  reset-to-baseline detection) remains as the fallback for total-only formats.
+  Validated against 47 real rollouts: parser output now reconciles with the
+  files' own `total_token_usage` ledger to the token (was -46% input/cache).
+  Historical rows ingested by older daemons remain under-counted; a backfill
+  is a separate decision.
+
+### Changed
+- **Pricing fallback refreshed** to the current LiteLLM sheet so the gpt-5.6
+  family (`-sol`, `-terra`, `-luna`) and other 2026 models price correctly on
+  a cold boot before the first upstream refresh.
+
 ## [0.6.0] - 2026-07-06
 
 The "Never Silent" release. Root cause: a production daemon spent two days

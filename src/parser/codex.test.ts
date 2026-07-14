@@ -12,29 +12,39 @@ async function makeTempJsonl(name: string, lines: string[]): Promise<string> {
   return file;
 }
 
-function tokenCountEvent(
-  ts: string,
-  cum: {
-    input: number;
-    output: number;
-    cached: number;
-    reasoning: number;
-  },
-  useTotal = false,
-) {
-  const usage = {
-    input_tokens: cum.input,
-    cached_input_tokens: cum.cached,
-    output_tokens: cum.output,
-    reasoning_output_tokens: cum.reasoning,
-    total_tokens: cum.input + cum.output,
+interface UsageNums {
+  input: number;
+  output: number;
+  cached: number;
+  reasoning: number;
+}
+
+function usageJson(u: UsageNums) {
+  return {
+    input_tokens: u.input,
+    cached_input_tokens: u.cached,
+    output_tokens: u.output,
+    reasoning_output_tokens: u.reasoning,
+    total_tokens: u.input + u.output,
   };
+}
+
+/**
+ * Real Codex shape: `last_token_usage` is the PER-TURN usage and
+ * `total_token_usage` the session-cumulative one (each total delta equals
+ * that event's last). Pass `total: null` / `last: null` to model partial
+ * formats.
+ */
+function tokenCountEvent(ts: string, last: UsageNums | null, total?: UsageNums | null) {
   return {
     timestamp: ts,
     type: "event_msg",
     payload: {
       type: "token_count",
-      info: useTotal ? { total_token_usage: usage } : { last_token_usage: usage },
+      info: {
+        ...(last ? { last_token_usage: usageJson(last) } : {}),
+        ...(total ? { total_token_usage: usageJson(total) } : {}),
+      },
     },
   };
 }
@@ -46,24 +56,22 @@ const turnContextLine = (model: string) => ({
 });
 
 describe("parseCodexFile (synthetic)", () => {
-  it("emits cumulative→delta events with model from turn_context", async () => {
+  it("emits per-turn last_token_usage directly with model from turn_context", async () => {
     const path = await makeTempJsonl("rollout-A.jsonl", [
       JSON.stringify(turnContextLine("gpt-5.5")),
       JSON.stringify(
-        tokenCountEvent("2026-05-01T00:00:01.000Z", {
-          input: 100,
-          output: 50,
-          cached: 10,
-          reasoning: 5,
-        }),
+        tokenCountEvent(
+          "2026-05-01T00:00:01.000Z",
+          { input: 100, output: 50, cached: 10, reasoning: 5 },
+          { input: 100, output: 50, cached: 10, reasoning: 5 },
+        ),
       ),
       JSON.stringify(
-        tokenCountEvent("2026-05-01T00:00:02.000Z", {
-          input: 250,
-          output: 130,
-          cached: 30,
-          reasoning: 12,
-        }),
+        tokenCountEvent(
+          "2026-05-01T00:00:02.000Z",
+          { input: 150, output: 80, cached: 20, reasoning: 7 },
+          { input: 250, output: 130, cached: 30, reasoning: 12 },
+        ),
       ),
     ]);
     const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
@@ -73,14 +81,14 @@ describe("parseCodexFile (synthetic)", () => {
     expect(r.events[0]!.requestId).toBeNull();
     expect(r.events[0]!.cacheCreationTokens).toBe(0);
     // Codex `input_tokens` is INCLUSIVE of `cached_input_tokens`. The
-    // parser subtracts cached at the delta boundary so downstream pricing
-    // can apply a uniform formula across providers.
-    //   Raw delta: input=100, cached=10 → non-cached = 90, cacheRead = 10.
+    // parser subtracts cached so downstream pricing can apply a uniform
+    // formula across providers.
+    //   Turn 1: input=100, cached=10 → non-cached = 90, cacheRead = 10.
     expect(r.events[0]!.inputTokens).toBe(90);
     expect(r.events[0]!.outputTokens).toBe(50);
     expect(r.events[0]!.cacheReadTokens).toBe(10);
     expect(r.events[0]!.reasoningTokens).toBe(5);
-    // delta on second event: raw input delta=150, cached delta=20 → 130/20.
+    // Turn 2 is emitted from its own per-turn numbers, NOT a delta of them.
     expect(r.events[1]!.inputTokens).toBe(130);
     expect(r.events[1]!.outputTokens).toBe(80);
     expect(r.events[1]!.cacheReadTokens).toBe(20);
@@ -98,16 +106,15 @@ describe("parseCodexFile (synthetic)", () => {
     expect(ids.size).toBe(r.events.length);
   });
 
-  it("preserves deltas across reads via prevSessionTotals", async () => {
+  it("preserves totals bookkeeping across reads via prevSessionTotals", async () => {
     const path = await makeTempJsonl("rollout-B.jsonl", [
       JSON.stringify(turnContextLine("gpt-5.5")),
       JSON.stringify(
-        tokenCountEvent("2026-05-01T00:00:01.000Z", {
-          input: 100,
-          output: 50,
-          cached: 10,
-          reasoning: 5,
-        }),
+        tokenCountEvent(
+          "2026-05-01T00:00:01.000Z",
+          { input: 100, output: 50, cached: 10, reasoning: 5 },
+          { input: 100, output: 50, cached: 10, reasoning: 5 },
+        ),
       ),
     ]);
     const r1 = await parseCodexFile({ path, byteOffset: 0, user: "k" });
@@ -116,10 +123,11 @@ describe("parseCodexFile (synthetic)", () => {
     expect(r1.events[0]!.inputTokens).toBe(90);
     expect(r1.events[0]!.cacheReadTokens).toBe(10);
 
-    // Append a second event.
+    // Append a total-only second event: the fallback delta path must pick
+    // up from the persisted cumulative totals of the first read.
     const second =
       JSON.stringify(
-        tokenCountEvent("2026-05-01T00:00:02.000Z", {
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
           input: 250,
           output: 130,
           cached: 30,
@@ -142,32 +150,38 @@ describe("parseCodexFile (synthetic)", () => {
     expect(r2.events[0]!.outputTokens).toBe(80);
   });
 
-  it("falls back to total_token_usage when last_token_usage missing", async () => {
+  it("falls back to cumulative deltas of total_token_usage when last is missing", async () => {
     const path = await makeTempJsonl("rollout-C.jsonl", [
       JSON.stringify(turnContextLine("gpt-5.5")),
       JSON.stringify(
-        tokenCountEvent(
-          "2026-05-01T00:00:01.000Z",
-          {
-            input: 10,
-            output: 5,
-            cached: 0,
-            reasoning: 0,
-          },
-          true,
-        ),
+        tokenCountEvent("2026-05-01T00:00:01.000Z", null, {
+          input: 10,
+          output: 5,
+          cached: 0,
+          reasoning: 0,
+        }),
+      ),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
+          input: 25,
+          output: 12,
+          cached: 0,
+          reasoning: 0,
+        }),
       ),
     ]);
     const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
-    expect(r.events.length).toBe(1);
+    expect(r.events.length).toBe(2);
     expect(r.events[0]!.inputTokens).toBe(10);
+    expect(r.events[1]!.inputTokens).toBe(15);
+    expect(r.events[1]!.outputTokens).toBe(7);
   });
 
   it("handles cumulative reset (negative delta) by treating values as new baseline", async () => {
     const path = await makeTempJsonl("rollout-D.jsonl", [
       JSON.stringify(turnContextLine("gpt-5.5")),
       JSON.stringify(
-        tokenCountEvent("2026-05-01T00:00:01.000Z", {
+        tokenCountEvent("2026-05-01T00:00:01.000Z", null, {
           input: 100,
           output: 50,
           cached: 0,
@@ -176,7 +190,7 @@ describe("parseCodexFile (synthetic)", () => {
       ),
       // Server reports lower totals — simulates reset.
       JSON.stringify(
-        tokenCountEvent("2026-05-01T00:00:02.000Z", {
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
           input: 30,
           output: 15,
           cached: 0,
@@ -187,6 +201,44 @@ describe("parseCodexFile (synthetic)", () => {
     const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
     expect(r.events.length).toBe(2);
     expect(r.events[1]!.inputTokens).toBe(30);
+  });
+
+  it("regression: real-shape stream sums to the sum of per-turn last values", async () => {
+    // Mirrors a real gpt-5.6-sol rollout: three token_count events whose
+    // total deltas equal each event's last, per-turn input hovering around
+    // the context size, output fluctuating. The old parser treated `last`
+    // as cumulative and swallowed ~half the volume (only the turn-over-turn
+    // difference survived when no bucket regressed).
+    const turns = [
+      { input: 26561, output: 696, cached: 9984, reasoning: 516 },
+      { input: 27281, output: 111, cached: 26368, reasoning: 0 },
+      { input: 26773, output: 468, cached: 26368, reasoning: 287 },
+    ];
+    let cum = { input: 0, output: 0, cached: 0, reasoning: 0 };
+    const lines = [JSON.stringify(turnContextLine("gpt-5.6-sol"))];
+    for (const [i, t] of turns.entries()) {
+      cum = {
+        input: cum.input + t.input,
+        output: cum.output + t.output,
+        cached: cum.cached + t.cached,
+        reasoning: cum.reasoning + t.reasoning,
+      };
+      lines.push(JSON.stringify(tokenCountEvent(`2026-07-11T16:34:4${i}.302Z`, t, cum)));
+    }
+    const path = await makeTempJsonl("rollout-real-shape.jsonl", lines);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.length).toBe(3);
+    const sum = r.events.reduce(
+      (a, e) => ({
+        input: a.input + e.inputTokens + e.cacheReadTokens,
+        output: a.output + e.outputTokens,
+        cached: a.cached + e.cacheReadTokens,
+      }),
+      { input: 0, output: 0, cached: 0 },
+    );
+    expect(sum.input).toBe(26561 + 27281 + 26773);
+    expect(sum.output).toBe(696 + 111 + 468);
+    expect(sum.cached).toBe(9984 + 26368 + 26368);
   });
 
   it("uses fallback model when no turn_context yet", async () => {
