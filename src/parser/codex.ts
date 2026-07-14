@@ -49,6 +49,9 @@ interface CodexLine {
     type?: string;
     model?: string;
     role?: string;
+    /** session_meta only: this rollout was seeded with a verbatim copy of
+     *  that thread's history (subagent spawn / fork / resume --fork). */
+    forked_from_id?: string;
     info?: {
       model?: string;
       model_name?: string;
@@ -62,6 +65,29 @@ interface CodexLine {
 }
 
 const LEGACY_FALLBACK_MODEL = "gpt-5";
+
+/**
+ * Fork-seed suppression. When Codex spawns a subagent or forks/resumes a
+ * thread (CLI ≥0.32; subagent spawns ≥0.107), the child rollout is seeded
+ * with a verbatim COPY of the parent's history — including every token_count
+ * line — re-stamped with spawn-time timestamps. Counting those re-bills the
+ * parent's entire ledger once per fork (measured: 86% of stored gpt-5.6
+ * volume fleet-wide was such copies).
+ *
+ * There is no per-line replay marker upstream. The reliable structural
+ * signals (confirmed against openai/codex source) are: the child's
+ * session_meta carries `forked_from_id`, and the seed is written in one
+ * synchronous burst at file birth — consecutive lines milliseconds apart —
+ * while the child's first REAL event trails by at least a model round-trip.
+ * So: in a file whose session_meta has forked_from_id, suppress emission
+ * until a line's timestamp jumps more than SEED_GAP_MS past the previous
+ * line's. Totals bookkeeping still runs during the seed (the child's
+ * cumulative ledger continues from the parent's).
+ *
+ * Seed handling is only needed when parsing from byte 0: the seed is flushed
+ * at file creation, so the first read of a new file always contains it whole.
+ */
+const SEED_GAP_MS = 1500;
 
 function isString(v: unknown): v is string {
   return typeof v === "string" && v.length > 0;
@@ -142,6 +168,10 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
   let lastTs = "";
   let ixForTs = 0;
   let oversizeSkipped = 0;
+  // Fork-seed suppression (see SEED_GAP_MS doc). Armed by a session_meta
+  // carrying forked_from_id; disarmed by the first inter-line timestamp gap.
+  let seedActive = false;
+  let prevLineTsMs: number | null = null;
 
   // Read line-by-line in capped windows so an oversized file never lands as
   // one string and we never build a giant per-chunk line array.
@@ -161,6 +191,24 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
       continue;
     }
 
+    // Seed-burst tracking: a real event after the seed arrives at least a
+    // model round-trip later; seed lines are written milliseconds apart.
+    const lineTsMs = isString(raw.timestamp) ? Date.parse(raw.timestamp) : NaN;
+    if (
+      seedActive &&
+      prevLineTsMs !== null &&
+      Number.isFinite(lineTsMs) &&
+      lineTsMs - prevLineTsMs > SEED_GAP_MS
+    ) {
+      seedActive = false;
+    }
+    if (Number.isFinite(lineTsMs)) prevLineTsMs = lineTsMs;
+
+    if (byteOffset === 0 && raw.type === "session_meta" && isString(raw.payload?.forked_from_id)) {
+      seedActive = true;
+      continue;
+    }
+
     // Track most-recent model from turn_context lines.
     if (raw.type === "turn_context") {
       const m = extractModel(raw);
@@ -174,6 +222,7 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     // same way as token-count events but tagged with `:user:` so it can
     // never collide with an assistant-event id at the same timestamp.
     if (raw.type === "response_item" && raw.payload?.role === "user") {
+      if (seedActive) continue; // copied prompt from the parent's history
       const tsStr = isString(raw.timestamp) ? raw.timestamp : new Date().toISOString();
       const tsMs = Date.parse(tsStr);
       const timestamp = Number.isFinite(tsMs) ? tsMs : Date.now();
@@ -252,6 +301,10 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
       totals.cachedInputTokens += dCached;
       totals.reasoningTokens += dReasoning;
     }
+
+    // Seeded copy of the parent's ledger: bookkeeping above stays (the
+    // child's cumulative continues the parent's), but nothing is billed.
+    if (seedActive) continue;
 
     if (dInput === 0 && dOutput === 0 && dCached === 0 && dReasoning === 0) continue;
 
