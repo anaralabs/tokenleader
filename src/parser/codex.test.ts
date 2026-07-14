@@ -49,10 +49,19 @@ function tokenCountEvent(ts: string, last: UsageNums | null, total?: UsageNums |
   };
 }
 
-const turnContextLine = (model: string) => ({
-  timestamp: "2026-05-01T00:00:00.000Z",
+const turnContextLine = (model: string, ts = "2026-05-01T00:00:00.000Z") => ({
+  timestamp: ts,
   type: "turn_context",
   payload: { turn_id: "tc-1", model },
+});
+
+const sessionMetaLine = (ts: string, forkedFromId?: string) => ({
+  timestamp: ts,
+  type: "session_meta",
+  payload: {
+    id: "child-thread-id",
+    ...(forkedFromId ? { forked_from_id: forkedFromId, thread_source: "subagent" } : {}),
+  },
 });
 
 describe("parseCodexFile (synthetic)", () => {
@@ -372,6 +381,113 @@ describe("parseCodexFile (synthetic)", () => {
     const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
     const ids = new Set(r.events.map((e) => e.messageId));
     expect(ids.size).toBe(r.events.length);
+  });
+});
+
+describe("fork-seed suppression", () => {
+  // Codex seeds forked/subagent rollouts with a verbatim copy of the
+  // parent's history — token_count lines included — re-stamped to the spawn
+  // instant. Structure mirrors a real 0.144.1 subagent file: session_meta
+  // with forked_from_id, a millisecond-packed seed burst, then real events
+  // seconds later.
+  const T0 = "2026-07-11T18:37:42.852Z";
+  const seedTs = (ms: number) => `2026-07-11T18:37:42.${String(852 + ms).padStart(3, "0")}Z`;
+
+  it("drops the seeded ledger copy and bills only the child's own turns", async () => {
+    const path = await makeTempJsonl("rollout-fork.jsonl", [
+      JSON.stringify(sessionMetaLine(T0, "parent-thread-id")),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", T0)),
+      // copied prompt from the parent's history
+      JSON.stringify({ timestamp: T0, type: "response_item", payload: { role: "user" } }),
+      // seed burst: parent's ledger replayed within milliseconds
+      JSON.stringify(
+        tokenCountEvent(
+          seedTs(0),
+          { input: 24860, output: 697, cached: 9984, reasoning: 516 },
+          { input: 24860, output: 697, cached: 9984, reasoning: 516 },
+        ),
+      ),
+      JSON.stringify(
+        tokenCountEvent(
+          seedTs(1),
+          { input: 25581, output: 194, cached: 24320, reasoning: 0 },
+          { input: 50441, output: 891, cached: 34304, reasoning: 516 },
+        ),
+      ),
+      // the child's first REAL turn, a model round-trip later
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-07-11T18:37:51.100Z",
+          { input: 51000, output: 300, cached: 50000, reasoning: 100 },
+          { input: 101441, output: 1191, cached: 84304, reasoning: 616 },
+        ),
+      ),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-07-11T18:38:02.000Z",
+          { input: 52000, output: 400, cached: 51000, reasoning: 0 },
+          { input: 153441, output: 1591, cached: 135304, reasoning: 616 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    // Only the two real turns are billed; seed + copied prompt vanish.
+    expect(r.events.length).toBe(2);
+    expect(r.events.every((e) => e.messageType === "assistant")).toBe(true);
+    expect(r.events[0]!.inputTokens + r.events[0]!.cacheReadTokens).toBe(51000);
+    expect(r.events[1]!.inputTokens + r.events[1]!.cacheReadTokens).toBe(52000);
+    // Bookkeeping continued through the seed: totals reflect the final ledger.
+    expect(r.sessionTotals.inputTokens).toBe(153441);
+  });
+
+  it("a copied parent session_meta inside the seed (depth ≥2) keeps suppression armed", async () => {
+    const path = await makeTempJsonl("rollout-fork-depth2.jsonl", [
+      JSON.stringify(sessionMetaLine(T0, "parent-thread-id")),
+      JSON.stringify(sessionMetaLine(seedTs(0), "grandparent-thread-id")),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", seedTs(1))),
+      JSON.stringify(
+        tokenCountEvent(
+          seedTs(2),
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+        ),
+      ),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-07-11T18:37:50.000Z",
+          { input: 200, output: 20, cached: 0, reasoning: 0 },
+          { input: 300, output: 30, cached: 0, reasoning: 0 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.length).toBe(1);
+    expect(r.events[0]!.inputTokens).toBe(200);
+  });
+
+  it("a session_meta without forked_from_id never suppresses anything", async () => {
+    const path = await makeTempJsonl("rollout-root.jsonl", [
+      JSON.stringify(sessionMetaLine(T0)),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", T0)),
+      // same-millisecond burst as a root session (e.g. batched flush) — still real
+      JSON.stringify(
+        tokenCountEvent(
+          seedTs(0),
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+        ),
+      ),
+      JSON.stringify(
+        tokenCountEvent(
+          seedTs(1),
+          { input: 150, output: 15, cached: 0, reasoning: 0 },
+          { input: 250, output: 25, cached: 0, reasoning: 0 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.length).toBe(2);
+    expect(r.events[0]!.inputTokens).toBe(100);
   });
 });
 

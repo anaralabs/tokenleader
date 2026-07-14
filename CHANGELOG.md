@@ -9,6 +9,31 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [0.6.2] - 2026-07-14
+
+The second half of the Codex accounting audit. Codex CLI (≥0.32; subagent
+spawns since 0.107, default-on since 0.123) seeds every forked/subagent
+rollout with a verbatim copy of the parent's history — token_count lines
+included, re-stamped to the spawn instant. Each spawn therefore re-billed
+the parent's entire accumulated ledger under a fresh sessionId that dedup
+cannot catch. Measured fleet-wide on the gpt-5.6 era: **86% of stored Codex
+volume was such phantom copies** (95% for the heaviest collab users). This
+inflation dominated the v0.6.1 under-count — net, the leaderboard
+OVER-stated Codex usage.
+
+### Fixed
+- **Codex parser: fork-seed suppression.** In rollouts whose session_meta
+  carries `forked_from_id`, the seeded history burst (consecutive lines
+  milliseconds apart at file birth; a real turn trails by a model
+  round-trip) is skipped for billing while cumulative bookkeeping continues.
+  Validated against every local fork by prefix-matching the actual parent
+  ledger: 47/47 sessions exact, 34 forks, boundary identical in all cases.
+  Confirmed against openai/codex source: no per-line replay marker exists;
+  the seed is one synchronous write at session construction.
+
+Historical rows (both bugs) remain as ingested; a full Codex backfill
+(server-side wipe + fleet re-scan from byte 0) is the path to true history.
+
 ## [0.6.1] - 2026-07-14
 
 Codex usage was systematically UNDER-counted (~46% of input and cache-read
