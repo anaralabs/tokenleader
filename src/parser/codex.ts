@@ -88,11 +88,13 @@ function extractModel(line: CodexLine): string | null {
   return null;
 }
 
-function pickUsage(info: NonNullable<CodexLine["payload"]>["info"]): CodexUsage | null {
-  if (!info) return null;
-  if (info.last_token_usage) return info.last_token_usage;
-  if (info.total_token_usage) return info.total_token_usage;
-  return null;
+function usageNums(u: CodexUsage) {
+  return {
+    input: readNum(u.input_tokens),
+    output: readNum(u.output_tokens),
+    cached: readNum(u.cached_input_tokens, u.cache_read_input_tokens),
+    reasoning: readNum(u.reasoning_output_tokens),
+  };
 }
 
 function readNum(...vals: Array<number | undefined>): number {
@@ -204,32 +206,52 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     const info = payload.info;
     if (!info) continue;
 
-    const usage = pickUsage(info);
-    if (!usage) continue;
+    const last = info.last_token_usage;
+    const cumTotal = info.total_token_usage ? usageNums(info.total_token_usage) : null;
+    if (!last && !cumTotal) continue;
 
-    const cumInput = readNum(usage.input_tokens);
-    const cumOutput = readNum(usage.output_tokens);
-    const cumCached = readNum(usage.cached_input_tokens, usage.cache_read_input_tokens);
-    const cumReasoning = readNum(usage.reasoning_output_tokens);
+    // `last_token_usage` is the PER-TURN usage — exactly what this event
+    // should emit, no delta bookkeeping needed. `total_token_usage` is the
+    // session-cumulative counterpart (verified against real rollouts: each
+    // total delta equals that event's last). Treating `last` as cumulative
+    // swallowed ~half of all input/cache tokens, so it is used directly and
+    // the delta path below only serves total-only formats.
+    let dInput: number;
+    let dOutput: number;
+    let dCached: number;
+    let dReasoning: number;
+    if (last) {
+      ({ input: dInput, output: dOutput, cached: dCached, reasoning: dReasoning } =
+        usageNums(last));
+    } else {
+      dInput = cumTotal!.input - totals.inputTokens;
+      dOutput = cumTotal!.output - totals.outputTokens;
+      dCached = cumTotal!.cached - totals.cachedInputTokens;
+      dReasoning = cumTotal!.reasoning - totals.reasoningTokens;
 
-    let dInput = cumInput - totals.inputTokens;
-    let dOutput = cumOutput - totals.outputTokens;
-    let dCached = cumCached - totals.cachedInputTokens;
-    let dReasoning = cumReasoning - totals.reasoningTokens;
-
-    // Reset detection: if any cumulative bucket regressed, treat current
-    // numbers as a fresh baseline (new sub-session, log rotation, etc.).
-    if (dInput < 0 || dOutput < 0 || dCached < 0 || dReasoning < 0) {
-      dInput = cumInput;
-      dOutput = cumOutput;
-      dCached = cumCached;
-      dReasoning = cumReasoning;
+      // Reset detection: if any cumulative bucket regressed, treat current
+      // numbers as a fresh baseline (new sub-session, log rotation, etc.).
+      if (dInput < 0 || dOutput < 0 || dCached < 0 || dReasoning < 0) {
+        dInput = cumTotal!.input;
+        dOutput = cumTotal!.output;
+        dCached = cumTotal!.cached;
+        dReasoning = cumTotal!.reasoning;
+      }
     }
 
-    totals.inputTokens = cumInput;
-    totals.outputTokens = cumOutput;
-    totals.cachedInputTokens = cumCached;
-    totals.reasoningTokens = cumReasoning;
+    // Keep the cumulative bookkeeping coherent either way so a later
+    // total-only event (or the next incremental read) deltas correctly.
+    if (cumTotal) {
+      totals.inputTokens = cumTotal.input;
+      totals.outputTokens = cumTotal.output;
+      totals.cachedInputTokens = cumTotal.cached;
+      totals.reasoningTokens = cumTotal.reasoning;
+    } else {
+      totals.inputTokens += dInput;
+      totals.outputTokens += dOutput;
+      totals.cachedInputTokens += dCached;
+      totals.reasoningTokens += dReasoning;
+    }
 
     if (dInput === 0 && dOutput === 0 && dCached === 0 && dReasoning === 0) continue;
 
