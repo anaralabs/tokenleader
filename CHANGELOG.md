@@ -9,6 +9,28 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [0.6.3] - 2026-07-21
+
+The watchdog can now revive a daemon whose launchd job is loaded but not
+running. Post-incident fix from a 10-day silent machine (2026-07-09): the
+daemon wedged, the watchdog's SIGTERM ladder worked — but the machine's
+*loaded* launchd registration still carried the legacy
+`KeepAlive {SuccessfulExit:false}` stanza (the v0.5.5 plist heal is
+file-only until next login), so the graceful exit 0 was treated as final.
+Every subsequent remote `restart` directive failed for 14 straight days
+because `launchctl bootstrap` returns EIO on a label that is already
+loaded.
+
+### Fixed
+- **Watchdog heal: loaded-but-idle daemon job → `launchctl kickstart`.**
+  Fires after two consecutive pid-less watchdog firings (rules out
+  KeepAlive ThrottleInterval respawn races), suppressed while
+  degraded-latched so a fused crash-looper stays down.
+- **`restart` directive: loaded-vs-absent distinction.** A loaded label is
+  kickstarted; only an absent one gets enable + bootstrap (which EIOs when
+  the label is loaded — the failure that made the strand unrecoverable
+  remotely).
+
 ## [0.6.2] - 2026-07-14
 
 The second half of the Codex accounting audit. Codex CLI (≥0.32; subagent
