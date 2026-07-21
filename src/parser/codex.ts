@@ -270,8 +270,12 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     let dCached: number;
     let dReasoning: number;
     if (last) {
-      ({ input: dInput, output: dOutput, cached: dCached, reasoning: dReasoning } =
-        usageNums(last));
+      ({
+        input: dInput,
+        output: dOutput,
+        cached: dCached,
+        reasoning: dReasoning,
+      } = usageNums(last));
     } else {
       dInput = cumTotal!.input - totals.inputTokens;
       dOutput = cumTotal!.output - totals.outputTokens;

@@ -81,6 +81,10 @@ const SPOOL_MAX_FILES = 12;
 const LOG_TAIL_BYTES = 64 * 1024;
 const SAMPLE_SECONDS = 3;
 const CURL_ARGS = ["--max-time", "10", "--connect-timeout", "5", "-sS"];
+/** Consecutive pid-less firings before the loaded-label kickstart heal fires —
+ *  one firing can be a KeepAlive ThrottleInterval respawn race; two (≥240s
+ *  apart) cannot. */
+export const KICKSTART_NO_PID_RUNS = 2;
 
 export interface WatchdogState {
   schema: 1;
@@ -103,6 +107,8 @@ export interface WatchdogState {
   respawns: number[];
   /** Timestamps of our kills (reporting only). */
   kills: number[];
+  /** Consecutive firings with no daemon pid (loaded-label kickstart gate). */
+  noPidRuns: number;
   degraded: boolean;
   degradedAt: number | null;
   rolledBackAt: number | null;
@@ -120,6 +126,7 @@ export function emptyWatchdogState(): WatchdogState {
     lastRunAt: null,
     respawns: [],
     kills: [],
+    noPidRuns: 0,
     degraded: false,
     degradedAt: null,
     rolledBackAt: null,
@@ -139,6 +146,7 @@ export function loadWatchdogState(stateDir: string): { state: WatchdogState; cor
     // corruption, just a younger writer.
     v.lastHbPid ??= null;
     v.lastRunAt ??= null;
+    v.noPidRuns ??= 0;
     return { state: v, corrupt: false };
   } catch (err: unknown) {
     const missing =
@@ -351,6 +359,7 @@ export async function runWatchdog(deps: WatchdogDeps): Promise<WatchdogRunResult
   state.lastLabelPid = daemonPid;
   if (hb) state.lastHbPid = hb.pid;
   state.lastRunAt = now();
+  state.noPidRuns = daemonPid === null ? state.noPidRuns + 1 : 0;
   state.respawns = state.respawns.filter((t) => now() - t < FUSE_WINDOW_MS);
 
   const staleThresholdRuns = staleRunsFor(ctx.tickIntervalSec);
@@ -448,8 +457,9 @@ export async function runWatchdog(deps: WatchdogDeps): Promise<WatchdogRunResult
   state.kills = state.kills.filter((t) => now() - t < FUSE_WINDOW_MS);
 
   // 3. Boot heal, local: missing daemon binary → repair download; unloaded
-  // daemon job → enable + bootstrap; missing daemon plist → restore snapshot.
-  await healDaemonArtifacts(deps, exec, ctx, uid, daemonPid, log);
+  // daemon job → enable + bootstrap; loaded-but-not-running job → kickstart;
+  // missing daemon plist → restore snapshot.
+  await healDaemonArtifacts(deps, exec, ctx, uid, daemonPid, state, log);
 
   saveWatchdogState(deps.stateDir, state);
 
@@ -627,6 +637,7 @@ async function healDaemonArtifacts(
   ctx: WatchdogContext,
   uid: number,
   daemonPid: number | null,
+  state: WatchdogState,
   log: Logger,
 ): Promise<void> {
   // Missing daemon plist with a live binary: restore the snapshot the daemon
@@ -672,6 +683,21 @@ async function healDaemonArtifacts(
     exec("launchctl", ["enable", `gui/${uid}/${DAEMON_LABEL}`]);
     const b = exec("launchctl", ["bootstrap", `gui/${uid}`, ctx.daemonPlistPath]);
     log.info("watchdog_daemon_bootstrap", { ok: b.ok, err: b.err });
+  } else if (
+    // Daemon job loaded but persistently NOT running: launchd's KeepAlive is
+    // satisfied and will never respawn it. Reachable when a loaded legacy
+    // {SuccessfulExit:false} registration (the plist heal is file-only until
+    // next login) sees the daemon exit 0 — e.g. the SIGTERM ladder's graceful
+    // shutdown (the 2026-07-09 edi strand). bootstrap EIOs on a loaded label;
+    // kickstart is the lever. Two pid-less firings rule out ThrottleInterval
+    // respawn races; the degraded latch wins — a fused crash-looper stays down.
+    daemonPid === null &&
+    !state.degraded &&
+    state.noPidRuns >= KICKSTART_NO_PID_RUNS &&
+    labelLoaded(exec, uid, DAEMON_LABEL)
+  ) {
+    const k = exec("launchctl", ["kickstart", `gui/${uid}/${DAEMON_LABEL}`]);
+    log.info("watchdog_daemon_kickstart", { ok: k.ok, err: k.err });
   }
 }
 
@@ -742,6 +768,13 @@ function executeWatchdogDirective(
           result = "failed";
           detail = String((err as Error)?.message ?? err);
         }
+      } else if (labelLoaded(exec, uid, DAEMON_LABEL)) {
+        // Loaded but not running: bootstrap EIOs on a loaded label (14
+        // consecutive failed restarts on the 2026-07 strand) — kickstart
+        // is the call that starts a loaded-but-idle job.
+        const k = exec("launchctl", ["kickstart", `gui/${uid}/${DAEMON_LABEL}`]);
+        detail = k.ok ? "kickstarted" : `kickstart failed: ${k.err}`;
+        if (!k.ok) result = "failed";
       } else {
         exec("launchctl", ["enable", `gui/${uid}/${DAEMON_LABEL}`]);
         const b = exec("launchctl", ["bootstrap", `gui/${uid}`, ctx.daemonPlistPath]);

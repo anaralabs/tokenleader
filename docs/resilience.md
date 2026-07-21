@@ -136,7 +136,17 @@ fetch is banned in the watchdog entirely.
    watchdog never performs endpoint-override migrations and never writes
    journal entries for restarts that didn't happen); daemon plist missing →
    rewrite (file-only); daemon job absent from launchd → `launchctl enable`
-   then `bootstrap` (a *different* label — safe).
+   then `bootstrap` (a *different* label — safe); daemon job loaded but
+   persistently NOT running → `launchctl kickstart` after **two consecutive
+   pid-less firings** (one firing can be a KeepAlive ThrottleInterval respawn
+   race; two cannot), suppressed while degraded-latched. This state is
+   reachable when a loaded legacy `{SuccessfulExit:false}` registration —
+   the plist heal is file-only until next login — sees the daemon exit 0,
+   e.g. the SIGTERM ladder's own graceful shutdown (the 2026-07-09 strand:
+   detection and kill worked, launchd never respawned, and 14 daily `restart`
+   directives failed because `bootstrap` EIOs on a loaded label). The
+   `restart` directive verb makes the same loaded-vs-absent distinction:
+   kickstart a loaded label, enable+bootstrap an absent one.
 4. Checkin: POST ~200B to `/watchdog-checkin` — `{device, daemon_pid_alive,
    heartbeat_age_runs, kills_recent, degraded, spool_pending}` — and execute
    any directive in the response (`restart`, `upload_logs`, `sample`,

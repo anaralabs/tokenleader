@@ -43,6 +43,10 @@ interface Harness {
   kills: { pid: number; sig: string }[];
   /** Mutable: what `launchctl print gui/uid/daemon-label` reports as pid. */
   daemonPid: { value: number | null };
+  /** Mutable: with daemonPid null, whether the label is still LOADED in the
+   *  domain (state = not running) vs absent entirely. Default false (absent)
+   *  — the pre-kickstart harness behavior. */
+  daemonLoaded: { value: boolean };
 }
 
 /** A watchdog test rig: real tmp fs, fake launchctl/sample/curl, fake kill. */
@@ -65,10 +69,15 @@ async function makeHarness(): Promise<Harness> {
   const execCalls: string[][] = [];
   const kills: { pid: number; sig: string }[] = [];
   const daemonPid = { value: 4242 as number | null };
+  const daemonLoaded = { value: false };
   const exec: Exec = (cmd, args) => {
     execCalls.push([cmd, ...args]);
     if (cmd === "launchctl" && args[0] === "print" && args[1]?.endsWith(DAEMON_LABEL)) {
-      if (daemonPid.value === null) return { ok: false, stdout: "", err: "not running" };
+      if (daemonPid.value === null) {
+        return daemonLoaded.value
+          ? { ok: true, stdout: "\tstate = not running\n" }
+          : { ok: false, stdout: "", err: "not running" };
+      }
       return { ok: true, stdout: `\tstate = running\n\tpid = ${daemonPid.value}\n` };
     }
     if (cmd === "launchctl") return { ok: true, stdout: "" };
@@ -85,7 +94,15 @@ async function makeHarness(): Promise<Harness> {
     skipDomainAssert: true,
     env: {},
   };
-  return { deps, home, stateDir, execCalls, kills, daemonPid };
+  return { deps, home, stateDir, execCalls, kills, daemonPid, daemonLoaded };
+}
+
+function kickstartCalls(h: Harness): string[][] {
+  return h.execCalls.filter((c) => c[0] === "launchctl" && c[1] === "kickstart");
+}
+
+function bootstrapCalls(h: Harness): string[][] {
+  return h.execCalls.filter((c) => c[0] === "launchctl" && c[1] === "bootstrap");
 }
 
 describe("staleness + kill ladder", () => {
@@ -247,6 +264,118 @@ describe("watchdog state file", () => {
     s.respawns = [123];
     saveWatchdogState(dir, s);
     expect(loadWatchdogState(dir).state).toEqual(s);
+  });
+});
+
+describe("loaded-label kickstart heal (the 2026-07 strand)", () => {
+  test("label loaded, no pid: kickstart on the second pid-less firing, never bootstrap", async () => {
+    const h = await makeHarness();
+    createHeartbeat(h.stateDir, "dev", 4242).tickStart(); // author dead below
+    h.daemonPid.value = null;
+    h.daemonLoaded.value = true;
+
+    await runWatchdog(h.deps); // firing 1 could be a ThrottleInterval respawn race
+    expect(kickstartCalls(h)).toEqual([]);
+    await runWatchdog(h.deps); // firing 2: genuinely stranded
+    const uid = process.getuid?.() ?? 501;
+    expect(kickstartCalls(h)).toEqual([["launchctl", "kickstart", `gui/${uid}/${DAEMON_LABEL}`]]);
+    // bootstrap EIOs on a loaded label — must never be attempted here.
+    expect(bootstrapCalls(h)).toEqual([]);
+  });
+
+  test("label absent entirely keeps the enable+bootstrap path, no kickstart", async () => {
+    const h = await makeHarness();
+    h.daemonPid.value = null; // daemonLoaded stays false = unloaded
+    await runWatchdog(h.deps);
+    await runWatchdog(h.deps);
+    expect(kickstartCalls(h)).toEqual([]);
+    expect(bootstrapCalls(h).length).toBe(2);
+  });
+
+  test("a pid sighting between firings resets the kickstart gate", async () => {
+    const h = await makeHarness();
+    h.daemonPid.value = null;
+    h.daemonLoaded.value = true;
+    await runWatchdog(h.deps);
+    h.daemonPid.value = 4243; // respawned on its own
+    await runWatchdog(h.deps);
+    h.daemonPid.value = null;
+    await runWatchdog(h.deps); // streak restarts at 1
+    expect(kickstartCalls(h)).toEqual([]);
+  });
+
+  test("degraded latch suppresses kickstart — a fused crash-looper stays down", async () => {
+    const h = await makeHarness();
+    const s = emptyWatchdogState();
+    s.degraded = true;
+    s.degradedAt = 1;
+    s.noPidRuns = 10;
+    saveWatchdogState(h.stateDir, s);
+    h.daemonPid.value = null;
+    h.daemonLoaded.value = true;
+    await runWatchdog(h.deps);
+    await runWatchdog(h.deps);
+    expect(kickstartCalls(h)).toEqual([]);
+  });
+
+  test("pre-kickstart state file (no noPidRuns) loads as 0, not corrupt", async () => {
+    const dir = await makeTmpDir();
+    const s: Record<string, unknown> = { ...emptyWatchdogState() };
+    delete s.noPidRuns;
+    await fsp.writeFile(path.join(dir, "watchdog.json"), JSON.stringify(s));
+    const { state, corrupt } = loadWatchdogState(dir);
+    expect(corrupt).toBe(false);
+    expect(state.noPidRuns).toBe(0);
+  });
+});
+
+describe("restart directive verb picks the right launchctl call", () => {
+  /** Harness whose first /watchdog-checkin hands out a restart directive. */
+  async function directiveHarness(): Promise<Harness> {
+    const h = await makeHarness();
+    await fsp.writeFile(path.join(h.stateDir, "secret"), "s3cret");
+    const inner = h.deps.exec!;
+    let handedOut = false;
+    h.deps.exec = (cmd, args, timeoutMs) => {
+      if (cmd === "curl" && args.some((a) => a.includes("/watchdog-checkin")) && !handedOut) {
+        handedOut = true;
+        h.execCalls.push([cmd, ...args]);
+        return { ok: true, stdout: '{"directive":{"id":7,"verb":"restart"}}' };
+      }
+      return inner(cmd, args, timeoutMs);
+    };
+    return h;
+  }
+
+  test("loaded-but-idle label: kickstart, acked as such (no pid-less-firings gate)", async () => {
+    const h = await directiveHarness();
+    h.daemonPid.value = null;
+    h.daemonLoaded.value = true;
+    await runWatchdog(h.deps); // first firing — directive path has no gate
+    expect(kickstartCalls(h).length).toBe(1);
+    expect(bootstrapCalls(h)).toEqual([]);
+    const ack = h.execCalls.find(
+      (c) => c[0] === "curl" && c.some((a) => a.includes("/directives/ack")),
+    );
+    expect(ack?.some((a) => a.includes("kickstarted"))).toBe(true);
+  });
+
+  test("unloaded label: enable + bootstrap as before", async () => {
+    const h = await directiveHarness();
+    h.daemonPid.value = null;
+    await runWatchdog(h.deps);
+    expect(kickstartCalls(h)).toEqual([]);
+    // Two: the heal path bootstraps an unloaded label every firing, and the
+    // directive bootstraps once more — both pre-existing behavior.
+    expect(bootstrapCalls(h).length).toBe(2);
+  });
+
+  test("live pid: SIGTERM as before", async () => {
+    const h = await directiveHarness();
+    await runWatchdog(h.deps);
+    expect(h.kills).toEqual([{ pid: 4242, sig: "SIGTERM" }]);
+    expect(kickstartCalls(h)).toEqual([]);
+    expect(bootstrapCalls(h)).toEqual([]);
   });
 });
 
