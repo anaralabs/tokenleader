@@ -63,7 +63,7 @@ tokens, ~24% of output, measured over 47 real gpt-5.6 sessions): the parser
 treated `last_token_usage` as session-cumulative when it is per-turn, so
 whenever no bucket happened to regress turn-over-turn, only the difference
 between two per-turn values survived. Surfaced by the gpt-5.6 launch (thanks
-@andrew for the report) but affects all Codex data since at least June.
+@andrewdoro for the report) but affects all Codex data since at least June.
 
 ### Fixed
 - **Codex parser: `last_token_usage` is per-turn, not cumulative.** It is now
