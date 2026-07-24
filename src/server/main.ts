@@ -169,10 +169,10 @@ export interface BuildOptions {
   startedAt?: number;
   /** False = skip the daily pricing-refresh interval (tests). */
   schedulePricingRefresh?: boolean;
-  /** Stats-cache invalidations are leading-edge coalesced to at most one
-   *  clear per this window (default 10s) so bulk replays can't starve the
-   *  event loop. 0 = clear on every write (tests). */
-  statsCacheClearCoalesceMs?: number;
+  /** TTL for live (rolling-window) stats-cache entries. Default 60s — the
+   *  dashboard's freshness bound now that /ingest no longer clears live
+   *  entries. 0 = no live caching (tests assert read-after-write). */
+  statsCacheTtlMs?: number;
   /** Public-facing server URL rendered into the dashboard + install
    *  snippets. Unset → inferred from request headers. Same URL the daemon
    *  uses for /ingest and /manifest.json. */
@@ -413,19 +413,26 @@ export function buildApp(opts: BuildOptions) {
   // In-process response cache for the read-heavy dashboard routes, keyed
   // by route + query params. bun:sqlite is synchronous — overlapping polls
   // block the event loop, and coalescing them here keeps /health
-  // responsive. FULLY CLEARED on every successful /ingest (and mirror
-  // insert), so the dashboard never shows data older than the most recent
-  // write or 15 s.
-  const STATS_CACHE_TTL_MS = 15_000;
+  // responsive. Live (rolling-window) entries age out on their TTL; new
+  // events carry current timestamps, so an ingest never changes a frozen
+  // window and only needs to drop the frozen entries a BACKFILL reaches
+  // into (see invalidateStatsCacheForIngest). Admin mutations that regroup
+  // history (categories, company changes, deletes) still clear everything.
+  const STATS_CACHE_TTL_MS = opts.statsCacheTtlMs ?? 60_000;
   // Windows ending in the past are frozen — no future write changes their
-  // answer until a backfill — so cache up to a day; /ingest still nukes
-  // the whole cache, so even a backfill can't serve stale frozen data.
+  // answer until a backfill — so cache up to a day.
   const STATS_CACHE_TTL_FROZEN_MS = 24 * 60 * 60 * 1000;
+  // Arbitrary since/until combos can mint unbounded 24h frozen entries;
+  // cap the map and evict oldest-inserted beyond it.
+  const STATS_CACHE_MAX_ENTRIES = 256;
   function isFrozenRange(untilMs: number): boolean {
     // 60s buffer for clock skew vs the clock that built `until`.
     return untilMs > 0 && untilMs < Date.now() - 60_000;
   }
-  const statsCache = new Map<string, { expiresAt: number; body: string }>();
+  const statsCache = new Map<
+    string,
+    { expiresAt: number; body: string; until: number; frozen: boolean }
+  >();
   function readStatsCache(key: string): string | null {
     const hit = statsCache.get(key);
     if (!hit) return null;
@@ -435,37 +442,40 @@ export function buildApp(opts: BuildOptions) {
     }
     return hit.body;
   }
-  function writeStatsCache(key: string, body: string, frozen = false): void {
+  function writeStatsCache(key: string, body: string, until: number): void {
+    const frozen = isFrozenRange(until);
     const ttl = frozen ? STATS_CACHE_TTL_FROZEN_MS : STATS_CACHE_TTL_MS;
-    statsCache.set(key, { expiresAt: Date.now() + ttl, body });
-  }
-  // Invalidations are leading-edge coalesced: the first write clears the
-  // cache immediately; further writes inside the window only schedule one
-  // trailing clear. Without this, a bulk replay (hundreds of /ingest
-  // batches) clears the cache per batch and every 5s dashboard poll re-runs
-  // the full aggregations between batches — the synchronous queries starve
-  // the event loop until ingest POSTs time out.
-  const STATS_CACHE_CLEAR_COALESCE_MS = opts.statsCacheClearCoalesceMs ?? 10_000;
-  let lastStatsClearAt = 0;
-  let trailingClear: ReturnType<typeof setTimeout> | null = null;
-  function invalidateStatsCache(): void {
-    const now = Date.now();
-    if (now - lastStatsClearAt >= STATS_CACHE_CLEAR_COALESCE_MS) {
-      lastStatsClearAt = now;
-      statsCache.clear();
-      return;
+    while (statsCache.size >= STATS_CACHE_MAX_ENTRIES && !statsCache.has(key)) {
+      const oldest = statsCache.keys().next().value;
+      if (oldest === undefined) break;
+      statsCache.delete(oldest);
     }
-    if (trailingClear) return;
-    trailingClear = setTimeout(
-      () => {
-        trailingClear = null;
-        lastStatsClearAt = Date.now();
-        statsCache.clear();
-      },
-      STATS_CACHE_CLEAR_COALESCE_MS - (now - lastStatsClearAt),
-    );
-    trailingClear.unref?.();
+    statsCache.set(key, { expiresAt: Date.now() + ttl, body, until, frozen });
   }
+  // Full clear: admin mutations that change how EXISTING rows aggregate
+  // (categories, company reassignment, deletes/uninstalls) and mirror
+  // backfills (no per-batch timestamps available on that path).
+  function invalidateStatsCache(): void {
+    statsCache.clear();
+  }
+  // Ingest-driven invalidation: live entries are left to their short TTL —
+  // that bound is the dashboard's freshness contract — and only frozen
+  // windows the batch actually lands in are dropped, which only a backfill
+  // (events older than a window edge) ever does.
+  function invalidateStatsCacheForIngest(minEventTs: number): void {
+    for (const [key, entry] of statsCache) {
+      if (entry.frozen && entry.until > minEventTs) statsCache.delete(key);
+    }
+  }
+  // Expired entries were previously bulk-evicted by the ingest clear();
+  // with that gone, sweep so dead frozen bodies don't linger for 24h.
+  const statsCacheSweep = setInterval(() => {
+    const cutoff = Date.now();
+    for (const [key, entry] of statsCache) {
+      if (entry.expiresAt <= cutoff) statsCache.delete(key);
+    }
+  }, 60_000);
+  statsCacheSweep.unref?.();
 
   // Outstanding link codes, one per user — minting replaces any prior code.
   // In-memory by design: single-use 10-minute codes don't merit persistence;
@@ -911,7 +921,8 @@ export function buildApp(opts: BuildOptions) {
   };
 
   app.get("/stats/admin", (c) => {
-    const range = parseStatsRange(new URL(c.req.url).searchParams, now());
+    const searchParams = new URL(c.req.url).searchParams;
+    const range = parseStatsRange(searchParams, now());
     if ("error" in range) return c.json({ error: range.error }, 400);
     const { since, until } = range;
     const companyParam = parseCompanyParam(c);
@@ -920,9 +931,17 @@ export function buildApp(opts: BuildOptions) {
     const categoryParam = parseCategoryParam(c);
     if (!categoryParam.ok) return categoryParam.res;
     const categoryId = categoryParam.categoryId;
+    // range=Nd keys by the RAW param, not the resolved ms window — the
+    // floored `since` rotates every minute, which would rotate the key and
+    // defeat the cache for the default dashboard view. Safe: range=Nd has
+    // until=MAX_TS_MS (never frozen) and sub-minute window drift was
+    // already accepted by the minute floor. Explicit since/until keeps ms
+    // keys (frozen-entry invalidation needs them exact).
     // Normalized company can't contain ":" (ports are stripped) and the
     // category id is a bare integer, so the delimited key is collision-free.
-    const cacheKey = `admin:${since}:${until}:${company ?? ""}:${categoryId ?? ""}`;
+    const rangeRaw = searchParams.get("range");
+    const rangeKey = rangeRaw !== null ? `r${rangeRaw}` : `${since}:${until}`;
+    const cacheKey = `admin:${rangeKey}:${company ?? ""}:${categoryId ?? ""}`;
     const cached = readStatsCache(cacheKey);
     if (cached !== null) {
       return new Response(cached, {
@@ -930,66 +949,125 @@ export function buildApp(opts: BuildOptions) {
       });
     }
     const leaderRows = store.adminLeaderboard(since, until, company, categoryId);
-    // Per-user cost walks the user's per-model breakdown over the same
-    // [since, until) window — token sums and cost must describe the same
-    // range. Fine for small/medium teams.
-    const leaderboard = leaderRows
-      .map((row) => {
-        const byModel = store.userByModel(row.user, since, until);
-        let usd = 0;
-        for (const m of byModel) {
-          // Source-provided cost (Cursor) wins over PricingCache derivation
-          // — keeps max-mode multipliers intact.
-          if (m.storedCostMicros > 0) {
-            usd += m.storedCostMicros / 1_000_000;
-            continue;
-          }
-          const price = pricing.lookup(m.model);
-          if (!price) continue;
-          usd += computeRowCostUsd(m, price);
+    // ONE grouped (user, model) pass feeds both the per-user cost and the
+    // byModel aggregate — replaces the former per-row userByModel N+1 and a
+    // separate adminByModel scan. The aggregate is unscoped; intersecting
+    // with the (scoped) leaderboard user set is equivalent to SQL scoping
+    // because any user with in-window events appears in leaderRows.
+    const userSet = new Set(leaderRows.map((row) => row.user));
+    const umRows = store.adminUserModel(since, until).filter((r) => userSet.has(r.user));
+
+    // Per-user cost: the stored-cost-wins branch runs per (user, model)
+    // group — exactly the granularity of the old userByModel loop.
+    const usdByUser = new Map<string, number>();
+    for (const m of umRows) {
+      let usd = usdByUser.get(m.user) ?? 0;
+      // Source-provided cost (Cursor) wins over PricingCache derivation
+      // — keeps max-mode multipliers intact.
+      if (m.storedCostMicros > 0) {
+        usd += m.storedCostMicros / 1_000_000;
+      } else {
+        const price = pricing.lookup(m.model);
+        if (price) {
+          usd += computeRowCostUsd(
+            {
+              input: m.inputTokens,
+              output: m.outputTokens,
+              cacheCreation: m.cacheCreationTokens,
+              cacheRead: m.cacheReadTokens,
+              reasoning: m.reasoningTokens,
+            },
+            price,
+          );
         }
-        return { ...row, costUsd: roundUsd(usd) };
-      })
+      }
+      usdByUser.set(m.user, usd);
+    }
+    const leaderboard = leaderRows
+      .map((row) => ({ ...row, costUsd: roundUsd(usdByUser.get(row.user) ?? 0) }))
       // Rank purely by cost; the SQL ORDER BY token-sum is not the source
       // of truth.
       .sort((a, b) => (b.costUsd ?? 0) - (a.costUsd ?? 0));
 
-    const modelRows = store.adminByModel(since, until, company, categoryId);
-    const byModel = modelRows.map((m) => {
-      let costUsd = 0;
-      let unknownPrice = false;
-      if (m.storedCostMicros > 0) {
-        costUsd = roundUsd(m.storedCostMicros / 1_000_000);
-      } else {
-        const price = pricing.lookup(m.model);
-        if (price) {
-          costUsd = roundUsd(
-            computeRowCostUsd(
-              {
-                input: m.inputTokens,
-                output: m.outputTokens,
-                cacheCreation: m.cacheCreationTokens,
-                cacheRead: m.cacheReadTokens,
-                reasoning: m.reasoningTokens,
-              },
-              price,
-            ),
-          );
-        } else {
-          unknownPrice = true;
-        }
+    // byModel: sum tokens/count/storedCostMicros per model ACROSS users
+    // first, then apply the stored-cost-wins branch on the model-level
+    // aggregate — the old adminByModel applied it at exactly that
+    // granularity, and mixed Cursor/non-Cursor traffic under one model
+    // string diverges if costs are summed per user instead.
+    const modelAgg = new Map<
+      string,
+      {
+        count: number;
+        inputTokens: number;
+        outputTokens: number;
+        cacheCreationTokens: number;
+        cacheReadTokens: number;
+        reasoningTokens: number;
+        storedCostMicros: number;
       }
-      return {
-        model: m.model,
-        count: m.count,
-        inputTokens: m.inputTokens,
-        outputTokens: m.outputTokens,
-        cacheCreationTokens: m.cacheCreationTokens,
-        cacheReadTokens: m.cacheReadTokens,
-        costUsd,
-        unknownPrice,
-      };
-    });
+    >();
+    for (const m of umRows) {
+      let agg = modelAgg.get(m.model);
+      if (!agg) {
+        agg = {
+          count: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          reasoningTokens: 0,
+          storedCostMicros: 0,
+        };
+        modelAgg.set(m.model, agg);
+      }
+      agg.count += m.count;
+      agg.inputTokens += m.inputTokens;
+      agg.outputTokens += m.outputTokens;
+      agg.cacheCreationTokens += m.cacheCreationTokens;
+      agg.cacheReadTokens += m.cacheReadTokens;
+      agg.reasoningTokens += m.reasoningTokens;
+      agg.storedCostMicros += m.storedCostMicros;
+    }
+    const byModel = Array.from(modelAgg.entries())
+      .map(([model, m]) => {
+        let costUsd = 0;
+        let unknownPrice = false;
+        if (m.storedCostMicros > 0) {
+          costUsd = roundUsd(m.storedCostMicros / 1_000_000);
+        } else {
+          const price = pricing.lookup(model);
+          if (price) {
+            costUsd = roundUsd(
+              computeRowCostUsd(
+                {
+                  input: m.inputTokens,
+                  output: m.outputTokens,
+                  cacheCreation: m.cacheCreationTokens,
+                  cacheRead: m.cacheReadTokens,
+                  reasoning: m.reasoningTokens,
+                },
+                price,
+              ),
+            );
+          } else {
+            unknownPrice = true;
+          }
+        }
+        return {
+          model,
+          count: m.count,
+          inputTokens: m.inputTokens,
+          outputTokens: m.outputTokens,
+          cacheCreationTokens: m.cacheCreationTokens,
+          cacheReadTokens: m.cacheReadTokens,
+          costUsd,
+          unknownPrice,
+        };
+      })
+      // count DESC like the old SQL; model ASC tiebreak matches the order
+      // SQLite's GROUP BY emitted ties in (and makes the payload
+      // deterministic, which the old ORDER BY never guaranteed).
+      .sort((a, b) => b.count - a.count || (a.model < b.model ? -1 : a.model > b.model ? 1 : 0));
 
     const recent = store.adminRecent(50, company, categoryId);
 
@@ -1036,7 +1114,7 @@ export function buildApp(opts: BuildOptions) {
       uninstalled: store.listUninstalledUsers(),
     };
     const body = JSON.stringify(payload);
-    writeStatsCache(cacheKey, body, isFrozenRange(until));
+    writeStatsCache(cacheKey, body, until);
     return new Response(body, {
       headers: { "content-type": "application/json; charset=UTF-8" },
     });
@@ -1109,7 +1187,8 @@ export function buildApp(opts: BuildOptions) {
       return c.json({ error: "bucket must be one of: day | week | month" }, 400);
     }
     const bucket: Bucket = bucketRaw;
-    const range = parseStatsRange(new URL(c.req.url).searchParams, now());
+    const searchParams = new URL(c.req.url).searchParams;
+    const range = parseStatsRange(searchParams, now());
     if ("error" in range) return c.json({ error: range.error }, 400);
     const { since, until } = range;
     const userFilter = c.req.query("user") || undefined;
@@ -1120,7 +1199,10 @@ export function buildApp(opts: BuildOptions) {
     if (!companyParam.ok) return companyParam.res;
     const companyFilter = userFilter ? undefined : companyParam.company;
 
-    const cacheKey = `ts:${bucket}:${since}:${until}:${userFilter ?? ""}:${companyFilter ?? ""}`;
+    // Raw-param keying for range=Nd — same rationale as /stats/admin.
+    const rangeRaw = searchParams.get("range");
+    const rangeKey = rangeRaw !== null ? `r${rangeRaw}` : `${since}:${until}`;
+    const cacheKey = `ts:${bucket}:${rangeKey}:${userFilter ?? ""}:${companyFilter ?? ""}`;
     const cached = readStatsCache(cacheKey);
     if (cached !== null) {
       return new Response(cached, {
@@ -1128,17 +1210,86 @@ export function buildApp(opts: BuildOptions) {
       });
     }
 
-    // 1) Per-(bucket, model) aggregates (assistant rows only).
-    const modelRows = store.timeseriesByModel(bucket, since, until, userFilter, companyFilter);
-    // 1b) Per-bucket message counts (both kinds) — always pulled so buckets
-    //     with only user messages still surface.
-    const countRows = store.timeseriesCountsByBucket(
-      bucket,
-      since,
-      until,
-      userFilter,
-      companyFilter,
-    );
+    // 1) Per-(bucket, model) aggregates + per-bucket message counts.
+    // Without user= (the contribution grid's case) the per-(bucket, user,
+    // model) rows fetched for byUser are a strict superset of both — the
+    // two dedicated queries are exact re-aggregations of them — so they
+    // are DERIVED in JS instead of re-scanning events (4 scans → 2). With
+    // user=, the narrow dedicated queries remain.
+    interface TsModelGroup {
+      bucketKey: string;
+      model: string;
+      events: number;
+      inputTokens: number;
+      outputTokens: number;
+      cacheCreationTokens: number;
+      cacheReadTokens: number;
+      reasoningTokens: number;
+      storedCostMicros: number;
+    }
+    let modelRows: TsModelGroup[];
+    let countRows: { bucketKey: string; userMessages: number; assistantMessages: number }[];
+    let userRows: ReturnType<typeof store.timeseriesByUser> = [];
+    let userCountRows: ReturnType<typeof store.timeseriesCountsByUser> = [];
+    if (userFilter) {
+      modelRows = store.timeseriesByModel(bucket, since, until, userFilter, companyFilter);
+      countRows = store.timeseriesCountsByBucket(bucket, since, until, userFilter, companyFilter);
+    } else {
+      userRows = store.timeseriesByUser(bucket, since, until, companyFilter);
+      userCountRows = store.timeseriesCountsByUser(bucket, since, until, companyFilter);
+      // Regroup to per-(bucket, model) INTEGER sums FIRST — the pricing
+      // loop below applies the stored-cost-wins branch at model-level
+      // granularity, and pricing per (user, model) row instead would
+      // diverge whenever one model mixes Cursor and derived-cost traffic.
+      // Iteration order mirrors the dedicated query's ORDER BY (bucketKey
+      // ASC, model ASC) so float summation order — and the rounded
+      // payload — stays byte-identical.
+      const perBucketModel = new Map<string, TsModelGroup>();
+      for (const r of userRows) {
+        const k = `${r.bucketKey} ${r.model}`;
+        let g = perBucketModel.get(k);
+        if (!g) {
+          g = {
+            bucketKey: r.bucketKey,
+            model: r.model,
+            events: 0,
+            inputTokens: 0,
+            outputTokens: 0,
+            cacheCreationTokens: 0,
+            cacheReadTokens: 0,
+            reasoningTokens: 0,
+            storedCostMicros: 0,
+          };
+          perBucketModel.set(k, g);
+        }
+        g.events += r.events;
+        g.inputTokens += r.inputTokens;
+        g.outputTokens += r.outputTokens;
+        g.cacheCreationTokens += r.cacheCreationTokens;
+        g.cacheReadTokens += r.cacheReadTokens;
+        g.reasoningTokens += r.reasoningTokens;
+        g.storedCostMicros += r.storedCostMicros;
+      }
+      modelRows = Array.from(perBucketModel.values()).sort(
+        (a, b) =>
+          (a.bucketKey < b.bucketKey ? -1 : a.bucketKey > b.bucketKey ? 1 : 0) ||
+          (a.model < b.model ? -1 : a.model > b.model ? 1 : 0),
+      );
+      const perBucketCounts = new Map<
+        string,
+        { bucketKey: string; userMessages: number; assistantMessages: number }
+      >();
+      for (const r of userCountRows) {
+        let g = perBucketCounts.get(r.bucketKey);
+        if (!g) {
+          g = { bucketKey: r.bucketKey, userMessages: 0, assistantMessages: 0 };
+          perBucketCounts.set(r.bucketKey, g);
+        }
+        g.userMessages += r.userMessages;
+        g.assistantMessages += r.assistantMessages;
+      }
+      countRows = Array.from(perBucketCounts.values());
+    }
 
     // 2) Group into per-bucket structures, computing cost via PricingCache.
     interface Acc {
@@ -1220,8 +1371,8 @@ export function buildApp(opts: BuildOptions) {
       >
     >();
     if (!userFilter) {
-      const userRows = store.timeseriesByUser(bucket, since, until, companyFilter);
-      const userCountRows = store.timeseriesCountsByUser(bucket, since, until, companyFilter);
+      // userRows/userCountRows were fetched above (they also fed the
+      // derived model/count aggregates).
       const ensureBU = (bucketKey: string, user: string) => {
         let perBucket = byUserByBucket.get(bucketKey);
         if (!perBucket) {
@@ -1296,7 +1447,7 @@ export function buildApp(opts: BuildOptions) {
       .sort((a, b) => a.bucketStart - b.bucketStart);
 
     const body = JSON.stringify({ bucket, rows });
-    writeStatsCache(cacheKey, body, isFrozenRange(until));
+    writeStatsCache(cacheKey, body, until);
     return new Response(body, {
       headers: { "content-type": "application/json; charset=UTF-8" },
     });
@@ -1444,8 +1595,12 @@ export function buildApp(opts: BuildOptions) {
         const company = normalizeCompany(rawCompany);
         if (company !== null) {
           // Operator alias map wins over the self-reported value — fixes a
-          // typo'd install without touching the teammate's machine.
-          store.setUserCompany(firstUser, opts.companyAliases?.[company] ?? company);
+          // typo'd install without touching the teammate's machine. A real
+          // change regroups history, so frozen company-scoped cache entries
+          // are wrong the instant it lands — full clear (rare event).
+          if (store.setUserCompany(firstUser, opts.companyAliases?.[company] ?? company)) {
+            invalidateStatsCache();
+          }
         } else {
           console.warn(
             `[tokenleader] ignoring invalid X-Tokenleader-Company ${JSON.stringify(rawCompany)} from user '${firstUser}'`,
@@ -1471,7 +1626,13 @@ export function buildApp(opts: BuildOptions) {
     }
 
     const result = store.insertMany(validated);
-    if (result.inserted > 0) invalidateStatsCache();
+    if (result.inserted > 0) {
+      // Frozen-window-aware: live entries ride out their TTL; only a
+      // backfill (events older than a frozen window's edge) drops entries.
+      let minTs = Number.POSITIVE_INFINITY;
+      for (const e of validated) minTs = Math.min(minTs, e.timestamp);
+      invalidateStatsCacheForIngest(minTs);
+    }
     // Piggyback a pending directive on the response — a busy daemon posts
     // events every tick and may never hit /checkin. Old daemons ignore the
     // extra field. Device-scoped: this machine only ever receives

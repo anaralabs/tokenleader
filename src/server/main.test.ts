@@ -2143,29 +2143,51 @@ describe("company filter (?company=)", () => {
   // LAST in this describe: it inserts directly into the store (bypassing
   // /ingest cache invalidation) to prove cache-key isolation.
   test("stats cache: distinct company params get distinct entries; same params replay the cached body", async () => {
-    const getBody = async (path: string) => {
-      const res = await built.app.request(new Request(`http://x${path}`));
-      expect(res.status).toBe(200);
-      return res.text();
-    };
-    const adminA = await getBody("/stats/admin?company=a.com");
-    const adminB = await getBody("/stats/admin?company=b.com");
-    const tsA = await getBody("/stats/timeseries?bucket=day&company=a.com");
-    const tsB = await getBody("/stats/timeseries?bucket=day&company=b.com");
-    // Different params never serve each other's bodies.
-    expect(adminA).not.toBe(adminB);
-    expect(tsA).not.toBe(tsB);
-    // Direct insert (no /ingest → no invalidation under the default test
-    // posture of statsCacheClearCoalesceMs: 0): repeats with the SAME
-    // params must replay the cached bodies byte-for-byte even though a
-    // fresh query would now see cf-ada-cache.
-    built.store.insertMany([
-      makeEvent({ user: "ada", messageId: "cf-ada-cache", timestamp: Date.UTC(2026, 5, 5) }),
-    ]);
-    expect(await getBody("/stats/admin?company=a.com")).toBe(adminA);
-    expect(await getBody("/stats/admin?company=b.com")).toBe(adminB);
-    expect(await getBody("/stats/timeseries?bucket=day&company=a.com")).toBe(tsA);
-    expect(await getBody("/stats/timeseries?bucket=day&company=b.com")).toBe(tsB);
+    // Own app with live caching ON (the shared describe app runs the test
+    // posture of statsCacheTtlMs: 0, which never serves live entries).
+    const cachy = createTestApp({ statsCacheTtlMs: 60_000 });
+    try {
+      const post = (user: string, secret: string, company: string, messageId: string) =>
+        cachy.app.request(
+          new Request("http://x/ingest", {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-tokenleader-secret": secret,
+              "x-tokenleader-company": company,
+            },
+            body: JSON.stringify({
+              events: [makeEvent({ user, messageId, timestamp: Date.UTC(2026, 5, 1) })],
+            }),
+          }),
+        );
+      expect((await post("ada", "a".repeat(40), "a.com", "cc-ada-1")).status).toBe(200);
+      expect((await post("bea", "b".repeat(40), "b.com", "cc-bea-1")).status).toBe(200);
+      const getBody = async (path: string) => {
+        const res = await cachy.app.request(new Request(`http://x${path}`));
+        expect(res.status).toBe(200);
+        return res.text();
+      };
+      const adminA = await getBody("/stats/admin?company=a.com");
+      const adminB = await getBody("/stats/admin?company=b.com");
+      const tsA = await getBody("/stats/timeseries?bucket=day&company=a.com");
+      const tsB = await getBody("/stats/timeseries?bucket=day&company=b.com");
+      // Different params never serve each other's bodies.
+      expect(adminA).not.toBe(adminB);
+      expect(tsA).not.toBe(tsB);
+      // Direct insert (bypasses every invalidation path): repeats with the
+      // SAME params must replay the cached bodies byte-for-byte even though
+      // a fresh query would now see cc-ada-cache.
+      cachy.store.insertMany([
+        makeEvent({ user: "ada", messageId: "cc-ada-cache", timestamp: Date.UTC(2026, 5, 5) }),
+      ]);
+      expect(await getBody("/stats/admin?company=a.com")).toBe(adminA);
+      expect(await getBody("/stats/admin?company=b.com")).toBe(adminB);
+      expect(await getBody("/stats/timeseries?bucket=day&company=a.com")).toBe(tsA);
+      expect(await getBody("/stats/timeseries?bucket=day&company=b.com")).toBe(tsB);
+    } finally {
+      await cachy.cleanup();
+    }
   });
 });
 
@@ -2402,11 +2424,11 @@ describe("/stats/leaderboard until", () => {
 });
 
 describe("range=<N>d rolling windows (server-resolved, minute-quantized)", () => {
-  test("same minute shares a cache key; the window steps per minute", async () => {
+  test("range=Nd keys by raw param: polls share the cached body across minutes", async () => {
     const DAY_MS = 86_400_000;
     const FIXED = Date.UTC(2026, 5, 10, 12, 0, 30); // mid-minute
     let nowMs = FIXED;
-    const built = createTestApp({ now: () => nowMs });
+    const built = createTestApp({ now: () => nowMs, statsCacheTtlMs: 60_000 });
     try {
       built.store.insertMany([
         makeEvent({ user: "alice", messageId: "r-1", timestamp: FIXED - DAY_MS }),
@@ -2419,8 +2441,8 @@ describe("range=<N>d rolling windows (server-resolved, minute-quantized)", () =>
       const body1 = await get();
       expect(body1).toContain("alice");
 
-      // Insert directly (bypassing /ingest invalidation): a same-minute
-      // request must still serve the cached body — same key, no fresh query.
+      // Insert directly (bypassing /ingest invalidation): repeats must
+      // serve the cached body — same raw-param key, no fresh query.
       built.store.insertMany([
         makeEvent({ user: "zed", messageId: "r-2", timestamp: FIXED - DAY_MS + 1000 }),
       ]);
@@ -2428,11 +2450,11 @@ describe("range=<N>d rolling windows (server-resolved, minute-quantized)", () =>
       nowMs = FIXED + 29_000; // still inside the 12:00 minute
       expect(await get()).toBe(body1);
 
-      // Crossing the minute mints a new key → fresh query sees zed.
+      // Crossing the minute no longer rotates the key (that rotation kept
+      // the default dashboard view permanently cold): the cached body
+      // keeps serving until the TTL, which is the freshness contract.
       nowMs = FIXED + 31_000; // 12:01:01
-      const body4 = await get();
-      expect(body4).not.toBe(body1);
-      expect(body4).toContain("zed");
+      expect(await get()).toBe(body1);
 
       // Protocol validation: range can't combine with since/until and N
       // is bounded 1..366; floats/exponents in since are 400 too.
@@ -2735,35 +2757,74 @@ describe("dashboard token unset (public posture)", () => {
   });
 });
 
-describe("stats-cache invalidation coalescing", () => {
-  test("writes inside the window serve the cached snapshot; window 0 clears every write", async () => {
-    // Production posture: one clear per window so a bulk replay can't make
-    // every dashboard poll re-aggregate between batches.
-    const coalesced = createTestApp({ statsCacheClearCoalesceMs: 60_000 });
+describe("stats-cache ingest invalidation (frozen-window aware)", () => {
+  const post = (app: ReturnType<typeof createTestApp>["app"], id: string, ts: number) =>
+    app.request(
+      new Request("http://x/ingest", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-tokenleader-user": "alice",
+          "x-tokenleader-secret": "s3cret-s3cret-s3cret-s3cret-s3cret-s3cret",
+        },
+        body: JSON.stringify({ events: [makeTokenEvent({ messageId: id, timestamp: ts })] }),
+      }),
+    );
+
+  test("live entries ride out their TTL across ingests (no per-write clear)", async () => {
+    const t = createTestApp({ statsCacheTtlMs: 60_000 });
     try {
-      const post = (id: string) =>
-        coalesced.app.request(
-          new Request("http://x/ingest", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-              "x-tokenleader-user": "alice",
-              "x-tokenleader-secret": "s3cret-s3cret-s3cret-s3cret-s3cret-s3cret",
-            },
-            body: JSON.stringify({ events: [makeTokenEvent({ messageId: id })] }),
-          }),
-        );
-      expect((await post("m-1")).status).toBe(200);
-      const first = await (await coalesced.app.request(new Request("http://x/stats/admin"))).text();
-      // Second write lands inside the coalesce window: the cached snapshot
-      // keeps serving (byte-identical body) instead of clearing.
-      expect((await post("m-2")).status).toBe(200);
+      expect((await post(t.app, "m-1", 1_700_000_000_000)).status).toBe(200);
+      const first = await (await t.app.request(new Request("http://x/stats/admin"))).text();
+      // A second write no longer clears the live (until=∞, never frozen)
+      // entry: the cached snapshot keeps serving byte-identically. The TTL
+      // is the freshness contract now.
+      expect((await post(t.app, "m-2", 1_700_000_000_001)).status).toBe(200);
+      const second = await (await t.app.request(new Request("http://x/stats/admin"))).text();
+      expect(second).toBe(first);
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  test("a backfill drops exactly the frozen windows it lands in", async () => {
+    const t = createTestApp({ statsCacheTtlMs: 60_000 });
+    try {
+      expect((await post(t.app, "m-1", Date.UTC(2026, 4, 10))).status).toBe(200);
+      const windowQ = `since=${Date.UTC(2026, 4, 1)}&until=${Date.UTC(2026, 5, 1)}`; // May 2026, frozen
+      const url = `http://x/stats/admin?${windowQ}`;
+      const warm = await (await t.app.request(new Request(url))).text();
+      // Ingest an event AFTER the frozen window: entry survives.
+      expect((await post(t.app, "m-2", Date.UTC(2026, 6, 1))).status).toBe(200);
+      expect(await (await t.app.request(new Request(url))).text()).toBe(warm);
+      // Ingest a backfill INSIDE the frozen window: entry is dropped and
+      // the next read sees the new event.
+      expect((await post(t.app, "m-3", Date.UTC(2026, 4, 20))).status).toBe(200);
+      const after = await (await t.app.request(new Request(url))).text();
+      expect(after).not.toBe(warm);
+      expect(after).toContain('"assistantMessages":2');
+    } finally {
+      await t.cleanup();
+    }
+  });
+
+  test("range=Nd keys by raw param and serves from cache across polls", async () => {
+    let nowMs = Date.UTC(2026, 6, 1, 12, 0, 30);
+    const t = createTestApp({ statsCacheTtlMs: 60_000, now: () => nowMs });
+    try {
+      expect((await post(t.app, "m-1", nowMs - 1000)).status).toBe(200);
+      const first = await (
+        await t.app.request(new Request("http://x/stats/admin?range=7d"))
+      ).text();
+      // Cross a minute boundary: the resolved `since` floor rotates, but
+      // the raw-param key keeps serving the cached body.
+      nowMs += 61_000;
       const second = await (
-        await coalesced.app.request(new Request("http://x/stats/admin"))
+        await t.app.request(new Request("http://x/stats/admin?range=7d"))
       ).text();
       expect(second).toBe(first);
     } finally {
-      await coalesced.cleanup();
+      await t.cleanup();
     }
   });
 });
