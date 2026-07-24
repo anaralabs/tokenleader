@@ -26,7 +26,10 @@ export const Route = createFileRoute("/")({
   component: Dashboard,
 });
 
-const ADMIN_POLL_MS = 5_000;
+// 60s: matches the server-side stats-cache TTL — polling faster than the
+// TTL just re-downloads the same cached body, and before the cache fix it
+// kept an 11s aggregation permanently in flight per open tab.
+const ADMIN_POLL_MS = 60_000;
 const FLEET_POLL_MS = 60_000;
 
 function Dashboard() {

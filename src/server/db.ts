@@ -26,12 +26,13 @@ CREATE TABLE IF NOT EXISTS events (
   costUsdMicros INTEGER,
   ingestedAt INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS events_user_ts ON events (user, timestamp DESC);
+-- The dashboard's covering index (events_user_cover) references
+-- messageType/costUsdMicros, which may not exist pre-migration — it is
+-- created in the constructor AFTER the migrate* calls.
 CREATE INDEX IF NOT EXISTS events_user_model ON events (user, model);
--- For aggregations that filter on timestamp without a leading user
--- (otherwise a full table scan). The (timestamp, messageType) composite
--- lives in migrateMessageType — that column may not exist pre-migration.
-CREATE INDEX IF NOT EXISTS events_ts        ON events (timestamp);
+-- Timestamp-leading aggregations ride the (timestamp, messageType)
+-- composite created in migrateMessageType; the old single-column
+-- events_ts was redundant with it and is dropped post-migration.
 CREATE INDEX IF NOT EXISTS events_model_ts  ON events (model, timestamp);
 
 CREATE TABLE IF NOT EXISTS user_secrets (
@@ -442,6 +443,12 @@ export interface ModelAggRow {
   storedCostMicros: number;
 }
 
+/** One (user, model) aggregate group — the single-pass replacement for the
+ *  admin route's former per-user userByModel loop + adminByModel scan. */
+export interface UserModelAggRow extends ModelAggRow {
+  user: string;
+}
+
 export interface RecentEventRow {
   id: number;
   user: string;
@@ -733,9 +740,7 @@ export class Store {
     LeaderboardAdminRow,
     [number, number, number]
   >;
-  private readonly adminByModelStmt: Statement<ModelAggRow, [number, number]>;
-  private readonly adminByModelForCompanyStmt: Statement<ModelAggRow, [number, number, string]>;
-  private readonly adminByModelForCategoryStmt: Statement<ModelAggRow, [number, number, number]>;
+  private readonly adminUserModelStmt: Statement<UserModelAggRow, [number, number]>;
   private readonly adminRecentStmt: Statement<RecentEventRow>;
   private readonly adminRecentForCompanyStmt: Statement<RecentEventRow, [string, number]>;
   private readonly adminRecentForCategoryStmt: Statement<RecentEventRow, [number, number]>;
@@ -863,7 +868,9 @@ export class Store {
     // skip the page-cache copy; temp_store=MEMORY keeps GROUP BY / ORDER BY
     // scratch out of temp files.
     this.db.exec("PRAGMA cache_size = -65536;");
-    this.db.exec("PRAGMA mmap_size = 268435456;");
+    // bun's bundled SQLite clamps mmap_size at 1 GiB (a larger request
+    // reads back 1073741824) — ask for exactly the cap.
+    this.db.exec("PRAGMA mmap_size = 1073741824;");
     this.db.exec("PRAGMA temp_store = MEMORY;");
     this.db.exec(SCHEMA);
     migrateMessageType(this.db);
@@ -874,6 +881,28 @@ export class Store {
     migrateWatchdogLastSeen(this.db);
     migrateUserDevices(this.db);
     migrateDirectiveLifecycle(this.db);
+    // Covering index for the dashboard aggregations (admin leaderboard's
+    // per-user cost pass, /stats?user=, the grouped user-model pass):
+    // every column those sums touch lives in the index, so the planner
+    // never does rowid lookups back into the wide rows. Created here (not
+    // in SCHEMA) because messageType/costUsdMicros may not exist until the
+    // migrations above have run. ~12% of the events table on disk; one-time
+    // multi-second build on first boot after upgrade.
+    this.db.exec(
+      `CREATE INDEX IF NOT EXISTS events_user_cover ON events (user, timestamp, messageType, model,
+         inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, reasoningTokens, costUsdMicros);`,
+    );
+    // Retire indexes superseded by events_user_cover / events_ts_type.
+    // Their CREATE lines are gone from SCHEMA, so this never fights a
+    // rebuild on the next boot.
+    this.db.exec("DROP INDEX IF EXISTS events_user_ts;");
+    this.db.exec("DROP INDEX IF EXISTS events_ts;");
+    // Planner statistics are mandatory for the covering index: without a
+    // sqlite_stat1 row the planner stays on timestamp-leading indexes
+    // (measured 4.9s vs 2.1s on 3.6M rows). analysis_limit bounds the
+    // per-index sample so this adds ~1-2s to boot, not a full scan.
+    this.db.exec("PRAGMA analysis_limit = 1000;");
+    this.db.exec("ANALYZE;");
 
     this.insertStmt = this.db.prepare(
       `INSERT INTO events (user, source, sessionId, messageId, requestId, timestamp,
@@ -979,8 +1008,14 @@ export class Store {
       LeaderboardAdminRow,
       [number, number, number]
     >(adminLeaderboardSql(CATEGORY_SCOPE));
-    this.adminByModelStmt = this.db.prepare<ModelAggRow, [number, number]>(
-      `SELECT model,
+    // One pass over (user, model) groups feeds BOTH the admin leaderboard's
+    // per-user cost and the byModel aggregate (summed across users in JS) —
+    // replaces the former per-leaderboard-row userByModel N+1 plus a
+    // separate adminByModel scan. Company/category scoping happens in JS by
+    // intersecting with the scoped adminLeaderboard user set (equivalent:
+    // any user with in-window events appears in that set).
+    this.adminUserModelStmt = this.db.prepare<UserModelAggRow, [number, number]>(
+      `SELECT user, model,
               COUNT(*)                              AS count,
               COALESCE(SUM(inputTokens), 0)         AS inputTokens,
               COALESCE(SUM(outputTokens), 0)        AS outputTokens,
@@ -990,38 +1025,7 @@ export class Store {
               COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
          FROM events
         WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
-        GROUP BY model
-        ORDER BY count DESC`,
-    );
-    this.adminByModelForCompanyStmt = this.db.prepare<ModelAggRow, [number, number, string]>(
-      `SELECT model,
-              COUNT(*)                              AS count,
-              COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-              COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-              COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-              COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-              COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-         FROM events
-        WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant' ${COMPANY_SCOPE}
-        GROUP BY model
-        ORDER BY count DESC`,
-    );
-    // Category-scoped by-model variant — mirror of the company one, swapping
-    // the scope clause. (since, until, categoryId).
-    this.adminByModelForCategoryStmt = this.db.prepare<ModelAggRow, [number, number, number]>(
-      `SELECT model,
-              COUNT(*)                              AS count,
-              COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-              COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-              COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-              COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-              COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-         FROM events
-        WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant' ${CATEGORY_SCOPE}
-        GROUP BY model
-        ORDER BY count DESC`,
+        GROUP BY user, model`,
     );
     // Message-count queries — both kinds; no token sums.
     this.userMessageCountsAllStmt = this.db.prepare<UserMessageCountsRow, [number, number]>(
@@ -1698,19 +1702,11 @@ export class Store {
     return this.adminLeaderboardStmt.all(sinceMs, untilMs);
   }
 
-  adminByModel(
-    sinceMs: number = 0,
-    untilMs: number = MAX_TS_MS,
-    company?: string,
-    categoryId?: number,
-  ): ModelAggRow[] {
-    if (categoryId !== undefined) {
-      return this.adminByModelForCategoryStmt.all(sinceMs, untilMs, categoryId);
-    }
-    if (company && company.length > 0) {
-      return this.adminByModelForCompanyStmt.all(sinceMs, untilMs, company);
-    }
-    return this.adminByModelStmt.all(sinceMs, untilMs);
+  /** Per-(user, model) aggregates over the window, assistant rows only.
+   *  Unscoped by design — the admin route intersects with its (scoped)
+   *  leaderboard user set in JS. */
+  adminUserModel(sinceMs: number = 0, untilMs: number = MAX_TS_MS): UserModelAggRow[] {
+    return this.adminUserModelStmt.all(sinceMs, untilMs);
   }
 
   adminRecent(limit: number, company?: string, categoryId?: number): RecentEventRow[] {
@@ -2542,8 +2538,13 @@ export class Store {
    * normalized domain — an absent or invalid header never clears the
    * stored value. No-op for unclaimed users.
    */
-  setUserCompany(user: string, company: string): void {
+  setUserCompany(user: string, company: string): boolean {
+    const prev = this.getUserCompany(user);
     this.setUserCompanyStmt.run({ $username: user, $company: company });
+    // Signal an actual change so the caller can invalidate company-scoped
+    // caches — frozen entries otherwise serve the OLD company grouping for
+    // up to 24h after an alias/header fix.
+    return this.getUserCompany(user) !== prev;
   }
 
   /** A user's stored company affiliation; null = never reported. */
@@ -2568,6 +2569,9 @@ export class Store {
 
   close(): void {
     try {
+      // Refresh planner stats if the data distribution drifted since boot;
+      // near-free when nothing changed.
+      this.db.exec("PRAGMA optimize;");
       this.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
     } catch {
       // best-effort: WAL + synchronous=NORMAL is crash-safe regardless

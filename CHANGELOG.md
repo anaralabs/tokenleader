@@ -9,6 +9,35 @@ Machine-facing release artifacts (daemon binaries + `manifest.json`) are publish
 every tagged release; daemons identify builds by exact version string, not by parsing
 semver.
 
+## [Unreleased]
+
+Server + dashboard performance overhaul (server-only deploy, no daemon
+release): `/stats/admin` cold compute ~11.4s → ~2.9s and `/stats/timeseries`
+~12.5s → ~4.7s on the production-sized dataset, with warm cache hits now
+actually possible (previously every ingest wiped the whole stats cache and
+rolling-range cache keys rotated every minute, so the dashboard recomputed
+nearly every poll).
+
+### Changed
+- **Stats cache overhaul**: ingest no longer clears live cache entries (TTL
+  60s is the freshness bound); only frozen past windows that a backfill
+  actually lands in are dropped. `range=Nd` requests key by the raw param.
+  Company changes and admin mutations still fully clear. Entry cap + sweep.
+- **Covering index + ANALYZE**: new `events_user_cover` index (built once at
+  boot, ~12% of table size), redundant `events_user_ts`/`events_ts` dropped,
+  `ANALYZE` at boot + `PRAGMA optimize` at shutdown, mmap raised to 1 GiB.
+- **`/stats/admin` N+1 removed**: one `GROUP BY user, model` pass replaces
+  ~22 per-user queries plus a separate by-model scan (payload byte-identical,
+  verified against the old code on the same data).
+- **`/stats/timeseries` halved**: the per-model and per-bucket-count scans
+  are derived in JS from the per-user rows already fetched (4 scans → 2,
+  payload byte-identical).
+- **Dashboard polling hygiene**: 5s → 60s admin poll (was re-firing an 11s
+  endpoint every 5s), TanStack Query staleTime 60s / retry 1, so range-pill
+  and focus toggles stop re-firing expensive endpoints.
+- Railway healthcheck window 60s → 300s (covers the one-time index build on
+  first boot after deploy).
+
 ## [0.6.3] - 2026-07-21
 
 The watchdog can now revive a daemon whose launchd job is loaded but not

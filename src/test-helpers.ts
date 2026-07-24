@@ -49,8 +49,11 @@ export function createTestApp(opts: Partial<Omit<BuildOptions, "dbPath">> = {}) 
   const built = buildApp({
     dbPath: join(dir, "tl.sqlite"),
     schedulePricingRefresh: false,
-    // Tests assert read-after-write freshness; production coalesces clears.
-    statsCacheClearCoalesceMs: 0,
+    // Tests assert read-after-write freshness: live entries are uncached
+    // (TTL 0) so every GET recomputes. Frozen (past-window) entries still
+    // cache, and test ingests carry past timestamps, so the backfill
+    // invalidation path stays exercised. Cache-behavior tests override.
+    statsCacheTtlMs: 0,
     ...opts,
   });
   return {
