@@ -309,18 +309,23 @@ section {
   color: var(--text-tertiary);
   pointer-events: none;
 }
-/* Leaderboard rows are buttons in focus mode. */
-.lb-table tr.lb-row {
+/* Leaderboard rows are buttons in focus mode; models-table rows are the
+   ?model= filter toggle — same treatment. */
+.lb-table tr.lb-row,
+.models-table tr.lb-row {
   cursor: pointer;
 }
-.lb-table tr.lb-row:focus-visible {
+.lb-table tr.lb-row:focus-visible,
+.models-table tr.lb-row:focus-visible {
   outline: 2px solid var(--text-primary);
   outline-offset: -2px;
 }
-.lb-table tr.is-selected > td {
+.lb-table tr.is-selected > td,
+.models-table tr.is-selected > td {
   background: var(--active-app);
 }
-.lb-table tr.is-selected > td:first-child {
+.lb-table tr.is-selected > td:first-child,
+.models-table tr.is-selected > td:first-child {
   box-shadow: inset 2px 0 0 var(--text-primary);
 }
 /* Non-focused rows stay visible but recede (leaderboard, fleet,

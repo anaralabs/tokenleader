@@ -6,6 +6,7 @@ import {
   toggleCategory,
   toggleCompany,
   toggleFocus,
+  toggleModel,
   userModelsToRows,
   userStatsQuery,
 } from "../src/focus";
@@ -135,6 +136,41 @@ describe("parseDashboardSearch (?category= validation)", () => {
       range: "7",
       categoryId: 2,
     });
+  });
+});
+
+describe("toggleModel (models-table row semantics)", () => {
+  test("clicking with no filter selects", () => {
+    expect(toggleModel(undefined, "claude-sonnet-4-5")).toBe("claude-sonnet-4-5");
+  });
+
+  test("clicking the active model clears", () => {
+    expect(toggleModel("claude-sonnet-4-5", "claude-sonnet-4-5")).toBeUndefined();
+  });
+
+  test("clicking another model moves the filter", () => {
+    expect(toggleModel("claude-sonnet-4-5", "gpt-5")).toBe("gpt-5");
+  });
+});
+
+describe("parseDashboardSearch (?model= validation)", () => {
+  test("keeps a non-empty model string as-is (no normalization)", () => {
+    expect(parseDashboardSearch({ model: "claude-sonnet-4-5" })).toEqual({
+      model: "claude-sonnet-4-5",
+    });
+    expect(parseDashboardSearch({ model: "Llama3:8B" })).toEqual({ model: "Llama3:8B" });
+  });
+
+  test("drops empty / non-string model values", () => {
+    expect(parseDashboardSearch({ model: "" })).toEqual({});
+    expect(parseDashboardSearch({ model: 42 })).toEqual({});
+    expect(parseDashboardSearch({ model: ["gpt-5"] })).toEqual({});
+  });
+
+  test("composes with user, range, and company", () => {
+    expect(
+      parseDashboardSearch({ user: "alice", range: "7", company: "anara.com", model: "gpt-5" }),
+    ).toEqual({ user: "alice", range: "7", company: "anara.com", model: "gpt-5" });
   });
 });
 

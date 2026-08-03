@@ -222,13 +222,23 @@ export function withCategory(query: string, categoryId?: number): string {
   return query ? `${query}&${c}` : `?${c}`;
 }
 
+/** Append model=<m> to a query string ("" or "?..."). Pure (bun-testable).
+ *  Model strings are free-form ("openrouter/x/y", "llama3:8b") so the value
+ *  is uri-encoded. Composes with the company/category helpers. */
+export function withModel(query: string, model?: string): string {
+  if (model === undefined || model === "") return query;
+  const m = `model=${encodeURIComponent(model)}`;
+  return query ? `${query}&${m}` : `?${m}`;
+}
+
 export function fetchAdminStats(
   range: string,
   company?: string,
   categoryId?: number,
+  model?: string,
 ): Promise<AdminStats> {
   return getJson<AdminStats>(
-    `/stats/admin${withCategory(withCompany(rangeQuery(range), company), categoryId)}`,
+    `/stats/admin${withModel(withCategory(withCompany(rangeQuery(range), company), categoryId), model)}`,
   );
 }
 
