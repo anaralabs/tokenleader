@@ -15,7 +15,13 @@ import { RangePills } from "../components/RangePills";
 import { StatsStrip } from "../components/StatsStrip";
 import { ThemeHint } from "../components/ThemeToggle";
 import { UninstalledList } from "../components/UninstalledList";
-import { parseDashboardSearch, toggleCompany, toggleFocus, userModelsToRows } from "../focus";
+import {
+  parseDashboardSearch,
+  toggleCompany,
+  toggleFocus,
+  toggleModel,
+  userModelsToRows,
+} from "../focus";
 import { defaultRange, persistRange } from "../range";
 
 export const Route = createFileRoute("/")({
@@ -39,16 +45,25 @@ function Dashboard() {
   const focusUser = search.user;
   const activeCompany = search.company;
   const activeCategory = search.categoryId;
+  const activeModel = search.model;
   // URL range wins; otherwise the localStorage-persisted default.
   const fallbackRange = useMemo(() => defaultRange(), []);
   const range = search.range ?? fallbackRange;
 
-  // ?company= / ?category= scope the admin payload server-side (leaderboard,
-  // models, messages, totals) — the strip/tables below render it untouched.
-  // Company and category are mutually exclusive (the UI only ever sets one).
+  // ?company= / ?category= / ?model= scope the admin payload server-side
+  // (leaderboard, models, messages, totals) — the strip/tables below render
+  // it untouched. Company and category are mutually exclusive (the UI only
+  // ever sets one); model composes with either.
   const admin = useQuery({
-    queryKey: ["stats", "admin", range, activeCompany ?? "", activeCategory ?? ""],
-    queryFn: () => fetchAdminStats(range, activeCompany, activeCategory),
+    queryKey: [
+      "stats",
+      "admin",
+      range,
+      activeCompany ?? "",
+      activeCategory ?? "",
+      activeModel ?? "",
+    ],
+    queryFn: () => fetchAdminStats(range, activeCompany, activeCategory, activeModel),
     refetchInterval: ADMIN_POLL_MS,
     // Range switch keeps the previous rows on screen (dimmed) instead of
     // collapsing back to skeletons.
@@ -101,6 +116,26 @@ function Dashboard() {
     void navigate({
       search: (prev) => ({ ...prev, company: toggleCompany(activeCompany, company) }),
     });
+  };
+
+  // Model filter (?model=): clicking the active models-table row clears it,
+  // any other row moves it. Push (no replace) so Back undoes it, same as
+  // the company filter. Selecting a model also drops any user focus — the
+  // two answer opposite questions ("one user, all models" vs "one model,
+  // all users"), and holding both would rank everyone while dimming all but
+  // one row. Clearing the model leaves the focus alone (there is none).
+  const onToggleModel = (model: string) => {
+    const next = toggleModel(activeModel, model);
+    void navigate({
+      search: (prev) => ({
+        ...prev,
+        model: next,
+        user: next === undefined ? prev.user : undefined,
+      }),
+    });
+  };
+  const clearModel = () => {
+    void navigate({ search: (prev) => ({ ...prev, model: undefined }) });
   };
 
   // Company pills read the server's always-global companies list (never
@@ -184,6 +219,20 @@ function Dashboard() {
             <span aria-hidden="true">✕</span> {focusUser}
           </button>
         )}
+        {/* Model-filter chip: same language as the focus chip. Doubles as the
+            escape hatch when the filtered model has no rows in the current
+            range (nothing left to click in the models table). */}
+        {activeModel !== undefined && (
+          <button
+            type="button"
+            className="focus-chip"
+            onClick={clearModel}
+            aria-label={`Clear model filter ${activeModel}`}
+            title="Clear model filter"
+          >
+            <span aria-hidden="true">✕</span> {activeModel}
+          </button>
+        )}
         <ThemeHint />
       </div>
       <main className="wrap" data-range-loading={admin.isPlaceholderData || undefined}>
@@ -208,6 +257,7 @@ function Dashboard() {
                     }
                   : undefined
               }
+              activeModel={activeModel}
             />
             <section aria-label="Activity calendar">
               {/* Focus wins over the company filter (existing behavior). */}
@@ -247,6 +297,9 @@ function Dashboard() {
               />
             </section>
             <section aria-label="Models">
+              {/* Rows double as the ?model= toggle (works in focus mode too,
+                  like the company pills — the filter scopes the leaderboard
+                  behind the focus). */}
               <ModelsTable
                 rows={focusUser !== undefined ? focusModelRows : admin.data?.byModel}
                 failed={
@@ -256,6 +309,8 @@ function Dashboard() {
                 }
                 onRetry={retryAll}
                 dim={focusUser !== undefined && focusStats.isPlaceholderData}
+                activeModel={activeModel}
+                onToggleModel={onToggleModel}
               />
             </section>
             <FleetPanel data={fleet.data} focusUser={focusUser} />

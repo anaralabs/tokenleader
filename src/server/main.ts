@@ -920,6 +920,24 @@ export function buildApp(opts: BuildOptions) {
     return { ok: true, categoryId: id };
   };
 
+  // Optional `model=` filter for /stats/admin: an exact model string as it
+  // appears in events.model. Absent/empty → no filter; model ids are
+  // free-form ("llama3:8b", "openrouter/x/y") so anything non-empty is
+  // accepted, capped only so a garbage URL can't mint unbounded cache keys.
+  // A valid-but-unknown model matches zero users → empty leaderboard, not an
+  // error (same posture as company/category). Scopes the leaderboard and
+  // message totals only; byModel and recent stay model-unscoped — byModel is
+  // the dashboard's click surface, and collapsing it to one row would strand
+  // the toggle (same reason the companies list ignores company=).
+  const parseModelParam = (
+    c: Context,
+  ): { ok: true; model: string | undefined } | { ok: false; res: Response } => {
+    const raw = c.req.query("model");
+    if (raw === undefined || raw.length === 0) return { ok: true, model: undefined };
+    if (raw.length > 200) return { ok: false, res: c.json({ error: "invalid model" }, 400) };
+    return { ok: true, model: raw };
+  };
+
   app.get("/stats/admin", (c) => {
     const searchParams = new URL(c.req.url).searchParams;
     const range = parseStatsRange(searchParams, now());
@@ -931,17 +949,23 @@ export function buildApp(opts: BuildOptions) {
     const categoryParam = parseCategoryParam(c);
     if (!categoryParam.ok) return categoryParam.res;
     const categoryId = categoryParam.categoryId;
+    const modelParam = parseModelParam(c);
+    if (!modelParam.ok) return modelParam.res;
+    const model = modelParam.model;
     // range=Nd keys by the RAW param, not the resolved ms window — the
     // floored `since` rotates every minute, which would rotate the key and
     // defeat the cache for the default dashboard view. Safe: range=Nd has
     // until=MAX_TS_MS (never frozen) and sub-minute window drift was
     // already accepted by the minute floor. Explicit since/until keeps ms
     // keys (frozen-entry invalidation needs them exact).
-    // Normalized company can't contain ":" (ports are stripped) and the
-    // category id is a bare integer, so the delimited key is collision-free.
+    // Normalized company can't contain ":" (ports are stripped), the
+    // category id is a bare integer, and the free-form model string is
+    // uri-encoded (":" → "%3A"), so the delimited key is collision-free.
     const rangeRaw = searchParams.get("range");
     const rangeKey = rangeRaw !== null ? `r${rangeRaw}` : `${since}:${until}`;
-    const cacheKey = `admin:${rangeKey}:${company ?? ""}:${categoryId ?? ""}`;
+    const cacheKey = `admin:${rangeKey}:${company ?? ""}:${categoryId ?? ""}:${
+      model === undefined ? "" : encodeURIComponent(model)
+    }`;
     const cached = readStatsCache(cacheKey);
     if (cached !== null) {
       return new Response(cached, {
@@ -957,10 +981,19 @@ export function buildApp(opts: BuildOptions) {
     const userSet = new Set(leaderRows.map((row) => row.user));
     const umRows = store.adminUserModel(since, until).filter((r) => userSet.has(r.user));
 
+    // model= scope: umRows is GROUP BY (user, model), so a fixed model
+    // leaves at most ONE row per user — the per-user slice for that model
+    // comes straight off the pass the route already runs, no extra SQL.
+    const modelByUser =
+      model === undefined
+        ? null
+        : new Map(umRows.filter((r) => r.model === model).map((r) => [r.user, r]));
+
     // Per-user cost: the stored-cost-wins branch runs per (user, model)
-    // group — exactly the granularity of the old userByModel loop.
+    // group — exactly the granularity of the old userByModel loop. Under a
+    // model filter only that model's rows count.
     const usdByUser = new Map<string, number>();
-    for (const m of umRows) {
+    for (const m of modelByUser === null ? umRows : modelByUser.values()) {
       let usd = usdByUser.get(m.user) ?? 0;
       // Source-provided cost (Cursor) wins over PricingCache derivation
       // — keeps max-mode multipliers intact.
@@ -983,7 +1016,31 @@ export function buildApp(opts: BuildOptions) {
       }
       usdByUser.set(m.user, usd);
     }
-    const leaderboard = leaderRows
+    // Under model= a row's numbers are that model's slice — users who never
+    // touched the model drop out, and userMessages reads 0 (user messages
+    // carry no model, so they aren't attributable to the filter).
+    const scopedRows =
+      modelByUser === null
+        ? leaderRows
+        : leaderRows.flatMap((row) => {
+            const m = modelByUser.get(row.user);
+            if (m === undefined) return [];
+            return [
+              {
+                ...row,
+                totalInputTokens: m.inputTokens,
+                totalOutputTokens: m.outputTokens,
+                totalCacheCreationTokens: m.cacheCreationTokens,
+                totalCacheReadTokens: m.cacheReadTokens,
+                totalReasoningTokens: m.reasoningTokens,
+                eventCount: m.count,
+                userMessages: 0,
+                assistantMessages: m.count,
+                modelCount: 1,
+              },
+            ];
+          });
+    const leaderboard = scopedRows
       .map((row) => ({ ...row, costUsd: roundUsd(usdByUser.get(row.user) ?? 0) }))
       // Rank purely by cost; the SQL ORDER BY token-sum is not the source
       // of truth.

@@ -20,6 +20,10 @@ export interface DashboardSearch {
    *  string. Absent = all categories. Validated as a positive integer; a
    *  dangling/unknown id is self-healed (dropped) in the index route. */
   categoryId?: number;
+  /** Model filter (?model=claude-sonnet-4-5): the leaderboard shows each
+   *  user's slice of that model, ranked — "who uses X the most". Absent =
+   *  all models. Exact match on the stored model string, no normalization. */
+  model?: string;
 }
 
 /** validateSearch for the index route: keep only well-formed values so a
@@ -41,6 +45,9 @@ export function parseDashboardSearch(search: Record<string, unknown>): Dashboard
     const n = Number(search.categoryId);
     if (Number.isInteger(n) && n > 0) out.categoryId = n;
   }
+  if (typeof search.model === "string" && search.model.length > 0) {
+    out.model = search.model;
+  }
   return out;
 }
 
@@ -59,6 +66,12 @@ export function toggleCompany(current: string | undefined, clicked: string): str
 /** Clicking a category pill toggles over ids: the active category clears the
  *  filter, any other moves it. undefined = no filter. */
 export function toggleCategory(current: number | undefined, clicked: number): number | undefined {
+  return current === clicked ? undefined : clicked;
+}
+
+/** Clicking a models-table row toggles the same way: the active model clears
+ *  the filter, any other model moves it. undefined = no filter. */
+export function toggleModel(current: string | undefined, clicked: string): string | undefined {
   return current === clicked ? undefined : clicked;
 }
 

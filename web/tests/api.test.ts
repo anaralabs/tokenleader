@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { withCategory, withCompany } from "../src/api";
+import { withCategory, withCompany, withModel } from "../src/api";
 import { dailyTimeseriesQuery, userStatsQuery } from "../src/focus";
 import { rangeQuery } from "../src/range";
 
@@ -70,5 +70,36 @@ describe("withCategory (?category= appended to existing query strings)", () => {
     // UI, but the chaining must produce a valid query either way.
     expect(withCategory(withCompany(rangeQuery("7")), 2)).toBe("?range=7d&category=2");
     expect(withCategory(withCompany(rangeQuery("all")), 5)).toBe("?category=5");
+  });
+});
+
+describe("withModel (?model= appended to existing query strings)", () => {
+  test("no model: query passes through untouched", () => {
+    expect(withModel("")).toBe("");
+    expect(withModel("?range=7d")).toBe("?range=7d");
+    expect(withModel("?range=7d", undefined)).toBe("?range=7d");
+    expect(withModel("?range=7d", "")).toBe("?range=7d");
+  });
+
+  test("empty query starts one", () => {
+    expect(withModel("", "claude-sonnet-4-5")).toBe("?model=claude-sonnet-4-5");
+  });
+
+  test("existing query gets &model=", () => {
+    expect(withModel("?range=30d", "gpt-5")).toBe("?range=30d&model=gpt-5");
+  });
+
+  test("free-form model strings are URL-encoded", () => {
+    expect(withModel("", "openrouter/anthropic/claude")).toBe(
+      "?model=openrouter%2Fanthropic%2Fclaude",
+    );
+    expect(withModel("", "llama3:8b")).toBe("?model=llama3%3A8b");
+  });
+
+  test("composes after company/category exactly as fetchAdminStats does", () => {
+    expect(withModel(withCategory(withCompany(rangeQuery("7"), "anara.com")), "gpt-5")).toBe(
+      "?range=7d&company=anara.com&model=gpt-5",
+    );
+    expect(withModel(withCategory(withCompany(rangeQuery("all"))), "gpt-5")).toBe("?model=gpt-5");
   });
 });

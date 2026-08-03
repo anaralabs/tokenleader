@@ -2191,6 +2191,132 @@ describe("company filter (?company=)", () => {
   });
 });
 
+// ----- model filter (?model= on /stats/admin) ------------------------------
+// Scope: the leaderboard becomes each user's slice of ONE model, ranked —
+// "who uses X the most". Users who never touched the model drop out;
+// userMessages reads 0 (user messages carry no model). byModel stays
+// UN-scoped (it is the dashboard's click surface — same reason the
+// companies list ignores company=). The param is free-form; a valid-but-
+// unknown model is an empty 200, only an oversized one is a 400.
+
+describe("model filter (?model=)", () => {
+  let built: ReturnType<typeof createTestApp>;
+
+  // ada: 2× claude-sonnet-4-5, 1× gpt-5, plus a user message.
+  // bea: 1× gpt-5 with bigger numbers (outranks ada's gpt-5 slice).
+  beforeAll(async () => {
+    built = createTestApp();
+    const post = (events: TokenEvent[], secret: string) =>
+      built.app.request(
+        new Request("http://x/ingest", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-tokenleader-secret": secret,
+          },
+          body: JSON.stringify({ events }),
+        }),
+      );
+    const r1 = await post(
+      [
+        makeEvent({ user: "ada", messageId: "mf-ada-1", timestamp: Date.UTC(2026, 5, 1) }),
+        makeEvent({ user: "ada", messageId: "mf-ada-2", timestamp: Date.UTC(2026, 5, 2) }),
+        makeEvent({
+          user: "ada",
+          messageId: "mf-ada-3",
+          model: "gpt-5",
+          timestamp: Date.UTC(2026, 5, 2, 1),
+        }),
+        makeEvent({
+          user: "ada",
+          messageId: "mf-ada-u1",
+          messageType: "user",
+          model: "",
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheCreationTokens: 0,
+          cacheReadTokens: 0,
+          timestamp: Date.UTC(2026, 5, 1, 1),
+        }),
+      ],
+      "ada-secret",
+    );
+    expect(r1.status).toBe(200);
+    const r2 = await post(
+      [
+        makeEvent({
+          user: "bea",
+          messageId: "mf-bea-1",
+          model: "gpt-5",
+          inputTokens: 1000,
+          outputTokens: 500,
+          timestamp: Date.UTC(2026, 5, 3),
+        }),
+      ],
+      "bea-secret",
+    );
+    expect(r2.status).toBe(200);
+  });
+
+  afterAll(async () => {
+    await built.cleanup();
+  });
+
+  test("/stats/admin?model=gpt-5 ranks users by that model's slice only", async () => {
+    const res = await built.app.request(new Request("http://x/stats/admin?model=gpt-5"));
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    // bea's single big gpt-5 event outranks ada's small one; ada's two
+    // claude events don't count here.
+    expect(body.leaderboard.map((r: any) => r.user)).toEqual(["bea", "ada"]);
+    const [bea, ada] = body.leaderboard;
+    expect(bea.totalInputTokens).toBe(1000);
+    expect(bea.totalOutputTokens).toBe(500);
+    expect(ada.totalInputTokens).toBe(100); // the ONE gpt-5 event, not 300
+    expect(ada.eventCount).toBe(1);
+    expect(ada.assistantMessages).toBe(1);
+    expect(ada.modelCount).toBe(1);
+    // User messages aren't attributable to a model → 0 across the board.
+    expect(ada.userMessages).toBe(0);
+    expect(body.messages).toEqual({ userMessages: 0, assistantMessages: 2 });
+    // byModel stays UN-scoped: still both models, full aggregates — the
+    // models table keeps every row while one is selected.
+    expect(body.byModel.map((m: any) => m.model).sort()).toEqual(["claude-sonnet-4-5", "gpt-5"]);
+  });
+
+  test("model composes with the claude side too; unfiltered view unchanged", async () => {
+    const claude = await jsonOf(
+      await built.app.request(new Request("http://x/stats/admin?model=claude-sonnet-4-5")),
+    );
+    // Only ada ever used claude-sonnet-4-5.
+    expect(claude.leaderboard.map((r: any) => r.user)).toEqual(["ada"]);
+    expect(claude.leaderboard[0].totalInputTokens).toBe(200); // 2 × 100
+    expect(claude.leaderboard[0].assistantMessages).toBe(2);
+    const all = await jsonOf(await built.app.request(new Request("http://x/stats/admin")));
+    expect(all.leaderboard.map((r: any) => r.user).sort()).toEqual(["ada", "bea"]);
+    const adaAll = all.leaderboard.find((r: any) => r.user === "ada");
+    expect(adaAll.totalInputTokens).toBe(300); // all three assistant events
+    expect(adaAll.userMessages).toBe(1); // user message counts again
+  });
+
+  test("valid-but-unknown model → 200 with empty leaderboard (byModel stays full)", async () => {
+    const res = await built.app.request(new Request("http://x/stats/admin?model=nope-9000"));
+    expect(res.status).toBe(200);
+    const body = await jsonOf(res);
+    expect(body.leaderboard).toEqual([]);
+    expect(body.messages).toEqual({ userMessages: 0, assistantMessages: 0 });
+    expect(body.byModel.length).toBe(2);
+  });
+
+  test("oversized model param → 400 {error:'invalid model'}", async () => {
+    const res = await built.app.request(
+      new Request(`http://x/stats/admin?model=${"m".repeat(201)}`),
+    );
+    expect(res.status).toBe(400);
+    expect(await jsonOf<{ error: string }>(res)).toEqual({ error: "invalid model" });
+  });
+});
+
 // ----- half-open [since, until) semantics --------------------------------
 // The one date contract: an event at timestamp === until is OUT, an event
 // at timestamp === since is IN, on every surface — so a boundary event
