@@ -170,9 +170,11 @@ header .brand {
 }
 .brand-logo {
   /* <img src="/brand/logo.svg"> — server-supplied, possibly operator art.
-     object-fit keeps a non-square custom logo from distorting. */
-  width: 16px;
-  height: 16px;
+     object-fit keeps a non-square custom logo from distorting. 20px, not
+     16px: the built-in Anara mark is a tile with a wide asterisk pair inset,
+     which needs the extra couple of pixels to stay legible. */
+  width: 20px;
+  height: 20px;
   display: block;
   object-fit: contain;
 }
