@@ -1,19 +1,22 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-label="leaderboard">
-  <!-- Neutral tokenleader mark: ascending bars on a rounded tile. The tile
-       gives the mark internal contrast, so it reads on light AND dark
-       backgrounds even when the page theme disagrees with the OS theme;
-       prefers-color-scheme flips it for the common case. Operators replace
-       this by dropping their own logo.svg into <data-dir>/brand/. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Anara">
+  <!-- Anara asterisk-pair mark on a rounded tile, matching the app icon in
+       anara/apps/web/public/brand/. The tile gives the mark internal
+       contrast, so it reads on light AND dark backgrounds even when the page
+       theme disagrees with the OS theme (the dashboard's theme toggle can
+       override prefers-color-scheme); it also gives apple-touch-icon an
+       opaque backdrop. Operators replace this by dropping their own
+       logo.svg into <data-dir>/brand/. -->
   <style>
-    .tile { fill: #18181b; }
-    .bar { fill: #fafafa; }
+    .tile { fill: #ffffff; }
+    .mark { fill: #000000; }
     @media (prefers-color-scheme: dark) {
-      .tile { fill: #fafafa; }
-      .bar { fill: #18181b; }
+      .tile { fill: #000000; }
+      .mark { fill: #ffffff; }
     }
   </style>
-  <rect class="tile" width="100" height="100" rx="22"/>
-  <rect class="bar" x="18" y="56" width="16" height="26" rx="4"/>
-  <rect class="bar" x="42" y="40" width="16" height="42" rx="4"/>
-  <rect class="bar" x="66" y="22" width="16" height="60" rx="4"/>
+  <rect class="tile" width="512" height="512" rx="114.5344"/>
+  <g class="mark" transform="translate(87.04 171.52) scale(1.430119)">
+    <path d="M64.3557 44.8681L102.776 21.4366L112.176 37.7746L72.4561 59.2037L112.179 80.5022L102.774 96.8484L64.3557 73.2847L65.4188 118.144H46.7474L47.8099 73.2794L9.2407 96.8537L0 80.4951L39.7095 59.2037L0.00235973 37.7811L9.23834 21.4314L47.8105 44.874L46.7474 0H65.4188L64.3557 44.8681Z"/>
+    <path d="M188.465 44.8681L226.886 21.4366L236.286 37.7746L196.566 59.2037L236.288 80.5022L226.884 96.8484L188.465 73.2847L189.528 118.144H170.857L171.92 73.2794L133.35 96.8537L124.111 80.4951L163.819 59.2037L124.113 37.7811L133.348 21.4314L171.92 44.874L170.857 0H189.528L188.465 44.8681Z"/>
+  </g>
 </svg>

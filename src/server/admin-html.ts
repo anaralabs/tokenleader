@@ -11,7 +11,10 @@ export function renderAdminHtml(serverUrl: string): string {
 <meta charset="utf-8" />
 <meta name="viewport" content="width=1280" />
 <title>tokenleader</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='black'/%3E%3Cpath fill='white' d='M50 14 Q50 50 86 50 Q50 50 50 86 Q50 50 14 50 Q50 50 50 14 Z'/%3E%3C/svg%3E">
+<!-- /brand/favicon.svg rather than an inlined data: URI, so this page shows
+     the same mark as the Vite dashboard and honours an operator's
+     <data-dir>/brand/favicon.svg override. The route is never auth-gated. -->
+<link rel="icon" type="image/svg+xml" href="/brand/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap">
@@ -192,7 +195,8 @@ export function renderAdminHtml(serverUrl: string): string {
     gap: 8px;
   }
   header .brand-logo {
-    width: 18px; height: 18px;
+    /* 2:1 box — #icon-mark's viewBox is the wide asterisk pair, not a square. */
+    width: 32px; height: 16px;
     display: block;
     fill: currentColor;
     color: hsl(var(--text-primary));
@@ -565,10 +569,13 @@ export function renderAdminHtml(serverUrl: string): string {
 <body>
 
 <svg xmlns="http://www.w3.org/2000/svg" style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true">
-  <symbol id="icon-mark" viewBox="0 0 100 100">
-    <!-- Neutral 4-pointed star mark: concave-sided star with cardinal-axis points.
-         fill: currentColor so it adapts to light/dark theme. -->
-    <path d="M50 8 Q50 50 92 50 Q50 50 50 92 Q50 50 8 50 Q50 50 50 8 Z"/>
+  <symbol id="icon-mark" viewBox="0 0 236.288 118.144">
+    <!-- Anara asterisk-pair mark (anara/apps/web/public/brand/anara-mark.svg).
+         Inline rather than <img src="/brand/logo.svg"> so it inherits
+         fill: currentColor and tracks the light/dark theme toggle; the 2:1
+         viewBox is why header .brand-logo above is 32x16, not square. -->
+    <path d="M64.3557 44.8681L102.776 21.4366L112.176 37.7746L72.4561 59.2037L112.179 80.5022L102.774 96.8484L64.3557 73.2847L65.4188 118.144H46.7474L47.8099 73.2794L9.2407 96.8537L0 80.4951L39.7095 59.2037L0.00235973 37.7811L9.23834 21.4314L47.8105 44.874L46.7474 0H65.4188L64.3557 44.8681Z"/>
+    <path d="M188.465 44.8681L226.886 21.4366L236.286 37.7746L196.566 59.2037L236.288 80.5022L226.884 96.8484L188.465 73.2847L189.528 118.144H170.857L171.92 73.2794L133.35 96.8537L124.111 80.4951L163.819 59.2037L124.113 37.7811L133.348 21.4314L171.92 44.874L170.857 0H189.528L188.465 44.8681Z"/>
   </symbol>
   <symbol id="icon-trophy" viewBox="0 0 24 24">
     <path fill-rule="evenodd" clip-rule="evenodd" d="M7 2C5.89543 2 5 2.89543 5 4H4C2.89543 4 2 4.89543 2 6V7C2 9.09706 3.61375 10.8172 5.66717 10.9864C6.65237 13.0719 8.63747 14.5925 11.0039 14.9297V17H8C6.89543 17 6 17.8954 6 19V20C6 21.1046 6.89543 22 8 22H16C17.1046 22 18 21.1046 18 20V19C18 17.8954 17.1046 17 16 17H13.0039V14.9286C15.3669 14.5892 17.3487 13.0696 18.3328 10.9864C20.3862 10.8172 22 9.09706 22 7V6C22 4.89543 21.1046 4 20 4H19C19 2.89543 18.1046 2 17 2H7ZM4 6H5V8C5 8.25512 5.01365 8.50705 5.04025 8.7551C4.42032 8.41539 4 7.75678 4 7V6ZM20 7C20 7.75678 19.5797 8.41539 18.9597 8.7551C18.9864 8.50705 19 8.25512 19 8V6H20V7Z"/>

@@ -29,7 +29,7 @@ are fatal at boot; out-of-range numerics clamp to the nearest bound and warn.
 ### Branding
 
 Branding is file-based. `GET /brand/logo.svg` and `GET /brand/favicon.svg`
-fall back to a built-in neutral mark; drop replacements into
+fall back to the built-in Anara mark; drop replacements into
 `<data-dir>/brand/` (e.g. `/data/brand/` on Docker):
 
 ```
