@@ -19,6 +19,10 @@
   --destructive: hsl(349 100% 42%);
   --border-primary: hsl(0 0% 86%);
   --border-muted: hsl(0 0% 95%);
+  /* Card outline: one notch stronger than --border-muted (which reads as
+     borderless against --bg-app) but weaker than --border-primary, so a card
+     is faintly outlined rather than boxed in. */
+  --border-card: hsl(0 0% 89%);
   --accent-green: hsl(135 59% 38%);
   --accent-orange: hsl(32 100% 40%);
   --ghost-a: hsl(0 0% 93%);
@@ -56,6 +60,7 @@
     --destructive: hsl(349 100% 59%);
     --border-primary: hsl(0 0% 15%);
     --border-muted: hsl(0 0% 13%);
+    --border-card: hsl(0 0% 18%);
     --accent-green: hsl(135 59% 49%);
     --accent-orange: hsl(32 100% 50%);
     --ghost-a: hsl(0 0% 15%);
@@ -83,6 +88,7 @@
   --destructive: hsl(349 100% 59%);
   --border-primary: hsl(0 0% 15%);
   --border-muted: hsl(0 0% 13%);
+  --border-card: hsl(0 0% 18%);
   --accent-green: hsl(135 59% 49%);
   --accent-orange: hsl(32 100% 50%);
   --ghost-a: hsl(0 0% 15%);
@@ -497,7 +503,7 @@ tr.is-dimmed > td {
 /* ---- cards / tables ------------------------------------------------------ */
 .card {
   background: var(--bg-object);
-  border: 1px solid var(--border-muted);
+  border: 1px solid var(--border-card);
   border-radius: var(--radius-card);
 }
 /* thead uses position:sticky to pin against the PAGE scrollport as you scroll a
