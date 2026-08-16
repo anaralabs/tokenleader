@@ -12,6 +12,10 @@
 #                          (next post from that machine claims fresh)
 #   --full                 drop BOTH tables and recreate (nuclear)
 #
+# Every mode also clears the matching rows from the events_roll_day /
+# events_roll_dirty dashboard aggregate, which is authoritative — see the
+# comment above the execute block. Restart the server afterwards.
+#
 # Confirmation:
 #   Prompts "Type 'yes' to confirm:" unless --yes or TOKENLEADER_CONFIRM=yes.
 #
@@ -124,19 +128,35 @@ if [ -z "$ASSUME_YES" ]; then
 fi
 
 # --- execute ---------------------------------------------------------------
+# events_roll_day is the dashboard's pre-aggregated source and it is
+# AUTHORITATIVE — the stats routes read it and never fall back to scanning
+# events. Deleting rows out of band here without clearing it leaves a running
+# server reporting the deleted users' totals indefinitely: nothing in the
+# server observes this script, so no cache TTL and no restart-free path
+# corrects it. So every mode below clears the rollup for the same scope in the
+# SAME sqlite3 invocation (one implicit transaction), which keeps the two
+# tables consistent for the NEXT process to open the file. A server that was
+# already running still holds a warm stats cache — hence the closing notice.
 case "$MODE" in
   all)
-    sqlite3 "$DB" 'DELETE FROM events;'
+    sqlite3 "$DB" 'DELETE FROM events; DELETE FROM events_roll_day; DELETE FROM events_roll_dirty;'
     ;;
   user)
-    sqlite3 "$DB" "DELETE FROM events WHERE user = '$(printf '%s' "$USERARG" | sed "s/'/''/g")';"
+    SAFE="$(printf '%s' "$USERARG" | sed "s/'/''/g")"
+    sqlite3 "$DB" "DELETE FROM events WHERE user = '$SAFE';
+                   DELETE FROM events_roll_day WHERE user = '$SAFE';
+                   DELETE FROM events_roll_dirty WHERE user = '$SAFE';"
     ;;
   reset-user)
     SAFE="$(printf '%s' "$USERARG" | sed "s/'/''/g")"
-    sqlite3 "$DB" "DELETE FROM events WHERE user = '$SAFE'; DELETE FROM user_secrets WHERE username = '$SAFE';"
+    sqlite3 "$DB" "DELETE FROM events WHERE user = '$SAFE';
+                   DELETE FROM events_roll_day WHERE user = '$SAFE';
+                   DELETE FROM events_roll_dirty WHERE user = '$SAFE';
+                   DELETE FROM user_secrets WHERE username = '$SAFE';"
     ;;
   full)
-    sqlite3 "$DB" 'DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets;'
+    sqlite3 "$DB" 'DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets;
+                   DROP TABLE IF EXISTS events_roll_day; DROP TABLE IF EXISTS events_roll_dirty;'
     sqlite3 "$DB" <<'SQL'
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,3 +193,7 @@ SECRETS_AFTER="$(sqlite3 "$DB" 'SELECT COUNT(*) FROM user_secrets' 2>/dev/null |
 printf 'done.\n'
 printf 'Events table size (after):  %s rows\n' "$EVENTS_AFTER"
 printf 'user_secrets size (after):  %s rows\n' "$SECRETS_AFTER"
+printf '\nNOTE: a server process that was ALREADY RUNNING when this ran still\n'
+printf '      holds prepared statements and a warm stats cache. Restart it, or\n'
+printf '      POST /admin/rollup-audit with {"rebuild":true}, before trusting\n'
+printf '      the dashboard.\n'

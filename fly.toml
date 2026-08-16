@@ -26,6 +26,10 @@ kill_timeout = "30s"          # > the 8s drain cap
   [[http_service.checks]]
     interval = "30s"
     timeout = "5s"
-    grace_period = "10s"
+    # Not 10s: the first boot after upgrading past the dashboard rollup builds
+    # events_roll_day before it listens (~5.5s at 5M events, ~12s at 10M), on
+    # top of migrations and ANALYZE. A grace period shorter than that fails
+    # the deploy on exactly the machines that have the most data.
+    grace_period = "120s"
     method = "GET"
     path = "/health"

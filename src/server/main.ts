@@ -2420,6 +2420,34 @@ export function buildApp(opts: BuildOptions) {
 
   // Destructive maintenance route, gated by the admin bearer.
   // Body: { scope: "all"|"user"|"reset-user"|"full", user?: string }.
+  // Verify events_roll_day against raw events on demand, rebuilding it if the
+  // two disagree. The stats routes read the rollup and never fall back to a
+  // full scan, so out-of-band SQL surgery on `events` (a hand-run rename or
+  // merge, or scripts/clear-db.sh) leaves them serving stale numbers until
+  // the next boot — this is the button that fixes it without a restart.
+  //
+  // Body {"rebuild": true} skips the comparison and rebuilds unconditionally.
+  // That is not a nicety: the audit compares per-user aggregates, so it is
+  // structurally blind to some edits (Store's RollAuditRow lists which), and
+  // without a forced path an operator who KNOWS the rollup is wrong has no
+  // supported fix — a restart just runs the same comparison.
+  //
+  // COSTS, both of them, because they differ by an order of magnitude and
+  // bun:sqlite is synchronous, so either one blocks the event loop for every
+  // other request: the audit scan is ~1.8s at 5M rows; the rebuild it can
+  // trigger (or that {"rebuild":true} forces) is ~5.5s at 5M rows and ~12s at
+  // 10M. Long enough to fail consecutive health checks, which is why this is
+  // admin-gated and never scheduled.
+  app.post("/admin/rollup-audit", async (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    // No body, a truncated body and a non-JSON body all mean "just audit".
+    const body: { rebuild?: unknown } = await c.req.json().catch(() => ({}));
+    const audit = store.auditRollup({ repair: true, force: body.rebuild === true });
+    if (audit.rebuilt) invalidateStatsCache();
+    return c.json(audit);
+  });
+
   app.post("/admin/clear", async (c) => {
     const denied = requireAdmin(c);
     if (denied) return denied;

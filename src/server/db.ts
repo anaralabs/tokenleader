@@ -26,14 +26,80 @@ CREATE TABLE IF NOT EXISTS events (
   costUsdMicros INTEGER,
   ingestedAt INTEGER NOT NULL
 );
--- The dashboard's covering index (events_user_cover) references
--- messageType/costUsdMicros, which may not exist pre-migration — it is
--- created in the constructor AFTER the migrate* calls.
-CREATE INDEX IF NOT EXISTS events_user_model ON events (user, model);
--- Timestamp-leading aggregations ride the (timestamp, messageType)
--- composite created in migrateMessageType; the old single-column
--- events_ts was redundant with it and is dropped post-migration.
-CREATE INDEX IF NOT EXISTS events_model_ts  ON events (model, timestamp);
+-- events has NO index defined here: the dashboard's covering index
+-- (events_user_cover) and the dedup/timestamp indexes reference
+-- messageType/costUsdMicros, which may not exist pre-migration, so they
+-- are created in the constructor / migrateMessageType AFTER the migrate*
+-- calls. events_user_model and events_model_ts used to live here and are
+-- dropped post-migration (see the constructor for why).
+
+-- Pre-aggregated dashboard source: one row per (UTC day, user, model,
+-- messageType) holding INTEGER partial sums. This is what makes the stats
+-- routes cost O(days x users x models-in-use) instead of O(events) — the
+-- distinction that matters, because the events table doubles every ~2.5
+-- months while the group rate is bounded by team size.
+--
+-- INVARIANTS, in the order they are easy to break:
+--
+--  1. It is AUTHORITATIVE. Reads never fall back to scanning events (a
+--     staleness check would cost as much as the scan it avoids), so every
+--     path that writes or deletes events MUST maintain it. Out-of-band SQL
+--     surgery on events (a hand-run "UPDATE events SET user = ...", or
+--     scripts/clear-db.sh) must also clear this table — there is no such
+--     UPDATE in the codebase, so this is an ops rule. The boot audit is the
+--     backstop, and POST /admin/rollup-audit {"rebuild":true} is the
+--     unconditional fix for what the audit cannot see (see RollAuditRow).
+--     The audit is also the last O(events) cost in the server: every read
+--     path is O(days x users x models), that one scan is not.
+--  2. Backfills need no watermark. The delta is keyed by the EVENT'S OWN
+--     day, never by arrival time, so an event dated last September that
+--     arrives today upserts last September's row. There is no
+--     "materialised up to X" frontier that a late arrival can invalidate.
+--  3. Deletes cannot be a delta, because maxTimestamp is not invertible.
+--     They mark (user, day) in events_roll_dirty and the marked cells are
+--     recomputed from raw events at the end of the same insertMany — exact
+--     by definition, and paid for by the writer rather than the next
+--     dashboard reader.
+--  4. model stays a KEY rather than being summed away, because the
+--     leaderboard's modelCount is a COUNT(DISTINCT model) and is not
+--     additively decomposable across days. messageType stays a key for
+--     the same reason on the user/assistant message split. maxTimestamp
+--     exists because the leaderboard needs MAX(timestamp), which counts
+--     cannot reconstruct.
+--  5. model is '' for messageType='user' rows (validateEvent permits an
+--     empty model only there) — a legal key value, not a sentinel.
+CREATE TABLE IF NOT EXISTS events_roll_day (
+  day                 INTEGER NOT NULL,
+  user                TEXT    NOT NULL,
+  model               TEXT    NOT NULL,
+  messageType         TEXT    NOT NULL,
+  events              INTEGER NOT NULL,
+  inputTokens         INTEGER NOT NULL,
+  outputTokens        INTEGER NOT NULL,
+  cacheCreationTokens INTEGER NOT NULL,
+  cacheReadTokens     INTEGER NOT NULL,
+  reasoningTokens     INTEGER NOT NULL,
+  storedCostMicros    INTEGER NOT NULL,
+  maxTimestamp        INTEGER NOT NULL,
+  PRIMARY KEY (day, user, model, messageType)
+) WITHOUT ROWID;
+-- The PK is day-leading (the timeseries access path). This one is
+-- user-leading for the per-user routes (/stats?user=, the
+-- /stats/leaderboard per-user pass). The whole table is ~0.1 MiB at prod
+-- scale, so a second index on it is free.
+CREATE INDEX IF NOT EXISTS events_roll_day_user ON events_roll_day (user, day);
+
+-- (user, day) pairs whose rollup rows a DELETE invalidated. Recomputed from
+-- raw events by Store.repairRollup, at the end of the insertMany that
+-- deleted them. A queue, not a cache: an entry here means events_roll_day is
+-- WRONG for that cell, so it must be drained before any read (which is why
+-- the reads drain it too, as a backstop), it is never drained partially, and
+-- it must be written in the same transaction as the delete that caused it.
+CREATE TABLE IF NOT EXISTS events_roll_dirty (
+  user TEXT    NOT NULL,
+  day  INTEGER NOT NULL,
+  PRIMARY KEY (user, day)
+) WITHOUT ROWID;
 
 CREATE TABLE IF NOT EXISTS user_secrets (
   username       TEXT PRIMARY KEY,
@@ -760,6 +826,218 @@ const COMPANY_SCOPE = "AND user IN (SELECT username FROM user_secrets WHERE comp
 const CATEGORY_SCOPE = "AND user IN (SELECT username FROM user_secrets WHERE category_id = ?)";
 
 /**
+ * The INTEGER sums the rollup audit compares between events and
+ * events_roll_day, PER USER. `n` is COUNT(*) vs SUM(events).
+ *
+ * The first seven are the token/cost totals. The last three exist because
+ * those seven alone are blind to any edit that moves rows between rollup
+ * CELLS without changing a user's totals — and those are the likeliest hand
+ * edits of all:
+ *
+ *   dsum  SUM(day)          catches a timestamp correction that moves rows
+ *                           to other day buckets (and the negative-timestamp
+ *                           truncation class rollDayOf exists to prevent).
+ *   asst  assistant rows    catches a messageType flip, which rewrites the
+ *                           user/assistant split while summing to the same
+ *                           tokens (user rows carry zero of everything).
+ *   mfp   model fingerprint catches a model-id rename — a real thing this
+ *                           repo has done — which otherwise leaves the
+ *                           dashboard serving the OLD name, priced by
+ *                           whatever that string resolves to, forever.
+ *
+ * All three are plain aggregates over the same single covering-index scan
+ * (GROUP BY user rides events_user_cover, no temp b-tree), which is why they
+ * are affordable where a real cell-level comparison is not: an exhaustive
+ * two-way EXCEPT against events_roll_day measures ~10s at 5M rows, i.e.
+ * dearer than simply rebuilding.
+ *
+ * mfp is a FINGERPRINT, not a proof: three cheap features of the model
+ * string (length, first codepoint, last codepoint). It catches every
+ * realistic rename, including same-length version bumps, but two different
+ * model ids can collide. The honest recovery for anything the audit cannot
+ * see is the unconditional rebuild — see POST /admin/rollup-audit.
+ */
+interface RollAuditRow {
+  user: string;
+  n: number;
+  i: number;
+  o: number;
+  cc: number;
+  cr: number;
+  rt: number;
+  cost: number;
+  dsum: number;
+  asst: number;
+  mfp: number;
+}
+
+/** Per-raw-row model fingerprint. On the rollup side each cell stands for
+ *  `events` identical rows, so that side multiplies by `events`. Bounded by
+ *  a few thousand per row, so the SUM stays far inside 2^53 even at 100M
+ *  rows. `unicode('')` is NULL (user rows carry model=''), hence COALESCE. */
+const MODEL_FP_SQL =
+  "(length(model) * 131 + COALESCE(unicode(model), 0) * 17 + COALESCE(unicode(substr(model, -1)), 0))";
+
+/** The connection's steady-state temp_store. Every window aggregation is
+ *  bounded by the rollup's row count now, so keeping its scratch in RAM is
+ *  cheap. rebuildRollup() is the one exception and flips to FILE around
+ *  itself — see there for the OOM this avoids. */
+const TEMP_STORE = "MEMORY";
+
+/** Result of Store.auditRollup(). `mismatched` names the users whose sums
+ *  disagree (or that exist on only one side) — the useful thing to log.
+ *  `auditMs` is the compare pass; `rebuildMs` is the (much dearer) repair. */
+export interface RollAudit {
+  ok: boolean;
+  rebuilt: boolean;
+  auditMs: number;
+  rebuildMs: number;
+  users: number;
+  mismatched: string[];
+}
+
+const DAY_MS = 86_400_000;
+
+/**
+ * UTC day index of an epoch-ms timestamp — FLOOR division, deliberately.
+ *
+ * validateEvent gates `timestamp` with isFiniteInt, not isNonNegInt, so
+ * /ingest accepts negative timestamps today. SQLite's integer division
+ * truncates TOWARD ZERO while JS's Math.floor rounds toward -inf, so the
+ * obvious `timestamp / 86400000` in SQL disagrees with this function for
+ * every negative timestamp — and the boot audit would NOT catch it, because
+ * putting a row in the wrong DAY cell leaves every per-user total intact.
+ * Both sides floor, and both go through these two definitions.
+ */
+const rollDayOf = (tsMs: number): number => Math.floor(tsMs / DAY_MS);
+/** SQL peer of rollDayOf(). Splices a column/expression, never user input. */
+const rollDaySql = (col: string): string =>
+  `((${col} - ((${col} % ${DAY_MS}) + ${DAY_MS}) % ${DAY_MS}) / ${DAY_MS})`;
+
+/**
+ * Split a half-open `[since, until)` ms window into the whole UTC days the
+ * rollup already holds plus at most two partial-day slivers read from raw
+ * events, as the six positional parameters every rollup statement takes:
+ *
+ *   ?1 dayLo, ?2 dayHi    interior, `day >= ?1 AND day < ?2`
+ *   ?3 .. ?4              leading sliver,  `timestamp >= ?3 AND < ?4`
+ *   ?5 .. ?6              trailing sliver, `timestamp >= ?5 AND < ?6`
+ *
+ * The half-open contract (an event at ts===since is IN, at ts===until is
+ * OUT) is decided entirely here: by the exact `>= / <` predicates on the
+ * slivers and by the integer day bounds on the interior.
+ *
+ * Every view that is actually slow is day-aligned and therefore costs ZERO
+ * sliver rows: all-time (since=0), the SPA's contribution grid
+ * (since = Date.UTC(year, 0, 1)) and the month pills. `range=Nd` snaps
+ * `since` to the minute, so it pays exactly one leading partial day.
+ *
+ * THE KNOWN RESIDUAL, recorded so the next person does not rediscover it as
+ * "the rollup regressed": that leading sliver is the only surviving O(events)
+ * term on a read path, and it is read through events_ts_type, which is NOT
+ * covering for the token columns, so each matched row costs a rowid lookup
+ * into the ~950 MB table. Measured at ~8us/row (12,914 rows in 102ms cold on
+ * a 10M-row fixture). At prod's ~67k events/day a full-day sliver is ~0.5s,
+ * and unlike everything else here it grows with the INGEST rate. It is
+ * confined to the 7D/30D pills. If it ever becomes the bottleneck the two
+ * cheap moves are to add the summed token columns to events_ts_type (making
+ * the sliver covering, at index-size cost) or to keep an hour-grain rollup
+ * for the current day.
+ */
+function rollWindow(
+  sinceMs: number,
+  untilMs: number,
+): [number, number, number, number, number, number] {
+  // `+ 0` normalises Math.ceil's -0 (e.g. sinceMs = -1000) to a plain 0,
+  // so the bound parameter is an integer.
+  const dayLo = Math.ceil(sinceMs / DAY_MS) + 0;
+  const dayHi = Math.floor(untilMs / DAY_MS) + 0;
+  if (dayHi <= dayLo) {
+    // Degenerate (until <= since) or wholly inside one UTC day: no day is
+    // fully covered, so the interior is empty and there is exactly ONE
+    // sliver — never two overlapping ones double-counting the window.
+    return [0, 0, sinceMs, Math.max(untilMs, sinceMs), 0, 0];
+  }
+  return [dayLo, dayHi, sinceMs, dayLo * DAY_MS, dayHi * DAY_MS, untilMs];
+}
+
+/** strftime formats for the three bucket grains. UTC ('unixepoch'), so
+ *  labels never shift with the server's timezone. Weeks are ISO 8601
+ *  (%G-W%V, Monday start): %W has a week-zero edge case and %U is
+ *  Sunday-based. */
+const BUCKET_FMT: Record<Bucket, string> = {
+  day: "%Y-%m-%d",
+  week: "%G-W%V",
+  month: "%Y-%m",
+};
+
+/**
+ * The rollup-backed FROM clause: the pre-aggregated interior plus the two
+ * raw-event slivers, normalised to one column shape
+ * `(bucketKey?, user, model, messageType, events, <5 token sums>,
+ *   storedCostMicros, maxTimestamp)`.
+ *
+ * `bucket` non-null adds a bucketKey column. Day grain rolls up to week and
+ * month EXACTLY because a UTC day lies wholly inside one ISO week and one
+ * calendar month — that is the whole reason a single day-grain table can
+ * serve all three. Both branches derive the label from the same floored day
+ * (rollDaySql), so interior and sliver agree on every timestamp.
+ *
+ * That is a deliberate behaviour change for PRE-EPOCH timestamps: the old
+ * statements bucketed by `strftime(fmt, timestamp/1000)`, and SQLite's
+ * truncating division pushed an event in the last 999ms before a pre-1970
+ * UTC midnight into the FOLLOWING day's label. It is unreachable through
+ * the API — parseStatsRange rejects a negative `since`, and the default
+ * window starts at 0 — but the rollup has to pick one answer for both
+ * branches, and the correct one is the true UTC day.
+ *
+ * `where` is an extra predicate pushed into BOTH branches (not applied
+ * outside the union) so the raw-events branch keeps an index-seek plan on
+ * `user`, and so the rollup branch can use events_roll_day_user.
+ *
+ * Every argument is a compile-time constant from this file — never user
+ * input — so the splicing is safe.
+ */
+function rollSource(bucket: Bucket | null, where = ""): string {
+  const key = (secondsExpr: string) =>
+    bucket === null
+      ? ""
+      : `strftime('${BUCKET_FMT[bucket]}', ${secondsExpr}, 'unixepoch') AS bucketKey,\n              `;
+  // events=1 per raw row; the two nullable columns COALESCE to the rollup's
+  // NOT NULL shape; timestamp is that row's own maxTimestamp.
+  const sliver = (
+    from: string,
+    to: string,
+  ) => `SELECT ${key(`${rollDaySql("timestamp")} * 86400`)}user, model, messageType,
+              1 AS events, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens,
+              COALESCE(reasoningTokens, 0) AS reasoningTokens,
+              COALESCE(costUsdMicros, 0)   AS storedCostMicros,
+              timestamp                    AS maxTimestamp
+         FROM events
+        WHERE timestamp >= ${from} AND timestamp < ${to} ${where}`;
+  return `SELECT ${key("day * 86400")}user, model, messageType,
+              events, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens,
+              reasoningTokens, storedCostMicros, maxTimestamp
+         FROM events_roll_day
+        WHERE day >= ?1 AND day < ?2 ${where}
+        UNION ALL
+       ${sliver("?3", "?4")}
+        UNION ALL
+       ${sliver("?5", "?6")}`;
+}
+
+/** Peers of COMPANY_SCOPE / CATEGORY_SCOPE for rollup statements, which
+ *  bind positionally (?1..?6 are the window) so the scope value is ?7. */
+const COMPANY_SCOPE_7 = "AND user IN (SELECT username FROM user_secrets WHERE company = ?7)";
+const CATEGORY_SCOPE_7 = "AND user IN (SELECT username FROM user_secrets WHERE category_id = ?7)";
+const USER_SCOPE_7 = "AND user = ?7";
+/** Restrict to assistant rows, pushed into both union branches. */
+const ASSISTANT_ONLY = "AND messageType = 'assistant'";
+
+/** The six positional window parameters rollWindow() produces. */
+type RollWindowArgs = [number, number, number, number, number, number];
+
+/**
  * Per-(user, model) aggregate over `[since, until)` for `/api/v1`.
  * Assistant rows only — user-message rows have zero tokens and no model.
  */
@@ -784,21 +1062,24 @@ export interface ApiUsageRow {
 export class Store {
   readonly db: Database;
   private readonly insertStmt: Statement;
-  private readonly deleteCursorLocalInSpanStmt: Statement;
+  private readonly deleteCursorLocalInSpanStmt: Statement<
+    { day: number },
+    [Record<string, string | number>]
+  >;
   private readonly countStmt: Statement<{ c: number }>;
-  private readonly userTotalsStmt: Statement<UserTotalsRow, [string, number, number]>;
-  private readonly userByModelStmt: Statement<ModelRow, [string, number, number]>;
-  private readonly leaderboardStmt: Statement<UserTotalsRow, [number, number]>;
-  private readonly adminLeaderboardStmt: Statement<LeaderboardAdminRow, [number, number]>;
+  private readonly userTotalsStmt: Statement<UserTotalsRow, [...RollWindowArgs, string]>;
+  private readonly userByModelStmt: Statement<ModelRow, [...RollWindowArgs, string]>;
+  private readonly leaderboardStmt: Statement<UserTotalsRow, RollWindowArgs>;
+  private readonly adminLeaderboardStmt: Statement<LeaderboardAdminRow, RollWindowArgs>;
   private readonly adminLeaderboardForCompanyStmt: Statement<
     LeaderboardAdminRow,
-    [number, number, string]
+    [...RollWindowArgs, string]
   >;
   private readonly adminLeaderboardForCategoryStmt: Statement<
     LeaderboardAdminRow,
-    [number, number, number]
+    [...RollWindowArgs, number]
   >;
-  private readonly adminUserModelStmt: Statement<UserModelAggRow, [number, number]>;
+  private readonly adminUserModelStmt: Statement<UserModelAggRow, RollWindowArgs>;
   private readonly adminRecentStmt: Statement<RecentEventRow>;
   private readonly adminRecentForCompanyStmt: Statement<RecentEventRow, [string, number]>;
   private readonly adminRecentForCategoryStmt: Statement<RecentEventRow, [number, number]>;
@@ -872,54 +1153,64 @@ export class Store {
   private readonly clearDeviceFlagStmt: Statement;
   private readonly setUserCompanyStmt: Statement;
   private readonly getUserCompanyStmt: Statement<{ company: string | null }, [string]>;
-  private readonly userMessageCountsAllStmt: Statement<UserMessageCountsRow, [number, number]>;
+  private readonly userMessageCountsAllStmt: Statement<UserMessageCountsRow, RollWindowArgs>;
   private readonly userMessageCountsForUserStmt: Statement<
     UserMessageCountsRow,
-    [string, number, number]
+    [...RollWindowArgs, string]
   >;
   // Timeseries: one prepared statement per (bucket × user-filter) shape.
-  // The strftime() format string is spliced in from a fixed allow-list
-  // (never user input), so this is splice-safe.
-  private readonly tsByModelStmts: Record<Bucket, Statement<TimeseriesModelRow, [number, number]>>;
+  // The strftime() format string and the scope clause are spliced in from
+  // fixed allow-lists (never user input), so this is splice-safe. Every one
+  // takes the six rollWindow() parameters, plus the scope value as ?7 where
+  // the shape has one.
+  private readonly tsByModelStmts: Record<Bucket, Statement<TimeseriesModelRow, RollWindowArgs>>;
   private readonly tsByModelForUserStmts: Record<
     Bucket,
-    Statement<TimeseriesModelRow, [string, number, number]>
+    Statement<TimeseriesModelRow, [...RollWindowArgs, string]>
   >;
   private readonly tsByModelForCompanyStmts: Record<
     Bucket,
-    Statement<TimeseriesModelRow, [number, number, string]>
+    Statement<TimeseriesModelRow, [...RollWindowArgs, string]>
   >;
-  private readonly tsByUserStmts: Record<
-    Bucket,
-    Statement<TimeseriesUserModelRow, [number, number]>
-  >;
+  private readonly tsByUserStmts: Record<Bucket, Statement<TimeseriesUserModelRow, RollWindowArgs>>;
   private readonly tsByUserForCompanyStmts: Record<
     Bucket,
-    Statement<TimeseriesUserModelRow, [number, number, string]>
+    Statement<TimeseriesUserModelRow, [...RollWindowArgs, string]>
   >;
   private readonly tsCountsByBucketStmts: Record<
     Bucket,
-    Statement<TimeseriesBucketCountsRow, [number, number]>
+    Statement<TimeseriesBucketCountsRow, RollWindowArgs>
   >;
   private readonly tsCountsByBucketForUserStmts: Record<
     Bucket,
-    Statement<TimeseriesBucketCountsRow, [string, number, number]>
+    Statement<TimeseriesBucketCountsRow, [...RollWindowArgs, string]>
   >;
   private readonly tsCountsByBucketForCompanyStmts: Record<
     Bucket,
-    Statement<TimeseriesBucketCountsRow, [number, number, string]>
+    Statement<TimeseriesBucketCountsRow, [...RollWindowArgs, string]>
   >;
   private readonly tsCountsByUserStmts: Record<
     Bucket,
-    Statement<TimeseriesUserCountsRow, [number, number]>
+    Statement<TimeseriesUserCountsRow, RollWindowArgs>
   >;
   private readonly tsCountsByUserForCompanyStmts: Record<
     Bucket,
-    Statement<TimeseriesUserCountsRow, [number, number, string]>
+    Statement<TimeseriesUserCountsRow, [...RollWindowArgs, string]>
   >;
-  private readonly apiUsageRangeStmt: Statement<ApiUsageRow, [number, number]>;
+  private readonly apiUsageRangeStmt: Statement<ApiUsageRow, RollWindowArgs>;
   private readonly getMetaStmt: Statement<{ value: string }, [string]>;
   private readonly setMetaStmt: Statement;
+  // --- events_roll_day maintenance ---
+  private readonly rollUpsertStmt: Statement;
+  private readonly rollMarkDirtyStmt: Statement;
+  private readonly rollListDirtyStmt: Statement<{ user: string; day: number }, []>;
+  private readonly rollClearDirtyStmt: Statement;
+  private readonly rollDropCellStmt: Statement;
+  private readonly rollRebuildCellStmt: Statement;
+  private readonly rollDistinctUsersStmt: Statement<{ user: string }, []>;
+  private readonly rollRebuildUserStmt: Statement;
+  private readonly rollAuditEventsStmt: Statement<RollAuditRow, []>;
+  private readonly rollAuditRollupStmt: Statement<RollAuditRow, []>;
 
   constructor(path: string) {
     const abs = resolve(path);
@@ -934,7 +1225,7 @@ export class Store {
     // bun's bundled SQLite clamps mmap_size at 1 GiB (a larger request
     // reads back 1073741824) — ask for exactly the cap.
     this.db.exec("PRAGMA mmap_size = 1073741824;");
-    this.db.exec("PRAGMA temp_store = MEMORY;");
+    this.db.exec(`PRAGMA temp_store = ${TEMP_STORE};`);
     this.db.exec(SCHEMA);
     migrateMessageType(this.db);
     migrateUninstalledAt(this.db);
@@ -960,12 +1251,148 @@ export class Store {
     // rebuild on the next boot.
     this.db.exec("DROP INDEX IF EXISTS events_user_ts;");
     this.db.exec("DROP INDEX IF EXISTS events_ts;");
+    // events_model_ts is dead: no statement in db.ts / main.ts / api-v1.ts
+    // has a model-leading access path (/stats/admin?model= scopes in JS off
+    // the grouped user-model pass), and dropping it leaves every EXPLAIN
+    // QUERY PLAN byte-identical.
+    //
+    // events_user_model is *nearly* dead: it is never used as (user, model)
+    // — only as a cheap user-leading index by clearUserEvents and the
+    // company-scoped adminRecent, which fall back to the equally
+    // user-leading events_dedup (measured 23.1ms -> 25.0ms on the latter, a
+    // once-per-filtered-admin-call statement). That is worth paying: on a
+    // 5M-row DB the pair costs ~306 MB of index against ~950 MB of table
+    // and 36% of the /ingest write path (8.4us -> 5.4us per row), which is
+    // the headroom the rollup maintenance below spends.
+    //
+    // The freed pages go on the sqlite FREELIST; the file is NOT truncated,
+    // so /stats/admin's dbSizeBytes (page_count * page_size) does not move —
+    // measured 2020.3 MiB before and after on a 5.1M-row fixture. What is
+    // bought is ~306 MB of future writes landing in reclaimed pages instead
+    // of growing the volume. An operator who wants the space back has to
+    // VACUUM, which needs ~2x free disk and minutes at this size.
+    this.db.exec("DROP INDEX IF EXISTS events_model_ts;");
+    this.db.exec("DROP INDEX IF EXISTS events_user_model;");
     // Planner statistics are mandatory for the covering index: without a
     // sqlite_stat1 row the planner stays on timestamp-leading indexes
     // (measured 4.9s vs 2.1s on 3.6M rows). analysis_limit bounds the
     // per-index sample so this adds ~1-2s to boot, not a full scan.
     this.db.exec("PRAGMA analysis_limit = 1000;");
     this.db.exec("ANALYZE;");
+
+    // --- events_roll_day maintenance (see the DDL in SCHEMA) ---
+    // One UPSERT per (day, user, model, messageType) group of an /ingest
+    // batch, run inside insertMany's transaction so the rollup is atomic
+    // with the events it summarises — and rides Litestream for free,
+    // because it lives in the one replicated file.
+    this.rollUpsertStmt = this.db.prepare(
+      `INSERT INTO events_roll_day (day, user, model, messageType, events, inputTokens,
+            outputTokens, cacheCreationTokens, cacheReadTokens, reasoningTokens,
+            storedCostMicros, maxTimestamp)
+       VALUES ($day, $user, $model, $messageType, $events, $inputTokens,
+               $outputTokens, $cacheCreationTokens, $cacheReadTokens, $reasoningTokens,
+               $storedCostMicros, $maxTimestamp)
+       ON CONFLICT (day, user, model, messageType) DO UPDATE SET
+         events              = events              + excluded.events,
+         inputTokens         = inputTokens         + excluded.inputTokens,
+         outputTokens        = outputTokens        + excluded.outputTokens,
+         cacheCreationTokens = cacheCreationTokens + excluded.cacheCreationTokens,
+         cacheReadTokens     = cacheReadTokens     + excluded.cacheReadTokens,
+         reasoningTokens     = reasoningTokens     + excluded.reasoningTokens,
+         storedCostMicros    = storedCostMicros    + excluded.storedCostMicros,
+         maxTimestamp        = MAX(maxTimestamp, excluded.maxTimestamp)`,
+    );
+    this.rollMarkDirtyStmt = this.db.prepare(
+      "INSERT OR IGNORE INTO events_roll_dirty (user, day) VALUES (?, ?)",
+    );
+    this.rollListDirtyStmt = this.db.prepare<{ user: string; day: number }, []>(
+      "SELECT user, day FROM events_roll_dirty ORDER BY user, day",
+    );
+    this.rollClearDirtyStmt = this.db.prepare(
+      "DELETE FROM events_roll_dirty WHERE user = ? AND day = ?",
+    );
+    this.rollDropCellStmt = this.db.prepare(
+      "DELETE FROM events_roll_day WHERE user = ? AND day = ?",
+    );
+    // Recompute one (user, day) cell from raw events. Bounded by one user's
+    // traffic on one day; rides events_user_cover, so no rowid lookups.
+    this.rollRebuildCellStmt = this.db.prepare(
+      `INSERT INTO events_roll_day
+       SELECT ${rollDaySql("timestamp")}, user, model, messageType, COUNT(*),
+              SUM(inputTokens), SUM(outputTokens), SUM(cacheCreationTokens),
+              SUM(cacheReadTokens), SUM(COALESCE(reasoningTokens, 0)),
+              SUM(COALESCE(costUsdMicros, 0)), MAX(timestamp)
+         FROM events
+        WHERE user = ? AND timestamp >= ? AND timestamp < ?
+        GROUP BY 1, 2, 3, 4`,
+    );
+    // The two halves of the chunked rebuild (see rebuildRollup for why it is
+    // chunked at all). DISTINCT over the leading column of events_user_cover
+    // is one covering scan with no sort; the per-user INSERT is the same
+    // shape as rollRebuildCellStmt without the day bound.
+    this.rollDistinctUsersStmt = this.db.prepare<{ user: string }, []>(
+      "SELECT DISTINCT user FROM events ORDER BY user",
+    );
+    this.rollRebuildUserStmt = this.db.prepare(
+      `INSERT INTO events_roll_day
+       SELECT ${rollDaySql("timestamp")}, user, model, messageType, COUNT(*),
+              SUM(inputTokens), SUM(outputTokens), SUM(cacheCreationTokens),
+              SUM(cacheReadTokens), SUM(COALESCE(reasoningTokens, 0)),
+              SUM(COALESCE(costUsdMicros, 0)), MAX(timestamp)
+         FROM events
+        WHERE user = ?
+        GROUP BY 1, 2, 3, 4`,
+    );
+    // The audit: the RollAuditRow columns PER USER, which must agree between
+    // the two tables. Per-user rather than grand totals, because the
+    // divergence worth catching — a hand-run `UPDATE events SET user = ...`
+    // merge — preserves every grand total while moving rows between users.
+    // Grouping by user is nearly free anyway: events_user_cover is
+    // user-leading, so the scan emits groups in order with no temp B-tree,
+    // and dsum/asst/mfp ride that same scan (see RollAuditRow for what each
+    // buys, and for what the audit still cannot see).
+    //
+    // COUNT(*) alone would not be enough either: it misses any divergence
+    // that preserves row counts, including the negative-timestamp
+    // truncation class that a wrong day expression would produce.
+    this.rollAuditEventsStmt = this.db.prepare<RollAuditRow, []>(
+      `SELECT user, COUNT(*) AS n,
+              COALESCE(SUM(inputTokens),0)         AS i,
+              COALESCE(SUM(outputTokens),0)        AS o,
+              COALESCE(SUM(cacheCreationTokens),0) AS cc,
+              COALESCE(SUM(cacheReadTokens),0)     AS cr,
+              COALESCE(SUM(reasoningTokens),0)     AS rt,
+              COALESCE(SUM(costUsdMicros),0)       AS cost,
+              COALESCE(SUM(${rollDaySql("timestamp")}),0)                        AS dsum,
+              COALESCE(SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END),0) AS asst,
+              COALESCE(SUM(${MODEL_FP_SQL}),0)                                   AS mfp
+         FROM events GROUP BY user ORDER BY user`,
+    );
+    this.rollAuditRollupStmt = this.db.prepare<RollAuditRow, []>(
+      `SELECT user, COALESCE(SUM(events),0)           AS n,
+              COALESCE(SUM(inputTokens),0)            AS i,
+              COALESCE(SUM(outputTokens),0)           AS o,
+              COALESCE(SUM(cacheCreationTokens),0)    AS cc,
+              COALESCE(SUM(cacheReadTokens),0)        AS cr,
+              COALESCE(SUM(reasoningTokens),0)        AS rt,
+              COALESCE(SUM(storedCostMicros),0)       AS cost,
+              COALESCE(SUM(day * events),0)                                            AS dsum,
+              COALESCE(SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END),0) AS asst,
+              COALESCE(SUM(${MODEL_FP_SQL} * events),0)                                AS mfp
+         FROM events_roll_day GROUP BY user ORDER BY user`,
+    );
+    // Boot audit. The rollup is authoritative, so a maintenance path that
+    // silently stopped maintaining it would serve wrong numbers forever;
+    // this is the only thing that catches that. It costs one covering-index
+    // scan — measured as +1.8s on a 5.1M-row boot that already takes 7.5s
+    // in migrations and ANALYZE — and it must NEVER be put on a timer,
+    // because bun:sqlite is synchronous and would block the event loop.
+    //
+    // This scan is now the ONLY O(events) cost left in the system: every
+    // read path is O(days x users x models). It therefore doubles with the
+    // events table like the old aggregations did, which is why its elapsed
+    // ms is logged (see auditRollup) rather than left to be rediscovered.
+    this.auditRollup({ repair: true });
 
     this.insertStmt = this.db.prepare(
       `INSERT INTO events (user, source, sessionId, messageId, requestId, timestamp,
@@ -982,52 +1409,91 @@ export class Store {
     // rows that fall inside the [min, max] timestamp span of that user's
     // incoming cloud `cursor` events. Inclusive bounds — a local row exactly
     // at an edge is covered by the cloud data.
-    this.deleteCursorLocalInSpanStmt = this.db.prepare(
+    // RETURNING the deleted rows' UTC day is what keeps the repair cheap:
+    // the rollup must be invalidated for exactly the (user, day) cells that
+    // lost rows, and those are only knowable from the rows themselves. The
+    // obvious alternative — dirty every day in [min, max] — is correct but
+    // degenerates when a cloud Cursor sync drains an all-time backfill and
+    // the span becomes the user's entire history.
+    this.deleteCursorLocalInSpanStmt = this.db.prepare<
+      { day: number },
+      [Record<string, string | number>]
+    >(
       `DELETE FROM events
        WHERE user = $user AND source = 'cursor_local' AND messageType = 'assistant'
-         AND timestamp BETWEEN $min AND $max`,
+         AND timestamp BETWEEN $min AND $max
+       RETURNING ${rollDaySql("timestamp")} AS day`,
     );
     this.countStmt = this.db.prepare<{ c: number }, []>("SELECT COUNT(*) AS c FROM events");
     // Token-aggregation queries restrict to messageType='assistant': user
     // rows carry zero tokens and no model, and would inflate event/model
     // counts. User-vs-assistant counts come from the message-count queries.
-    this.userTotalsStmt = this.db.prepare<UserTotalsRow, [string, number, number]>(
+    //
+    // From here down every window-scoped aggregation reads events_roll_day
+    // (plus the two partial-day slivers) instead of events. The transform is
+    // mechanical — COUNT(*) becomes SUM(events), SUM(col) stays SUM(col),
+    // MAX(timestamp) becomes MAX(maxTimestamp) — and it is EXACT because
+    // every summed column is an INTEGER, so pre-adding them changes no
+    // float. The float pricing in main.ts runs unchanged on top, at the same
+    // granularity, in the same order.
+    this.userTotalsStmt = this.db.prepare<UserTotalsRow, [...RollWindowArgs, string]>(
       `SELECT user,
               COALESCE(SUM(inputTokens), 0)         AS totalInputTokens,
               COALESCE(SUM(outputTokens), 0)        AS totalOutputTokens,
               COALESCE(SUM(cacheCreationTokens), 0) AS totalCacheCreationTokens,
               COALESCE(SUM(cacheReadTokens), 0)     AS totalCacheReadTokens,
               COALESCE(SUM(reasoningTokens), 0)     AS totalReasoningTokens
-         FROM events
-        WHERE user = ? AND timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
+         FROM (${rollSource(null, `${USER_SCOPE_7} ${ASSISTANT_ONLY}`)})
         GROUP BY user`,
     );
-    this.userByModelStmt = this.db.prepare<ModelRow, [string, number, number]>(
+    // TIE ORDER, and why these two suffixes are what they are.
+    //
+    // A token-sum tie is not exotic: any two users whose in-window rows are
+    // all messageType='user' both total 0, and the 7d/30d pills produce
+    // those constantly. The old statements left the tie to the plan, and the
+    // plan is exactly what this change replaced (one index scan became a
+    // three-branch UNION ALL feeding a temp b-tree), so the emitted order
+    // moved with it. Measured on the 5,099,335-row prod-shaped fixture with
+    // nine tied users injected: `main` emits them ASCENDING, the rerouted
+    // statement emitted them DESCENDING — a real payload divergence on the
+    // same data, on /stats/admin's default view.
+    //
+    // So the tie keys below are not a preference, they are transcriptions of
+    // what prod emits today: `user ASC` for the two per-user sorts, and
+    // `model DESC` for the per-model one (both trees already agree there, at
+    // both fixture scales). They also matter beyond array order —
+    // /stats/leaderboard and /stats/admin accumulate `usd +=` over these
+    // rows in emission order, and float addition is not associative.
+    //
+    // Note `main`'s own order here is plan-dependent (the same nine users
+    // come out DESCENDING on a nine-row test DB and ASCENDING on the
+    // prod-shaped one), so byte-parity with `main` at every scale is not a
+    // thing that exists. Prod's order is the one the constraint protects,
+    // and it is now pinned rather than emergent. rollup.test.ts pins it.
+    this.userByModelStmt = this.db.prepare<ModelRow, [...RollWindowArgs, string]>(
       `SELECT model,
               COALESCE(SUM(inputTokens), 0)         AS input,
               COALESCE(SUM(outputTokens), 0)        AS output,
               COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreation,
               COALESCE(SUM(cacheReadTokens), 0)     AS cacheRead,
               COALESCE(SUM(reasoningTokens), 0)     AS reasoning,
-              COUNT(*)                              AS count,
-              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-         FROM events
-        WHERE user = ? AND timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
+              COALESCE(SUM(events), 0)              AS count,
+              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros
+         FROM (${rollSource(null, `${USER_SCOPE_7} ${ASSISTANT_ONLY}`)})
         GROUP BY model
-        ORDER BY (input + output + cacheCreation + cacheRead) DESC`,
+        ORDER BY (input + output + cacheCreation + cacheRead) DESC, model DESC`,
     );
-    this.leaderboardStmt = this.db.prepare<UserTotalsRow, [number, number]>(
+    this.leaderboardStmt = this.db.prepare<UserTotalsRow, RollWindowArgs>(
       `SELECT user,
               COALESCE(SUM(inputTokens), 0)         AS totalInputTokens,
               COALESCE(SUM(outputTokens), 0)        AS totalOutputTokens,
               COALESCE(SUM(cacheCreationTokens), 0) AS totalCacheCreationTokens,
               COALESCE(SUM(cacheReadTokens), 0)     AS totalCacheReadTokens,
               COALESCE(SUM(reasoningTokens), 0)     AS totalReasoningTokens
-         FROM events
-        WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
+         FROM (${rollSource(null, ASSISTANT_ONLY)})
         GROUP BY user
         ORDER BY (totalInputTokens + totalOutputTokens
-                  + totalCacheCreationTokens + totalCacheReadTokens) DESC`,
+                  + totalCacheCreationTokens + totalCacheReadTokens) DESC, user ASC`,
     );
     // Token sums + counts restricted to assistant rows via CASE in one
     // scan; lastEventAt spans both kinds ("last seen" = any activity).
@@ -1036,6 +1502,12 @@ export class Store {
     // One SELECT body, three scoped variants (base / company / category). The
     // LEFT JOINs carry company + the assigned category (id/name/color) per
     // row; an optional scope clause narrows to one company or one category.
+    // modelCount stays exact under pre-aggregation only because `model` is
+    // a KEY of the rollup, never summed away: COUNT(DISTINCT model) is not
+    // additively decomposable, so summing per-day distinct counts would
+    // over-count any model a user touched on more than one day.
+    // lastEventAt likewise needs MAX(maxTimestamp) — counts cannot rebuild
+    // it — and spans BOTH message kinds ("last seen" = any activity).
     const adminLeaderboardSql = (scope: string): string =>
       `SELECT user,
               COALESCE(SUM(CASE WHEN messageType='assistant' THEN inputTokens         ELSE 0 END), 0) AS totalInputTokens,
@@ -1043,71 +1515,74 @@ export class Store {
               COALESCE(SUM(CASE WHEN messageType='assistant' THEN cacheCreationTokens ELSE 0 END), 0) AS totalCacheCreationTokens,
               COALESCE(SUM(CASE WHEN messageType='assistant' THEN cacheReadTokens     ELSE 0 END), 0) AS totalCacheReadTokens,
               COALESCE(SUM(CASE WHEN messageType='assistant' THEN reasoningTokens     ELSE 0 END), 0) AS totalReasoningTokens,
-              SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END)                                AS eventCount,
-              SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END)                                AS userMessages,
-              SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END)                                AS assistantMessages,
-              COALESCE(MAX(timestamp), 0)                                                             AS lastEventAt,
+              SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END)                           AS eventCount,
+              SUM(CASE WHEN messageType='user'      THEN events ELSE 0 END)                           AS userMessages,
+              SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END)                           AS assistantMessages,
+              COALESCE(MAX(maxTimestamp), 0)                                                          AS lastEventAt,
               COUNT(DISTINCT CASE WHEN messageType='assistant' THEN model END)                        AS modelCount,
               us.company                                                                              AS company,
               us.category_id                                                                          AS categoryId,
               cat.name                                                                                AS categoryName,
               cat.color                                                                               AS categoryColor
-         FROM events
-         LEFT JOIN user_secrets us ON us.username = events.user
+         FROM (${rollSource(null, scope)}) AS src
+         LEFT JOIN user_secrets us ON us.username = src.user
          LEFT JOIN categories cat ON cat.id = us.category_id
-        WHERE timestamp >= ? AND timestamp < ? ${scope}
         GROUP BY user
         ORDER BY (totalInputTokens + totalOutputTokens
-                  + totalCacheCreationTokens + totalCacheReadTokens) DESC`;
-    this.adminLeaderboardStmt = this.db.prepare<LeaderboardAdminRow, [number, number]>(
+                  + totalCacheCreationTokens + totalCacheReadTokens) DESC, user ASC`;
+    this.adminLeaderboardStmt = this.db.prepare<LeaderboardAdminRow, RollWindowArgs>(
       adminLeaderboardSql(""),
     );
-    // Scoped variants: (since, until, company|categoryId) — the scope appends.
+    // Scoped variants: the six window params plus the scope value as ?7.
     this.adminLeaderboardForCompanyStmt = this.db.prepare<
       LeaderboardAdminRow,
-      [number, number, string]
-    >(adminLeaderboardSql(COMPANY_SCOPE));
+      [...RollWindowArgs, string]
+    >(adminLeaderboardSql(COMPANY_SCOPE_7));
     this.adminLeaderboardForCategoryStmt = this.db.prepare<
       LeaderboardAdminRow,
-      [number, number, number]
-    >(adminLeaderboardSql(CATEGORY_SCOPE));
+      [...RollWindowArgs, number]
+    >(adminLeaderboardSql(CATEGORY_SCOPE_7));
     // One pass over (user, model) groups feeds BOTH the admin leaderboard's
     // per-user cost and the byModel aggregate (summed across users in JS) —
     // replaces the former per-leaderboard-row userByModel N+1 plus a
     // separate adminByModel scan. Company/category scoping happens in JS by
     // intersecting with the scoped adminLeaderboard user set (equivalent:
     // any user with in-window events appears in that set).
-    this.adminUserModelStmt = this.db.prepare<UserModelAggRow, [number, number]>(
+    // ORDER BY user, model is explicit here (the old statement had none and
+    // relied on SQLite's GROUP BY temp b-tree emitting in group-key order).
+    // main.ts accumulates `usdByUser` and `modelAgg` in emission order with
+    // `+=` on floats, and float addition is not associative — so the order
+    // is part of the payload contract, and it should be written down rather
+    // than inherited from a plan that a future index could change.
+    this.adminUserModelStmt = this.db.prepare<UserModelAggRow, RollWindowArgs>(
       `SELECT user, model,
-              COUNT(*)                              AS count,
+              COALESCE(SUM(events), 0)              AS count,
               COALESCE(SUM(inputTokens), 0)         AS inputTokens,
               COALESCE(SUM(outputTokens), 0)        AS outputTokens,
               COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
               COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
               COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-         FROM events
-        WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
-        GROUP BY user, model`,
+              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros
+         FROM (${rollSource(null, ASSISTANT_ONLY)})
+        GROUP BY user, model
+        ORDER BY user ASC, model ASC`,
     );
     // Message-count queries — both kinds; no token sums.
-    this.userMessageCountsAllStmt = this.db.prepare<UserMessageCountsRow, [number, number]>(
+    this.userMessageCountsAllStmt = this.db.prepare<UserMessageCountsRow, RollWindowArgs>(
       `SELECT user,
-              SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-              SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-         FROM events
-        WHERE timestamp >= ? AND timestamp < ?
+              SUM(CASE WHEN messageType='user'      THEN events ELSE 0 END) AS userMessages,
+              SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END) AS assistantMessages
+         FROM (${rollSource(null)})
         GROUP BY user`,
     );
     this.userMessageCountsForUserStmt = this.db.prepare<
       UserMessageCountsRow,
-      [string, number, number]
+      [...RollWindowArgs, string]
     >(
       `SELECT user,
-              SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-              SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-         FROM events
-        WHERE user = ? AND timestamp >= ? AND timestamp < ?
+              SUM(CASE WHEN messageType='user'      THEN events ELSE 0 END) AS userMessages,
+              SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END) AS assistantMessages
+         FROM (${rollSource(null, USER_SCOPE_7)})
         GROUP BY user`,
     );
     this.adminRecentStmt = this.db.prepare<RecentEventRow, [number]>(
@@ -1481,215 +1956,111 @@ export class Store {
       "SELECT company FROM user_secrets WHERE username = ?",
     );
 
-    // strftime over 'unixepoch' is UTC — labels must not shift with the
-    // server's local timezone. Weeks are ISO 8601 (%G-W%V, Monday start):
-    // %W has a week-zero edge case and %U is Sunday-based.
-    const bucketExpr: Record<Bucket, string> = {
-      day: `strftime('%Y-%m-%d', timestamp/1000, 'unixepoch')`,
-      week: `strftime('%G-W%V',   timestamp/1000, 'unixepoch')`,
-      month: `strftime('%Y-%m',    timestamp/1000, 'unixepoch')`,
-    };
-
-    const mkByModel = (b: Bucket) =>
-      this.db.prepare<TimeseriesModelRow, [number, number]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                model,
-                COUNT(*)                              AS events,
-                COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-                COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-                COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-                COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-                COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-                COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
-          GROUP BY bucketKey, model
-          ORDER BY bucketKey ASC, model ASC`,
-      );
-    const mkByModelForUser = (b: Bucket) =>
-      this.db.prepare<TimeseriesModelRow, [string, number, number]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                model,
-                COUNT(*)                              AS events,
-                COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-                COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-                COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-                COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-                COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-                COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-           FROM events
-          WHERE user = ? AND timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
-          GROUP BY bucketKey, model
-          ORDER BY bucketKey ASC, model ASC`,
-      );
-    const mkByModelForCompany = (b: Bucket) =>
-      this.db.prepare<TimeseriesModelRow, [number, number, string]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                model,
-                COUNT(*)                              AS events,
-                COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-                COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-                COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-                COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-                COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-                COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant' ${COMPANY_SCOPE}
-          GROUP BY bucketKey, model
-          ORDER BY bucketKey ASC, model ASC`,
-      );
-    const mkByUser = (b: Bucket) =>
-      this.db.prepare<TimeseriesUserModelRow, [number, number]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                user,
-                model,
-                COUNT(*)                              AS events,
-                COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-                COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-                COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-                COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-                COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-                COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
-          GROUP BY bucketKey, user, model
-          ORDER BY bucketKey ASC, user ASC`,
-      );
-    const mkByUserForCompany = (b: Bucket) =>
-      this.db.prepare<TimeseriesUserModelRow, [number, number, string]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                user,
-                model,
-                COUNT(*)                              AS events,
-                COALESCE(SUM(inputTokens), 0)         AS inputTokens,
-                COALESCE(SUM(outputTokens), 0)        AS outputTokens,
-                COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
-                COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
-                COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-                COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant' ${COMPANY_SCOPE}
-          GROUP BY bucketKey, user, model
-          ORDER BY bucketKey ASC, user ASC`,
-      );
+    // Timeseries. All four shapes read the rollup; the bucket label comes
+    // from strftime over the floored day (rollSource), so day grain serves
+    // week and month too — a UTC day lies wholly inside one ISO week and
+    // one calendar month, which is exactly why one day-grain table is
+    // enough. This is also why `bucket=month`, previously the single
+    // slowest endpoint, is now no dearer than `bucket=day`: cost tracks
+    // rollup rows scanned, not events.
+    const byModelSql = (b: Bucket, scope: string) =>
+      `SELECT bucketKey,
+              model,
+              COALESCE(SUM(events), 0)              AS events,
+              COALESCE(SUM(inputTokens), 0)         AS inputTokens,
+              COALESCE(SUM(outputTokens), 0)        AS outputTokens,
+              COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
+              COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
+              COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
+              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros
+         FROM (${rollSource(b, `${scope} ${ASSISTANT_ONLY}`)})
+        GROUP BY bucketKey, model
+        ORDER BY bucketKey ASC, model ASC`;
+    // `ORDER BY ..., model ASC` is explicit here (the old statement stopped
+    // at `user`): main.ts sums costUsd per (bucket, user) with `+=` over
+    // this stream, so its float total depends on the emission order of the
+    // model rows inside each group. Inherited-from-the-plan is not a
+    // contract; written down is.
+    const byUserSql = (b: Bucket, scope: string) =>
+      `SELECT bucketKey,
+              user,
+              model,
+              COALESCE(SUM(events), 0)              AS events,
+              COALESCE(SUM(inputTokens), 0)         AS inputTokens,
+              COALESCE(SUM(outputTokens), 0)        AS outputTokens,
+              COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
+              COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
+              COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
+              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros
+         FROM (${rollSource(b, `${scope} ${ASSISTANT_ONLY}`)})
+        GROUP BY bucketKey, user, model
+        ORDER BY bucketKey ASC, user ASC, model ASC`;
     // Message-count timeseries (both kinds; no token sums).
-    const mkCountsByBucket = (b: Bucket) =>
-      this.db.prepare<TimeseriesBucketCountsRow, [number, number]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-                SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ?
-          GROUP BY bucketKey
-          ORDER BY bucketKey ASC`,
-      );
-    const mkCountsByBucketForUser = (b: Bucket) =>
-      this.db.prepare<TimeseriesBucketCountsRow, [string, number, number]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-                SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-           FROM events
-          WHERE user = ? AND timestamp >= ? AND timestamp < ?
-          GROUP BY bucketKey
-          ORDER BY bucketKey ASC`,
-      );
-    const mkCountsByBucketForCompany = (b: Bucket) =>
-      this.db.prepare<TimeseriesBucketCountsRow, [number, number, string]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-                SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ? ${COMPANY_SCOPE}
-          GROUP BY bucketKey
-          ORDER BY bucketKey ASC`,
-      );
-    const mkCountsByUser = (b: Bucket) =>
-      this.db.prepare<TimeseriesUserCountsRow, [number, number]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                user,
-                SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-                SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ?
-          GROUP BY bucketKey, user
-          ORDER BY bucketKey ASC, user ASC`,
-      );
-    const mkCountsByUserForCompany = (b: Bucket) =>
-      this.db.prepare<TimeseriesUserCountsRow, [number, number, string]>(
-        `SELECT ${bucketExpr[b]} AS bucketKey,
-                user,
-                SUM(CASE WHEN messageType='user'      THEN 1 ELSE 0 END) AS userMessages,
-                SUM(CASE WHEN messageType='assistant' THEN 1 ELSE 0 END) AS assistantMessages
-           FROM events
-          WHERE timestamp >= ? AND timestamp < ? ${COMPANY_SCOPE}
-          GROUP BY bucketKey, user
-          ORDER BY bucketKey ASC, user ASC`,
-      );
+    const countsByBucketSql = (b: Bucket, scope: string) =>
+      `SELECT bucketKey,
+              SUM(CASE WHEN messageType='user'      THEN events ELSE 0 END) AS userMessages,
+              SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END) AS assistantMessages
+         FROM (${rollSource(b, scope)})
+        GROUP BY bucketKey
+        ORDER BY bucketKey ASC`;
+    const countsByUserSql = (b: Bucket, scope: string) =>
+      `SELECT bucketKey,
+              user,
+              SUM(CASE WHEN messageType='user'      THEN events ELSE 0 END) AS userMessages,
+              SUM(CASE WHEN messageType='assistant' THEN events ELSE 0 END) AS assistantMessages
+         FROM (${rollSource(b, scope)})
+        GROUP BY bucketKey, user
+        ORDER BY bucketKey ASC, user ASC`;
 
-    this.tsByModelStmts = {
-      day: mkByModel("day"),
-      week: mkByModel("week"),
-      month: mkByModel("month"),
-    };
-    this.tsByModelForUserStmts = {
-      day: mkByModelForUser("day"),
-      week: mkByModelForUser("week"),
-      month: mkByModelForUser("month"),
-    };
-    this.tsByModelForCompanyStmts = {
-      day: mkByModelForCompany("day"),
-      week: mkByModelForCompany("week"),
-      month: mkByModelForCompany("month"),
-    };
-    this.tsByUserStmts = {
-      day: mkByUser("day"),
-      week: mkByUser("week"),
-      month: mkByUser("month"),
-    };
-    this.tsByUserForCompanyStmts = {
-      day: mkByUserForCompany("day"),
-      week: mkByUserForCompany("week"),
-      month: mkByUserForCompany("month"),
-    };
-    this.tsCountsByBucketStmts = {
-      day: mkCountsByBucket("day"),
-      week: mkCountsByBucket("week"),
-      month: mkCountsByBucket("month"),
-    };
-    this.tsCountsByBucketForUserStmts = {
-      day: mkCountsByBucketForUser("day"),
-      week: mkCountsByBucketForUser("week"),
-      month: mkCountsByBucketForUser("month"),
-    };
-    this.tsCountsByBucketForCompanyStmts = {
-      day: mkCountsByBucketForCompany("day"),
-      week: mkCountsByBucketForCompany("week"),
-      month: mkCountsByBucketForCompany("month"),
-    };
-    this.tsCountsByUserStmts = {
-      day: mkCountsByUser("day"),
-      week: mkCountsByUser("week"),
-      month: mkCountsByUser("month"),
-    };
-    this.tsCountsByUserForCompanyStmts = {
-      day: mkCountsByUserForCompany("day"),
-      week: mkCountsByUserForCompany("week"),
-      month: mkCountsByUserForCompany("month"),
-    };
+    const byBucket = <T>(mk: (b: Bucket) => T): Record<Bucket, T> => ({
+      day: mk("day"),
+      week: mk("week"),
+      month: mk("month"),
+    });
+    /** Unscoped variant: rollWindow()'s six params, nothing else. */
+    const plain = <R>(sql: (b: Bucket) => string) =>
+      byBucket((b) => this.db.prepare<R, RollWindowArgs>(sql(b)));
+    /** Scoped variant: the same six, plus the scope value as ?7. */
+    const scoped = <R>(sql: (b: Bucket) => string) =>
+      byBucket((b) => this.db.prepare<R, [...RollWindowArgs, string]>(sql(b)));
+
+    this.tsByModelStmts = plain<TimeseriesModelRow>((b) => byModelSql(b, ""));
+    this.tsByModelForUserStmts = scoped<TimeseriesModelRow>((b) => byModelSql(b, USER_SCOPE_7));
+    this.tsByModelForCompanyStmts = scoped<TimeseriesModelRow>((b) =>
+      byModelSql(b, COMPANY_SCOPE_7),
+    );
+    this.tsByUserStmts = plain<TimeseriesUserModelRow>((b) => byUserSql(b, ""));
+    this.tsByUserForCompanyStmts = scoped<TimeseriesUserModelRow>((b) =>
+      byUserSql(b, COMPANY_SCOPE_7),
+    );
+    this.tsCountsByBucketStmts = plain<TimeseriesBucketCountsRow>((b) => countsByBucketSql(b, ""));
+    this.tsCountsByBucketForUserStmts = scoped<TimeseriesBucketCountsRow>((b) =>
+      countsByBucketSql(b, USER_SCOPE_7),
+    );
+    this.tsCountsByBucketForCompanyStmts = scoped<TimeseriesBucketCountsRow>((b) =>
+      countsByBucketSql(b, COMPANY_SCOPE_7),
+    );
+    this.tsCountsByUserStmts = plain<TimeseriesUserCountsRow>((b) => countsByUserSql(b, ""));
+    this.tsCountsByUserForCompanyStmts = scoped<TimeseriesUserCountsRow>((b) =>
+      countsByUserSql(b, COMPANY_SCOPE_7),
+    );
 
     // Per-(user, model) aggregate for /api/v1/usage; same half-open
-    // contract as every other range query here.
-    this.apiUsageRangeStmt = this.db.prepare<ApiUsageRow, [number, number]>(
+    // contract as every other range query here. /api/v1 sorts users
+    // explicitly (localeCompare) so it does not depend on emission order,
+    // but the GROUP BY key order is pinned anyway for the same reason as
+    // adminUserModel: cost accumulates with float `+=`.
+    this.apiUsageRangeStmt = this.db.prepare<ApiUsageRow, RollWindowArgs>(
       `SELECT user, model,
               COALESCE(SUM(inputTokens), 0)         AS input,
               COALESCE(SUM(outputTokens), 0)        AS output,
               COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreation,
               COALESCE(SUM(cacheReadTokens), 0)     AS cacheRead,
               COALESCE(SUM(reasoningTokens), 0)     AS reasoning,
-              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
-         FROM events
-        WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
-        GROUP BY user, model`,
+              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros
+         FROM (${rollSource(null, ASSISTANT_ONLY)})
+        GROUP BY user, model
+        ORDER BY user ASC, model ASC`,
     );
 
     this.getMetaStmt = this.db.prepare<{ value: string }, [string]>(
@@ -1712,6 +2083,200 @@ export class Store {
    */
   private cachedCount: number | null = null;
 
+  /**
+   * Rebuild events_roll_day from scratch. O(rows) — the one operation here
+   * that is — but it runs at boot, off the request path: ~5s at 5M rows.
+   * Also the recovery path after a staged import or any out-of-band surgery
+   * on events.
+   *
+   * PEAK MEMORY is the thing to be careful about here, and it is why this is
+   * not one `INSERT ... SELECT ... GROUP BY`. That form sorts the whole
+   * events table, and the connection runs `temp_store = MEMORY`, so its peak
+   * RSS is O(rows): measured 478 MB at 5.1M rows and 864 MB at 10.2M —
+   * linear, doubling with the table. docs/self-hosting.md advertises
+   * 256-512 MB, and this runs in the CONSTRUCTOR, before the server listens,
+   * so an operator upgrading a 512 MB machine against an existing DB would
+   * be OOM-killed before /health ever answered, restart, find an empty
+   * rollup, rebuild, and OOM again — a deterministic crash loop that
+   * railway.json's restartPolicyMaxRetries:10 turns into a dead deploy.
+   *
+   * Two changes bound it, and they cover different worst cases, so both are
+   * here. Partitioning by user bounds each sort to one person's traffic
+   * rather than the whole table (exact: every row has exactly one user) —
+   * but it does nothing for the SOLO self-hoster, whose one user IS the
+   * whole table, and that is the shape docs/self-hosting.md is written for.
+   * `temp_store = FILE` for the duration covers that case by spilling the
+   * sorter to disk. Measured peak RSS, external sampler, mmap off:
+   *
+   *                                  5.1M rows   10.2M rows
+   *   one GROUP BY, temp MEMORY       478 MB       864 MB     (was: O(rows))
+   *   one GROUP BY, temp FILE         220 MB       220 MB     (solo worst case)
+   *   per-user + temp FILE            203 MB       220 MB     (shipped)
+   *
+   * — flat instead of doubling, and not slower: shipped vs the old one-shot
+   * form, 5.7s vs 5.6s at 5.1M rows and 12.0s vs 13.1s at 10.2M.
+   *
+   * If the temp directory is not writable the spill throws, and this runs in
+   * the constructor, so failing hard here would trade an OOM crash-loop for a
+   * boot crash-loop. Hence the retry in memory: worse peak on a pathological
+   * DB beats not starting.
+   */
+  rebuildRollup(): number {
+    const t0 = Date.now();
+    const run = () =>
+      this.db.transaction(() => {
+        this.db.exec("DELETE FROM events_roll_day; DELETE FROM events_roll_dirty;");
+        for (const { user } of this.rollDistinctUsersStmt.all()) {
+          this.rollRebuildUserStmt.run(user);
+        }
+      })();
+    try {
+      this.db.exec("PRAGMA temp_store = FILE;");
+      run();
+    } catch (err) {
+      console.warn(
+        `[tokenleader] events_roll_day rebuild could not spill to disk (${String(err)}) — retrying in memory`,
+      );
+      this.db.exec(`PRAGMA temp_store = ${TEMP_STORE};`);
+      run();
+    } finally {
+      this.db.exec(`PRAGMA temp_store = ${TEMP_STORE};`);
+    }
+    return Date.now() - t0;
+  }
+
+  /**
+   * Compare, PER USER, the RollAuditRow aggregates events_roll_day exists to
+   * pre-compute against the same aggregates over raw events. With `repair`,
+   * rebuilds on any mismatch and logs loudly — a silent rebuild hides the
+   * bug that caused it. Blocks the event loop for one covering-index scan,
+   * so it is boot-time and admin-triggered only, never scheduled.
+   *
+   * `force` skips the comparison and rebuilds unconditionally. That is the
+   * supported recovery for the divergences the comparison CANNOT see (see
+   * RollAuditRow): the rollup is authoritative with no read-time fallback,
+   * so an operator who knows they edited `events` needs a way to say so that
+   * does not depend on the audit agreeing with them.
+   */
+  auditRollup(opts: { repair: boolean; force?: boolean }): RollAudit {
+    if (opts.force) {
+      console.warn("[tokenleader] events_roll_day rebuild forced — rebuilding from events");
+      // No repairRollup() first: rebuildRollup empties the dirty queue too,
+      // so draining it would be recomputing cells about to be recomputed.
+      const rebuildMs = this.rebuildRollup();
+      console.warn(`[tokenleader] events_roll_day rebuilt in ${rebuildMs}ms`);
+      return {
+        ok: true,
+        rebuilt: true,
+        auditMs: 0,
+        rebuildMs,
+        users: this.rollAuditRollupStmt.all().length,
+        mismatched: [],
+      };
+    }
+    const t0 = Date.now();
+    // Drain pending repairs first: a dirty cell is a KNOWN divergence, and
+    // auditing through it would trigger a needless full rebuild.
+    this.repairRollup();
+    const ev = this.rollAuditEventsStmt.all();
+    const rl = this.rollAuditRollupStmt.all();
+    const byUser = new Map(rl.map((r) => [r.user, r]));
+    const mismatched: string[] = [];
+    for (const e of ev) {
+      const r = byUser.get(e.user);
+      byUser.delete(e.user);
+      if (
+        r === undefined ||
+        r.n !== e.n ||
+        r.i !== e.i ||
+        r.o !== e.o ||
+        r.cc !== e.cc ||
+        r.cr !== e.cr ||
+        r.rt !== e.rt ||
+        r.cost !== e.cost ||
+        r.dsum !== e.dsum ||
+        r.asst !== e.asst ||
+        r.mfp !== e.mfp
+      ) {
+        mismatched.push(e.user);
+      }
+    }
+    // Whatever is left has rollup rows but no events — also a divergence.
+    for (const user of byUser.keys()) mismatched.push(user);
+    mismatched.sort();
+    const auditMs = Date.now() - t0;
+
+    const ok = mismatched.length === 0;
+    let rebuildMs = 0;
+    if (!ok && opts.repair) {
+      // rl empty + ev non-empty is the expected first boot on a DB from
+      // before the rollup existed, not a bug — say so, so the loud version
+      // stays meaningful.
+      console.warn(
+        rl.length === 0
+          ? "[tokenleader] events_roll_day is empty — building it from events"
+          : `[tokenleader] events_roll_day disagrees with events for ${mismatched.length} user(s) ` +
+              `(${mismatched.slice(0, 5).join(", ")}${mismatched.length > 5 ? ", ..." : ""}) — rebuilding`,
+      );
+      rebuildMs = this.rebuildRollup();
+      console.warn(`[tokenleader] events_roll_day rebuilt in ${rebuildMs}ms`);
+    }
+    // Reported separately from the rebuild, because this scan is the last
+    // O(events) cost in the system and so doubles with the table the way
+    // ae88cca's gain did. A number in the boot log is what makes that
+    // visible before it becomes a problem. Thresholded so it stays silent on
+    // small installs (and in tests) but always prints at prod scale, where
+    // it measures ~1.8s at 5M rows.
+    if (auditMs >= 250 || rebuildMs > 0) {
+      console.log(`[tokenleader] events_roll_day audit ${auditMs}ms (${ev.length} users)`);
+    }
+    return { ok, rebuilt: !ok && opts.repair, auditMs, rebuildMs, users: ev.length, mismatched };
+  }
+
+  /**
+   * Drain events_roll_dirty: recompute each marked (user, day) cell from
+   * raw events. Deletes cannot be applied to the rollup as a delta —
+   * maxTimestamp is MAX(), which is not invertible from the deleted rows —
+   * so the delete side marks and this recomputes. Exact by definition, and
+   * bounded at one user-day per entry (~28ms for a user-day holding 34k
+   * events), which is why no worker thread is needed.
+   *
+   * WHO PAYS. The queue is drained at the end of insertMany, in the same
+   * transaction as the delete that filled it, so the daemon POST that caused
+   * the work is the request that absorbs it. It is drained again at the top
+   * of every rollup-backed read, but by then it is a no-op — that call is
+   * the structural backstop for a crash between the delete and the drain,
+   * not the normal path.
+   *
+   * That distinction is the whole point. The number of ENTRIES is not
+   * bounded: a Cursor cloud tick reconciles per user across the batch's
+   * whole [min, max] span, and a from-zero backfill accumulates
+   * maxPagesPerTick pages into ONE insertMany, so a single tick can dirty
+   * every day that user has ever used cursor_local. Draining that on the
+   * next read means an unauthenticated public GET /stats/* pays it —
+   * measured at 846-905ms on an 864k-row fixture with 3,200 cells queued,
+   * scaling with the affected user's history, in a WRITE transaction that
+   * blocks /health for everyone. That is a smaller copy of the exact problem
+   * this rollup exists to remove, so it belongs on the writer.
+   *
+   * The drain is never capped. An entry here means events_roll_day is WRONG
+   * for that cell, so a partial drain would serve knowingly-stale
+   * aggregates — worse than paying for the full recompute.
+   */
+  private repairRollup(): void {
+    if (this.rollListDirtyStmt.all().length === 0) return;
+    this.db.transaction(() => this.repairRollupInTx())();
+  }
+
+  /** repairRollup's body, for callers that already hold a transaction. */
+  private repairRollupInTx(): void {
+    for (const d of this.rollListDirtyStmt.all()) {
+      this.rollDropCellStmt.run(d.user, d.day);
+      this.rollRebuildCellStmt.run(d.user, d.day * DAY_MS, (d.day + 1) * DAY_MS);
+      this.rollClearDirtyStmt.run(d.user, d.day);
+    }
+  }
+
   insertMany(events: TokenEvent[]): { inserted: number; duplicates: number } {
     const now = Date.now();
     let inserted = 0;
@@ -1732,8 +2297,42 @@ export class Store {
         }
       }
       for (const [user, span] of reconcileSpans) {
-        this.deleteCursorLocalInSpanStmt.run({ $user: user, $min: span.min, $max: span.max });
+        // A DELETE hides inside the hot write path, and no delta can undo it
+        // (maxTimestamp is a MAX, which is not invertible from the rows that
+        // went). Queue the (user, day) cells it touched for recomputation
+        // instead; the next read drains the queue.
+        const dirtyDays = new Set<number>();
+        for (const row of this.deleteCursorLocalInSpanStmt.all({
+          $user: user,
+          $min: span.min,
+          $max: span.max,
+        })) {
+          dirtyDays.add(row.day);
+        }
+        for (const day of dirtyDays) this.rollMarkDirtyStmt.run(user, day);
       }
+      // Per-(day, user, model, messageType) deltas for this batch, flushed
+      // as one UPSERT per group after the insert loop — a 1000-row batch
+      // yields ~18 groups. Accumulated only for rows the INSERT actually
+      // took (res.changes > 0), so a re-posted batch adds nothing and
+      // dedup-exactness costs zero extra work.
+      const deltas = new Map<
+        string,
+        {
+          $day: number;
+          $user: string;
+          $model: string;
+          $messageType: string;
+          $events: number;
+          $inputTokens: number;
+          $outputTokens: number;
+          $cacheCreationTokens: number;
+          $cacheReadTokens: number;
+          $reasoningTokens: number;
+          $storedCostMicros: number;
+          $maxTimestamp: number;
+        }
+      >();
       for (const e of batch) {
         const res = this.insertStmt.run({
           $user: e.user,
@@ -1754,8 +2353,50 @@ export class Store {
           $costUsdMicros: e.costUsdMicros ?? null,
           $ingestedAt: now,
         });
-        if (res.changes > 0) inserted += 1;
+        if (res.changes > 0) {
+          inserted += 1;
+          // Keyed by the EVENT'S OWN day, never by arrival time — that is
+          // what makes backfills correct with no watermark and no cache
+          // invalidation: a row dated last September upserts last
+          // September's cell.
+          const day = rollDayOf(e.timestamp);
+          const messageType = e.messageType ?? "assistant";
+          // NUL-separated: user and model are free-form, and a printable
+          // delimiter could be forged to collide two distinct groups.
+          const key = `${day}\u0000${e.user}\u0000${e.model}\u0000${messageType}`;
+          let g = deltas.get(key);
+          if (g === undefined) {
+            g = {
+              $day: day,
+              $user: e.user,
+              $model: e.model,
+              $messageType: messageType,
+              $events: 0,
+              $inputTokens: 0,
+              $outputTokens: 0,
+              $cacheCreationTokens: 0,
+              $cacheReadTokens: 0,
+              $reasoningTokens: 0,
+              $storedCostMicros: 0,
+              $maxTimestamp: e.timestamp,
+            };
+            deltas.set(key, g);
+          }
+          g.$events += 1;
+          g.$inputTokens += e.inputTokens;
+          g.$outputTokens += e.outputTokens;
+          g.$cacheCreationTokens += e.cacheCreationTokens;
+          g.$cacheReadTokens += e.cacheReadTokens;
+          g.$reasoningTokens += e.reasoningTokens ?? 0;
+          g.$storedCostMicros += e.costUsdMicros ?? 0;
+          if (e.timestamp > g.$maxTimestamp) g.$maxTimestamp = e.timestamp;
+        }
       }
+      for (const g of deltas.values()) this.rollUpsertStmt.run(g);
+      // Pay for our own deletes. Empty (and free) unless the reconcile above
+      // dirtied cells; when it did, this is the ingest that caused them, not
+      // the next visitor to open the dashboard. See repairRollup.
+      this.repairRollupInTx();
     });
     tx(events);
     if (this.cachedCount !== null) this.cachedCount += inserted;
@@ -1769,16 +2410,33 @@ export class Store {
     return this.cachedCount;
   }
 
+  /**
+   * The six window parameters for a rollup-backed statement — and the one
+   * place the read side answers "did I remember to repair before reading?",
+   * structurally rather than per call site.
+   *
+   * The drain here is a BACKSTOP, not the normal path: insertMany drains the
+   * queue in the same transaction as the delete that filled it, so by the
+   * time a reader gets here the queue is empty except after a crash between
+   * those two points. Keeping the call means a reader can never observe a
+   * cell the queue says is wrong; moving the cost to the writer means a
+   * public GET never pays for a daemon's backfill. See repairRollup.
+   */
+  private rollArgs(sinceMs: number, untilMs: number): RollWindowArgs {
+    this.repairRollup();
+    return rollWindow(sinceMs, untilMs);
+  }
+
   userTotals(user: string, sinceMs: number, untilMs: number = MAX_TS_MS): UserTotalsRow | null {
-    return this.userTotalsStmt.get(user, sinceMs, untilMs);
+    return this.userTotalsStmt.get(...this.rollArgs(sinceMs, untilMs), user);
   }
 
   userByModel(user: string, sinceMs: number, untilMs: number = MAX_TS_MS): ModelRow[] {
-    return this.userByModelStmt.all(user, sinceMs, untilMs);
+    return this.userByModelStmt.all(...this.rollArgs(sinceMs, untilMs), user);
   }
 
   leaderboard(sinceMs: number, untilMs: number = MAX_TS_MS): UserTotalsRow[] {
-    return this.leaderboardStmt.all(sinceMs, untilMs);
+    return this.leaderboardStmt.all(...this.rollArgs(sinceMs, untilMs));
   }
 
   // category and company are mutually exclusive at the store layer: the UI
@@ -1791,19 +2449,22 @@ export class Store {
     categoryId?: number,
   ): LeaderboardAdminRow[] {
     if (categoryId !== undefined) {
-      return this.adminLeaderboardForCategoryStmt.all(sinceMs, untilMs, categoryId);
+      return this.adminLeaderboardForCategoryStmt.all(
+        ...this.rollArgs(sinceMs, untilMs),
+        categoryId,
+      );
     }
     if (company && company.length > 0) {
-      return this.adminLeaderboardForCompanyStmt.all(sinceMs, untilMs, company);
+      return this.adminLeaderboardForCompanyStmt.all(...this.rollArgs(sinceMs, untilMs), company);
     }
-    return this.adminLeaderboardStmt.all(sinceMs, untilMs);
+    return this.adminLeaderboardStmt.all(...this.rollArgs(sinceMs, untilMs));
   }
 
   /** Per-(user, model) aggregates over the window, assistant rows only.
    *  Unscoped by design — the admin route intersects with its (scoped)
    *  leaderboard user set in JS. */
   adminUserModel(sinceMs: number = 0, untilMs: number = MAX_TS_MS): UserModelAggRow[] {
-    return this.adminUserModelStmt.all(sinceMs, untilMs);
+    return this.adminUserModelStmt.all(...this.rollArgs(sinceMs, untilMs));
   }
 
   adminRecent(limit: number, company?: string, categoryId?: number): RecentEventRow[] {
@@ -1912,7 +2573,7 @@ export class Store {
   /** Per-user (userMessages, assistantMessages) counts in the window.
    *  No token sums — see `adminLeaderboard` / `userTotals`. */
   userMessageCounts(sinceMs: number = 0, untilMs: number = MAX_TS_MS): UserMessageCountsRow[] {
-    return this.userMessageCountsAllStmt.all(sinceMs, untilMs);
+    return this.userMessageCountsAllStmt.all(...this.rollArgs(sinceMs, untilMs));
   }
 
   /** Single-user message counts; returns zeros (not null) when the user
@@ -1922,7 +2583,7 @@ export class Store {
     sinceMs: number = 0,
     untilMs: number = MAX_TS_MS,
   ): { userMessages: number; assistantMessages: number } {
-    const row = this.userMessageCountsForUserStmt.get(user, sinceMs, untilMs);
+    const row = this.userMessageCountsForUserStmt.get(...this.rollArgs(sinceMs, untilMs), user);
     return {
       userMessages: row?.userMessages ?? 0,
       assistantMessages: row?.assistantMessages ?? 0,
@@ -1940,12 +2601,18 @@ export class Store {
     company?: string,
   ): TimeseriesBucketCountsRow[] {
     if (user && user.length > 0) {
-      return this.tsCountsByBucketForUserStmts[bucket].all(user, sinceMs, untilMs);
+      return this.tsCountsByBucketForUserStmts[bucket].all(
+        ...this.rollArgs(sinceMs, untilMs),
+        user,
+      );
     }
     if (company && company.length > 0) {
-      return this.tsCountsByBucketForCompanyStmts[bucket].all(sinceMs, untilMs, company);
+      return this.tsCountsByBucketForCompanyStmts[bucket].all(
+        ...this.rollArgs(sinceMs, untilMs),
+        company,
+      );
     }
-    return this.tsCountsByBucketStmts[bucket].all(sinceMs, untilMs);
+    return this.tsCountsByBucketStmts[bucket].all(...this.rollArgs(sinceMs, untilMs));
   }
 
   timeseriesCountsByUser(
@@ -1955,9 +2622,12 @@ export class Store {
     company?: string,
   ): TimeseriesUserCountsRow[] {
     if (company && company.length > 0) {
-      return this.tsCountsByUserForCompanyStmts[bucket].all(sinceMs, untilMs, company);
+      return this.tsCountsByUserForCompanyStmts[bucket].all(
+        ...this.rollArgs(sinceMs, untilMs),
+        company,
+      );
     }
-    return this.tsCountsByUserStmts[bucket].all(sinceMs, untilMs);
+    return this.tsCountsByUserStmts[bucket].all(...this.rollArgs(sinceMs, untilMs));
   }
 
   timeseriesByModel(
@@ -1968,12 +2638,12 @@ export class Store {
     company?: string,
   ): TimeseriesModelRow[] {
     if (user && user.length > 0) {
-      return this.tsByModelForUserStmts[bucket].all(user, sinceMs, untilMs);
+      return this.tsByModelForUserStmts[bucket].all(...this.rollArgs(sinceMs, untilMs), user);
     }
     if (company && company.length > 0) {
-      return this.tsByModelForCompanyStmts[bucket].all(sinceMs, untilMs, company);
+      return this.tsByModelForCompanyStmts[bucket].all(...this.rollArgs(sinceMs, untilMs), company);
     }
-    return this.tsByModelStmts[bucket].all(sinceMs, untilMs);
+    return this.tsByModelStmts[bucket].all(...this.rollArgs(sinceMs, untilMs));
   }
 
   timeseriesByUser(
@@ -1983,29 +2653,41 @@ export class Store {
     company?: string,
   ): TimeseriesUserModelRow[] {
     if (company && company.length > 0) {
-      return this.tsByUserForCompanyStmts[bucket].all(sinceMs, untilMs, company);
+      return this.tsByUserForCompanyStmts[bucket].all(...this.rollArgs(sinceMs, untilMs), company);
     }
-    return this.tsByUserStmts[bucket].all(sinceMs, untilMs);
+    return this.tsByUserStmts[bucket].all(...this.rollArgs(sinceMs, untilMs));
   }
 
   /** Per-(user, model) token sums over `[since, until)`, assistant rows
    *  only. Callers price each pair and aggregate to per-user totals. */
   apiUsageRange(sinceMs: number, untilMs: number): ApiUsageRow[] {
-    return this.apiUsageRangeStmt.all(sinceMs, untilMs);
+    return this.apiUsageRangeStmt.all(...this.rollArgs(sinceMs, untilMs));
   }
 
   /** Wipe the events table (keep user_secrets). Returns rows removed. */
   clearAllEvents(): number {
-    const r = this.db.prepare("DELETE FROM events").run();
+    // Truncating the rollup alongside is exact and cheaper than marking
+    // every cell dirty; same transaction, so a crash can't leave the
+    // rollup describing deleted events.
+    const tx = this.db.transaction(() => {
+      this.db.exec("DELETE FROM events_roll_day; DELETE FROM events_roll_dirty;");
+      return Number(this.db.prepare("DELETE FROM events").run().changes);
+    });
+    const removed = tx();
     this.cachedCount = null;
-    return Number(r.changes);
+    return removed;
   }
 
   /** Wipe events for one user. Returns rows removed. */
   clearUserEvents(user: string): number {
-    const r = this.db.prepare("DELETE FROM events WHERE user = ?").run(user);
+    const tx = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM events_roll_day WHERE user = ?").run(user);
+      this.db.prepare("DELETE FROM events_roll_dirty WHERE user = ?").run(user);
+      return Number(this.db.prepare("DELETE FROM events WHERE user = ?").run(user).changes);
+    });
+    const removed = tx();
     this.cachedCount = null;
-    return Number(r.changes);
+    return removed;
   }
 
   /** Remove the TOFU claim + every device row for a user (so the next
@@ -2031,7 +2713,13 @@ export class Store {
   clearFull(): void {
     this.cachedCount = null;
     this.db.exec(
-      "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices; DROP TABLE IF EXISTS categories; " +
+      // events_roll_day/events_roll_dirty go with events. This drop list is
+      // a curated contract with deliberate survivors (page_views,
+      // server_meta) — leaving the rollup out would let it survive the nuke
+      // and keep serving aggregates for deleted events. SCHEMA below
+      // recreates both.
+      "DROP TABLE IF EXISTS events_roll_day; DROP TABLE IF EXISTS events_roll_dirty; " +
+        "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices; DROP TABLE IF EXISTS categories; " +
         "DROP TABLE IF EXISTS checkin_history; DROP TABLE IF EXISTS device_checkin_state; DROP TABLE IF EXISTS diag_logs_v2; DROP TABLE IF EXISTS fleet_alerts; DROP TABLE IF EXISTS device_fleet_state; DROP TABLE IF EXISTS auth_failures;",
     );
     // page_views survives too: it holds no user data (no handle, no
