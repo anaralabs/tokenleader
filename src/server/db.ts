@@ -235,6 +235,37 @@ CREATE TABLE IF NOT EXISTS device_flag_state (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (device_id, flag)
 );
+
+-- Anonymous dashboard traffic: one row per HUMAN document load of '/' or
+-- '/admin'. Deliberately identity-FREE — no cookie, no visitor id, no IP,
+-- no user-agent — so there is nothing here to leak, correlate, or hand back
+-- under a subject-access request; ts and path are the whole record.
+-- Bot/unfurl loads (Slackbot, WhatsApp, scanners, python-requests) are
+-- classified in memory from the UA header, which is then DISCARDED, and are
+-- never inserted at all — a bot column would be a persisted claim we could
+-- never re-derive or correct once the UA is gone, and every consumer wants
+-- the human number anyway, so plain COUNT(*) is the answer.
+-- Written in buffered batches by PageViewRecorder (page-views.ts), NEVER
+-- inline on the request path: bun:sqlite is synchronous and shares the event
+-- loop, so a per-request INSERT would put fsync latency in front of every
+-- other in-flight request.
+-- Capped at PAGE_VIEWS_MAX rows (pruned once per flush, oldest first) for
+-- the same reason auth_failures is: this is the other table whose row count
+-- is driven by UNAUTHENTICATED internet traffic. TOKENLEADER_DASHBOARD_TOKEN
+-- is optional, so on a default self-host GET / is open to the world, and a
+-- scraper sending a browser UA would otherwise append rows without limit to
+-- the one file Litestream replicates on every write. Real traffic is ~40
+-- loads/day, so the cap is more than a decade of history and no operator
+-- will ever meet it; a flood meets it and stops there instead of taking the
+-- database (and the admin aggregate's scan time) with it.
+CREATE TABLE IF NOT EXISTS page_views (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts   INTEGER NOT NULL,
+  path TEXT NOT NULL
+);
+-- Every read is a [since, until) window, so the range predicate should not
+-- degrade into a full scan once the table has years in it.
+CREATE INDEX IF NOT EXISTS page_views_ts ON page_views (ts);
 `;
 
 /**
@@ -623,6 +654,25 @@ export interface AuthFailureRow {
   ts: number;
 }
 
+/** One buffered document load on its way to `page_views`. Carries no
+ *  viewer identity by construction — there is nowhere to put one. */
+export interface PageViewRow {
+  ts: number;
+  path: string;
+}
+
+/** Page views per UTC day, ascending ("YYYY-MM-DD"). */
+export interface PageViewDayRow {
+  day: string;
+  views: number;
+}
+
+/** Page views per path, busiest first. */
+export interface PageViewPathRow {
+  path: string;
+  views: number;
+}
+
 // A directive older than this is stale — the machine it targeted was
 // offline the whole window, so silently running it days later would be a
 // surprise, not a recovery. Undelivered + expired rows are simply skipped.
@@ -637,6 +687,14 @@ const CHECKIN_HISTORY_PER_DEVICE = 500;
 /** auth_failures cap, global (prune-on-insert). Forensics, not analytics —
  *  the recent trace is what matters. */
 const AUTH_FAILURES_MAX = 1000;
+
+/** page_views cap, global (pruned once per FLUSH, not per row — the flush is
+ *  already the one transaction, so the cap is free). ~200k rows is ~7 MB with
+ *  the ts index and, at the ~40 loads/day this table actually sees, more than
+ *  a decade of history; it exists only so an open instance being crawled
+ *  cannot grow the replicated DB without bound. Oldest rows go first, which
+ *  is also the right trade under a flood: recent counts stay truthful. */
+export const PAGE_VIEWS_MAX = 200_000;
 
 /** Actions an operator may enqueue. Enforced at the /admin route AND
  *  re-checked by each executor's own allowlist before running: the daemon
@@ -800,6 +858,11 @@ export class Store {
   private readonly pruneAuthFailuresStmt: Statement;
   private readonly listAuthFailuresStmt: Statement<AuthFailureRow, [number]>;
   private readonly listAuthFailuresForUserStmt: Statement<AuthFailureRow, [string, number]>;
+  private readonly insertPageViewStmt: Statement;
+  private readonly prunePageViewsStmt: Statement;
+  private readonly countPageViewsStmt: Statement<{ views: number }, [number, number]>;
+  private readonly pageViewsByDayStmt: Statement<PageViewDayRow, [number, number]>;
+  private readonly pageViewsByPathStmt: Statement<PageViewPathRow, [number, number]>;
   private readonly lastFleetAlertStmt: Statement<{ alerted_at: number }, [number, string]>;
   private readonly insertFleetAlertStmt: Statement;
   private readonly getDeviceFleetStateStmt: Statement<{ state: string; since: number }, [number]>;
@@ -1341,6 +1404,40 @@ export class Store {
         WHERE username = ?
         ORDER BY id DESC
         LIMIT ?`,
+    );
+    this.insertPageViewStmt = this.db.prepare(
+      "INSERT INTO page_views (ts, path) VALUES ($ts, $path)",
+    );
+    // Same job as pruneAuthFailuresStmt, different shape on purpose: at a
+    // 200k cap the `id NOT IN (SELECT … LIMIT $keep)` form would materialize
+    // 200k ids on every flush. This walks the PK index backwards to the
+    // cap'th row and deletes everything at or below it — the cost is one
+    // index seek when the table is under cap (i.e. always, in practice),
+    // and the subquery yields NULL then, so nothing matches and nothing is
+    // deleted. AUTOINCREMENT guarantees id order == insertion order.
+    this.prunePageViewsStmt = this.db.prepare(
+      `DELETE FROM page_views
+        WHERE id <= (SELECT id FROM page_views ORDER BY id DESC LIMIT 1 OFFSET $keep)`,
+    );
+    this.countPageViewsStmt = this.db.prepare(
+      "SELECT COUNT(*) AS views FROM page_views WHERE ts >= ? AND ts < ?",
+    );
+    // strftime over 'unixepoch' is UTC, matching the events timeseries
+    // buckets below — a day label must not shift with the server's local
+    // timezone.
+    this.pageViewsByDayStmt = this.db.prepare(
+      `SELECT strftime('%Y-%m-%d', ts/1000, 'unixepoch') AS day, COUNT(*) AS views
+         FROM page_views
+        WHERE ts >= ? AND ts < ?
+        GROUP BY day
+        ORDER BY day ASC`,
+    );
+    this.pageViewsByPathStmt = this.db.prepare(
+      `SELECT path, COUNT(*) AS views
+         FROM page_views
+        WHERE ts >= ? AND ts < ?
+        GROUP BY path
+        ORDER BY views DESC, path ASC`,
     );
     this.lastFleetAlertStmt = this.db.prepare(
       `SELECT alerted_at FROM fleet_alerts
@@ -1937,6 +2034,12 @@ export class Store {
       "DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS user_secrets; DROP TABLE IF EXISTS daemon_status; DROP TABLE IF EXISTS user_devices; DROP TABLE IF EXISTS categories; " +
         "DROP TABLE IF EXISTS checkin_history; DROP TABLE IF EXISTS device_checkin_state; DROP TABLE IF EXISTS diag_logs_v2; DROP TABLE IF EXISTS fleet_alerts; DROP TABLE IF EXISTS device_fleet_state; DROP TABLE IF EXISTS auth_failures;",
     );
+    // page_views survives too: it holds no user data (no handle, no
+    // identity of any kind), so wiping the leaderboard is not a reason to
+    // lose the operator's traffic history. It cannot grow without bound
+    // either — PAGE_VIEWS_MAX prunes it on every flush — so sparing it here
+    // costs nothing. Drop the table by hand if you really want it gone.
+    //
     // server_meta survives (other keys may be unrelated state), but the
     // cursor watermark must go or cleared Cursor history never re-imports.
     this.deleteMeta(CURSOR_WATERMARK_META_KEY);
@@ -2400,6 +2503,40 @@ export class Store {
     return user === null
       ? this.listAuthFailuresStmt.all(limit)
       : this.listAuthFailuresForUserStmt.all(user, limit);
+  }
+
+  /** Insert a batch of anonymous page views in ONE transaction — the flush
+   *  side of PageViewRecorder's buffer. One transaction per flush (not per
+   *  row) keeps the event-loop stall to a single fsync no matter how many
+   *  loads accumulated, and the PAGE_VIEWS_MAX prune rides inside the same
+   *  transaction so the cap costs no extra commit. Returns rows written. */
+  recordPageViews(rows: readonly PageViewRow[]): number {
+    if (rows.length === 0) return 0;
+    const tx = this.db.transaction((batch: readonly PageViewRow[]) => {
+      for (const r of batch) {
+        this.insertPageViewStmt.run({ $ts: r.ts, $path: r.path });
+      }
+      this.prunePageViewsStmt.run({ $keep: PAGE_VIEWS_MAX });
+    });
+    tx(rows);
+    return rows.length;
+  }
+
+  /** Human page views in `[since, until)`. Bots never made it into the
+   *  table, so this needs no filter. */
+  countPageViews(since: number, until: number): number {
+    return this.countPageViewsStmt.get(since, until)?.views ?? 0;
+  }
+
+  /** Page views per UTC day in `[since, until)`, oldest first. Days with
+   *  zero loads are absent (no gap filling — callers render what happened). */
+  pageViewsByDay(since: number, until: number): PageViewDayRow[] {
+    return this.pageViewsByDayStmt.all(since, until);
+  }
+
+  /** Page views per path in `[since, until)`, busiest first. */
+  pageViewsByPath(since: number, until: number): PageViewPathRow[] {
+    return this.pageViewsByPathStmt.all(since, until);
   }
 
   /** When was this (device, state) last alerted? null = never. */

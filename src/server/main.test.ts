@@ -1,6 +1,6 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createTestApp, jsonOf, makeTmpDirSync, makeTokenEvent } from "../test-helpers.ts";
@@ -3719,5 +3719,208 @@ describe("POST /admin/mark-uninstalled", () => {
   test("unknown user 404; missing bearer 401", async () => {
     expect((await mark("nobody-at-all")).status).toBe(404);
     expect((await mark("uma", false)).status).toBe(401);
+  });
+});
+
+// --- anonymous page views ---------------------------------------------------
+// The whole feature has NO identity in it: no cookie, no visitor id, no IP,
+// no stored user-agent. These tests pin the things that could quietly
+// regress — the seam counts real document loads, bots never enter the table,
+// only the pathname is stored (never the `?token=` query string), and nothing
+// is written on the request path itself.
+describe("anonymous page views (/admin/page-views)", () => {
+  const ADMIN = "page-views-admin";
+  const BROWSER_UA =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+  let built: ReturnType<typeof createTestApp>;
+  let webDir: { dir: string; cleanup: () => void };
+
+  beforeAll(() => {
+    // A real (stub) SPA build: production serves index.html for BOTH / and
+    // /admin, which is the only shape where the two paths are separate 200s.
+    webDir = makeTmpDirSync("page-views-web-");
+    writeFileSync(join(webDir.dir, "index.html"), "<!doctype html><title>tokenleader</title>");
+  });
+
+  afterAll(() => {
+    webDir.cleanup();
+  });
+
+  // A FRESH app (and DB) per test. These assertions are absolute counts, so
+  // sharing one app would make every test depend on how many loads the tests
+  // above it happened to issue — inserting a case in the middle would then
+  // "break" three unrelated ones.
+  beforeEach(() => {
+    built = createTestApp({ adminToken: ADMIN, webDistDir: webDir.dir });
+  });
+
+  afterEach(async () => {
+    await built.cleanup();
+  });
+
+  const load = (path: string, ua?: string) =>
+    built.app.request(new Request(`http://x${path}`, { headers: ua ? { "user-agent": ua } : {} }));
+
+  interface PageViewsBody {
+    enabled: boolean;
+    totalViews: number;
+    byDay: Array<{ day: string; views: number }>;
+    byPath: Array<{ path: string; views: number }>;
+  }
+
+  const views = async (qs = "", auth = true): Promise<Response> =>
+    built.app.request(
+      new Request(`http://x/admin/page-views${qs}`, {
+        headers: auth ? { authorization: `Bearer ${ADMIN}` } : {},
+      }),
+    );
+
+  const viewsBody = async (qs = ""): Promise<PageViewsBody> =>
+    jsonOf<PageViewsBody>(await views(qs));
+
+  test("a load buffers in memory and only reaches SQLite on a flush", async () => {
+    // The load-bearing property: bun:sqlite is synchronous, so the request
+    // path must not insert. The admin read flushes, which is what makes the
+    // row visible here.
+    expect((await load("/", BROWSER_UA)).status).toBe(200);
+    expect(built.pageViewRecorder?.pending()).toBe(1);
+    expect(built.store.countPageViews(0, Number.MAX_SAFE_INTEGER)).toBe(0);
+
+    expect((await viewsBody()).totalViews).toBe(1);
+    expect(built.pageViewRecorder?.pending()).toBe(0);
+    expect(built.store.countPageViews(0, Number.MAX_SAFE_INTEGER)).toBe(1);
+  });
+
+  test("counts / and /admin separately, one row per document load", async () => {
+    await load("/", BROWSER_UA);
+    await load("/", BROWSER_UA);
+    await load("/admin", BROWSER_UA);
+    const body = await viewsBody();
+    expect(body.enabled).toBe(true);
+    expect(body.totalViews).toBe(3);
+    expect(body.byPath).toEqual([
+      { path: "/", views: 2 },
+      { path: "/admin", views: 1 },
+    ]);
+    // Everything landed in today's UTC bucket.
+    expect(body.byDay).toEqual([{ day: new Date().toISOString().slice(0, 10), views: 3 }]);
+  });
+
+  test("only the PATHNAME is stored — a query string never reaches the table", async () => {
+    // The dashboard's one-shot `?token=` auth rides in the query string. If
+    // this seam ever switched from c.req.path to the full URL, the secret
+    // would land in plaintext in the Litestream-replicated DB.
+    await load("/?token=super-secret&utm_source=slack", BROWSER_UA);
+    const body = await viewsBody();
+    expect(body.byPath).toEqual([{ path: "/", views: 1 }]);
+    expect(JSON.stringify(body)).not.toContain("super-secret");
+  });
+
+  test("bots, unfurls and UA-less scripts are excluded", async () => {
+    await load("/", BROWSER_UA); // one real person, for contrast
+    await load("/", "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)");
+    await load("/", "python-requests/2.31.0");
+    await load("/"); // no user-agent at all
+    expect((await viewsBody()).totalViews).toBe(1);
+  });
+
+  test("range params scope the aggregate", async () => {
+    await load("/", BROWSER_UA);
+    await load("/admin", BROWSER_UA);
+    const future = Date.now() + 60_000;
+    expect((await viewsBody(`?since=${future}`)).totalViews).toBe(0);
+    expect((await viewsBody("?range=1d")).totalViews).toBe(2);
+  });
+
+  test("the read endpoint is admin-gated", async () => {
+    expect((await views("", false)).status).toBe(401);
+    const wrong = await built.app.request(
+      new Request("http://x/admin/page-views", { headers: { authorization: "Bearer nope" } }),
+    );
+    expect(wrong.status).toBe(403);
+
+    // No admin token configured → the route opts out rather than failing open.
+    const open = createTestApp();
+    try {
+      const res = await open.app.request(new Request("http://x/admin/page-views"));
+      expect(res.status).toBe(503);
+    } finally {
+      await open.cleanup();
+    }
+  });
+
+  test("TOKENLEADER_PAGE_VIEWS=0 (pageViews: false) collects nothing", async () => {
+    const off = createTestApp({ adminToken: ADMIN, pageViews: false, webDistDir: webDir.dir });
+    try {
+      expect(off.pageViewRecorder).toBeNull();
+      expect(
+        (
+          await off.app.request(
+            new Request("http://x/", {
+              headers: { "user-agent": BROWSER_UA },
+            }),
+          )
+        ).status,
+      ).toBe(200);
+      const body = await jsonOf<PageViewsBody>(
+        await off.app.request(
+          new Request("http://x/admin/page-views", {
+            headers: { authorization: `Bearer ${ADMIN}` },
+          }),
+        ),
+      );
+      expect(body.enabled).toBe(false);
+      expect(body.totalViews).toBe(0);
+    } finally {
+      await off.cleanup();
+    }
+  });
+
+  test("a visitor who never gets past the dashboard token is not a view", async () => {
+    const gated = createTestApp({
+      adminToken: ADMIN,
+      dashboardToken: "dash-secret",
+      webDistDir: webDir.dir,
+    });
+    try {
+      const res = await gated.app.request(
+        new Request("http://x/", { headers: { "user-agent": BROWSER_UA, accept: "text/html" } }),
+      );
+      expect(res.status).toBe(302); // /login, not the dashboard
+      expect(gated.pageViewRecorder?.pending()).toBe(0);
+    } finally {
+      await gated.cleanup();
+    }
+  });
+
+  test("a mid-redeploy load with no index.html is not a view", async () => {
+    // The vanished-index fallback streams a Bun.file handle wrapped in a
+    // hardcoded status 200, even though the client receives a 404 body — so
+    // the seam must key off "did it render", not off the status, or a
+    // redeploy window would mint rows for loads that showed nothing.
+    const gone = makeTmpDirSync("page-views-gone-");
+    const indexPath = join(gone.dir, "index.html");
+    writeFileSync(indexPath, "<!doctype html>");
+    const app = createTestApp({ adminToken: ADMIN, webDistDir: gone.dir });
+    try {
+      rmSync(indexPath);
+      await app.app.request(new Request("http://x/", { headers: { "user-agent": BROWSER_UA } }));
+      expect(app.pageViewRecorder?.pending()).toBe(0);
+    } finally {
+      await app.cleanup();
+      gone.cleanup();
+    }
+  });
+
+  test("stop() flushes the buffer on graceful shutdown", async () => {
+    const built2 = createTestApp({ adminToken: ADMIN, webDistDir: webDir.dir });
+    try {
+      await built2.app.request(new Request("http://x/", { headers: { "user-agent": BROWSER_UA } }));
+      expect(built2.store.countPageViews(0, Number.MAX_SAFE_INTEGER)).toBe(0);
+      await built2.stop();
+      expect(built2.store.countPageViews(0, Number.MAX_SAFE_INTEGER)).toBe(1);
+    } finally {
+      await built2.cleanup();
+    }
   });
 });

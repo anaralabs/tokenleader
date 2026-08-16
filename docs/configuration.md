@@ -52,6 +52,73 @@ plus page `<title>` / `og:title` (`tokenleader · <team>`).
 | `TOKENLEADER_ADMIN_TOKEN` | unset = admin routes disabled | Gates the destructive `POST /admin/clear` route (timing-safe bearer compare). Unset → the route returns `503` — admin is opted out, it does not fail open. |
 | `TOKENLEADER_JOIN_TOKEN` | unset = open TOFU | Join code for **new** leaderboard names: when set, the first `/ingest` claim of an unclaimed username must present it (`X-Tokenleader-Join`, supplied via the installer's `--join` flag) or it is rejected with `403 join_required`. Already-claimed users are untouched — their TOFU secret rules. Unset is fine on a LAN/tailnet; set it on the public internet. |
 
+### Page views
+
+Anonymous server-side traffic counting, **on by default**. Every human
+document load of `/` or `/admin` appends one row to the `page_views` table.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `TOKENLEADER_PAGE_VIEWS` | `1` (on) | Count anonymous dashboard page views. Same on/off grammar as `TOKENLEADER_CLAUDE_COWORK`: unset, empty, or `1`/`true`/`yes`/`on` keeps counting; **any other value** (`0`, `false`, `off`, `no`, `disabled`, …) disables collection entirely. The opt-out fails closed on purpose — if you typed something meaning "stop", it stops. |
+
+**What is stored:** `{timestamp, path}`. That is the whole row. No cookie —
+not even an anonymous UUID — no visitor id, no session, no IP address, no
+stored user-agent. Two loads by one person are indistinguishable from one
+load by two people, which is why the default is on: there is no privacy
+posture for an operator to opt into.
+
+The `User-Agent` header **is** read, in memory, for exactly one decision:
+bots and link unfurls (Slackbot, WhatsApp, scanners, `python-requests`,
+agentic fetchers — around 5% of real traffic) are not people, so they are
+dropped and never written. The header itself is then discarded. Because bots
+never enter the table, a plain `COUNT(*)` is already the human number.
+
+Views are buffered in memory and flushed once a minute in a single
+transaction (and on graceful shutdown) — `bun:sqlite` is synchronous and
+shares the event loop, so an insert on the request path would put an fsync
+in front of every other in-flight request. A hard `kill -9` loses at most a
+minute of counts; that trade is deliberate.
+
+Requests that never reach the dashboard are never counted: with
+`TOKENLEADER_DASHBOARD_TOKEN` set, an unauthenticated visitor gets the
+`/login` form, not a view.
+
+**Reading it back** (there is no UI):
+
+```bash
+curl -H "Authorization: Bearer $TOKENLEADER_ADMIN_TOKEN" \
+  "https://leaderboard.example.com/admin/page-views?range=30d"
+```
+
+```json
+{
+  "enabled": true,
+  "since": 1754000000000,
+  "until": 9007199254740991,
+  "totalViews": 1183,
+  "byDay": [{ "day": "2026-08-12", "views": 41 }],
+  "byPath": [{ "path": "/", "views": 902 }, { "path": "/admin", "views": 281 }]
+}
+```
+
+Range params are the same grammar as `/stats`: `range=<N>d` (rolling window,
+N in 1..366) or explicit `since`/`until` in unix-ms; unset means all history.
+Days with zero loads are omitted rather than zero-filled. The route requires
+`TOKENLEADER_ADMIN_TOKEN` (unset → `503`, like every other admin route).
+
+The table is capped at 200,000 rows, oldest pruned first as part of each
+flush. Real traffic is a few tens of loads a day, so that is over a decade of
+history and you will never meet the cap — it exists because
+`TOKENLEADER_DASHBOARD_TOKEN` is optional, so on an open instance `GET /` is
+reachable by anyone, and a crawler must not be able to grow the
+Litestream-replicated database without bound. Under a flood the newest counts
+survive and the oldest are dropped.
+
+`page_views` deliberately survives `POST /admin/clear` with `scope: "full"`:
+it contains no user data, and wiping the leaderboard is not a reason to lose
+traffic history. To discard it anyway, drop the table by hand — it is
+recreated empty on the next boot.
+
 ### Daemon binary mirror
 
 Pulls daemon binaries + `manifest.json` from a GitHub release and serves them

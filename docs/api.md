@@ -125,3 +125,4 @@ Daemons and the rendered scripts are the only intended clients:
 | `GET /install`, `GET /uninstall` | rendered bash scripts, parameterized by the server's URL and join posture |
 | `GET /login`, `POST /login` | dashboard cookie auth (only when a dashboard token is set) |
 | `POST /admin/clear` | destructive maintenance, admin bearer only — see [self-hosting.md](self-hosting.md#operations) |
+| `GET /admin/page-views` | anonymous dashboard traffic aggregate (`totalViews`, `byDay`, `byPath`; same `range`/`since`/`until` grammar as `/stats`), admin bearer only — see [configuration.md](configuration.md#page-views) |

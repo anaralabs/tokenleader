@@ -42,6 +42,11 @@ export interface ServerConfig {
    *  at ingest. Operator lever for typo'd self-reported affiliations
    *  ("sync.labs" → "sync.so") without touching teammate machines. */
   companyAliases?: Readonly<Record<string, string>>;
+  /** Count anonymous dashboard page views. Default ON — the stored row is
+   *  `{ts, path}` with no cookie, no visitor id, no IP and no user-agent,
+   *  so there is no privacy posture for an operator to opt into. Opt out
+   *  with TOKENLEADER_PAGE_VIEWS=0. */
+  pageViews: boolean;
 }
 
 export interface ConfigLogger {
@@ -66,6 +71,22 @@ function clampInt(name: string, n: number, lo: number, hi: number, log: ConfigLo
 function nonEmpty(raw: string | undefined): string | undefined {
   const v = raw?.trim();
   return v && v.length > 0 ? v : undefined;
+}
+
+/**
+ * Default-ON boolean knob, with the SAME semantics as the daemon's
+ * `isEnabledByDefault` (src/parser/index.ts) that already backs
+ * TOKENLEADER_CURSOR_LOCAL and TOKENLEADER_CLAUDE_COWORK: unset/empty → on,
+ * otherwise an allow-list of on-words and everything else is off.
+ *
+ * Deliberately an allow-list, not a deny-list of off-words: an operator who
+ * writes `=disabled` or `=none` to stop a collector must actually stop it.
+ * A knob whose whole job is to turn collection off has to fail closed.
+ */
+function parseBoolOn(raw: string | undefined): boolean {
+  const v = nonEmpty(raw)?.toLowerCase();
+  if (v === undefined) return true;
+  return v === "1" || v === "true" || v === "yes" || v === "on";
 }
 
 /**
@@ -207,6 +228,7 @@ export function parseServerConfig(
     binaryCacheDir,
     mirrorIntervalSec,
     cursorIntervalSec,
+    pageViews: parseBoolOn(env.TOKENLEADER_PAGE_VIEWS),
   };
   if (serverUrl !== undefined) cfg.serverUrl = serverUrl;
   if (teamName !== undefined) cfg.teamName = teamName;
@@ -290,5 +312,8 @@ export function echoConfig(cfg: ServerConfig): void {
   );
   console.log(
     `[tokenleader] adminToken=${cfg.adminToken ? "from-env" : "unset (/admin/clear disabled)"}`,
+  );
+  console.log(
+    `[tokenleader] pageViews=${cfg.pageViews ? "on (anonymous: ts + path only)" : "off"}`,
   );
 }
