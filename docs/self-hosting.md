@@ -6,7 +6,10 @@ One stateful container (or process): Bun + Hono + a single SQLite file in WAL
 mode. Three in-process loops — daemon-binary mirror (15 min), optional Cursor
 mirror (15 min), daily pricing refresh. No external database, queue, or cache.
 
-- **Resources:** 256–512 MB RAM; CPU is negligible.
+- **Resources:** 256–512 MB RAM; CPU is negligible. 512 MB if you are
+  importing an existing multi-million-row DB: the one-time dashboard-rollup
+  build at first boot peaks around 200–220 MB on top of the runtime (it is
+  chunked per user, so that figure stays put as the table grows).
 - **Disk:** give the data dir ≥1 GB. Mirrored daemon binaries are the bulk
   (~120–240 MB per cached release plus transient space during swaps); the DB
   grows slowly — token counts, not content.
@@ -152,6 +155,47 @@ checkpoint state.
 - **Restart:** `docker compose restart tokenleader` / redeploy on Railway/Fly.
   In-flight requests drain for up to 8 s on SIGTERM; daemons buffer and retry,
   so brief restarts lose nothing.
+- **First boot after upgrading past the dashboard rollup** pays a one-time
+  rebuild of the `events_roll_day` aggregate — measured ~5.5 s at 5M events
+  and ~12 s at 10M, logged as `events_roll_day rebuilt in Nms`, and peaking
+  around 200–220 MB of RAM at both sizes (it is built one user at a time
+  precisely so that figure does not grow with the table). It happens before
+  the server starts listening. Railway's shipped `healthcheckTimeout: 300`
+  covers it; on Fly the check's `grace_period` is what matters, and the
+  shipped `fly.toml` sets it to 120 s for this reason.
+
+  A Litestream restore needs **no** rebuild: `events_roll_day` and
+  `events_roll_dirty` are tables inside `tokenleader.sqlite`, the single file
+  Litestream replicates, and they are committed in the same transaction as
+  the events they summarise — so a restore lands a consistent aggregate and
+  boots at normal speed. That is the payoff for keeping the aggregate in the
+  main DB rather than a second file. A staged import is the case that does
+  rebuild.
+- **The dashboard is showing numbers that do not match the `events` table.**
+  `events_roll_day` is authoritative — the stats routes read it and never
+  fall back to scanning `events` — so anything that changes `events` out of
+  band (hand-run SQL, `scripts/clear-db.sh`) must invalidate it too.
+  `scripts/clear-db.sh` now does, but a server that was already running when
+  you ran it still needs a restart.
+
+  Every boot audits the aggregate against the raw events and rebuilds on any
+  mismatch, and `POST /admin/rollup-audit` (admin bearer) runs that same
+  check on demand. Know what it does and does not catch: it compares per-user
+  totals plus a day-sum, an assistant-row count, and a fingerprint of the
+  model strings, so it catches user renames and merges, timestamp
+  corrections, `messageType` changes and realistic model-id renames — but it
+  is a fingerprint, not a proof, and a sufficiently exotic edit can slip
+  through. When you know the aggregate is wrong, do not argue with the audit:
+
+  ```sh
+  curl -X POST -H "Authorization: Bearer $TOKENLEADER_ADMIN_TOKEN" \
+       -H 'content-type: application/json' -d '{"rebuild":true}' \
+       https://<host>/admin/rollup-audit
+  ```
+
+  That skips the comparison and rebuilds unconditionally. Both calls block
+  the event loop for every other request (SQLite is synchronous here): the
+  audit scan is ~1.8 s at 5M events, the rebuild ~5.5 s.
 - **`/manifest.json` returns 503:** either the mirror isn't configured
   (`TOKENLEADER_GH_REPO` + `TOKENLEADER_GH_TOKEN` unset — the boot log warns)
   or the first mirror tick hasn't completed yet. Daemons retry on their next
