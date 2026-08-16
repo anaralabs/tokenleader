@@ -18,6 +18,19 @@ actually possible (previously every ingest wiped the whole stats cache and
 rolling-range cache keys rotated every minute, so the dashboard recomputed
 nearly every poll).
 
+### Added
+- **Anonymous page-view counting** (`TOKENLEADER_PAGE_VIEWS`, on by default):
+  the server records one `{timestamp, path}` row per human document load of
+  the dashboard. That row is the entire record — no cookie (not even an
+  anonymous id), no visitor id, no session, no IP, no stored user-agent; the
+  `User-Agent` is read in memory only to drop bots/unfurls and then
+  discarded. Views are buffered and flushed once a minute in one transaction
+  (never inline — `bun:sqlite` is synchronous), and the table is capped at
+  200k rows so an open instance being crawled cannot grow the replicated DB
+  without bound. Read it back with `GET /admin/page-views` (admin bearer;
+  `range`/`since`/`until` like `/stats`). No UI yet. Opt out with
+  `TOKENLEADER_PAGE_VIEWS=0`.
+
 ### Changed
 - **Stats cache overhaul**: ingest no longer clears live cache entries (TTL
   60s is the freshness bound); only frozen past windows that a backfill

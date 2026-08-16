@@ -36,6 +36,7 @@ import {
   sweepFleetAlerts,
 } from "./fleet.ts";
 import { renderInstallScript, renderUninstallScript } from "./install-script.ts";
+import { isBotUserAgent, PageViewRecorder } from "./page-views.ts";
 import { PricingCache, computeRowCostUsd, roundUsd } from "./pricing.ts";
 import { parseStatsRange } from "./range.ts";
 import pkg from "../../package.json";
@@ -251,6 +252,12 @@ export interface BuildOptions {
   scheduleAlertSweep?: boolean;
   /** Test seam for the alert webhook POST. */
   alertFetch?: typeof fetch;
+  /** Count anonymous dashboard page views (TOKENLEADER_PAGE_VIEWS).
+   *  Defaults to true — the stored row is `{ts, path}`, no identity of any
+   *  kind. False = the recorder is never built and nothing is written. */
+  pageViews?: boolean;
+  /** Page-view flush cadence in ms (tests use a short one). */
+  pageViewFlushMs?: number;
 }
 
 const DAILY_MS = 24 * 60 * 60 * 1000;
@@ -814,8 +821,13 @@ export function buildApp(opts: BuildOptions) {
 
   // Serve-time branding for the SPA shell, memoized by index.html's mtime
   // so a redeployed web/dist re-injects while steady-state costs one stat().
+  // `rendered` is for the page-view seam, which must not count a load that
+  // never rendered: the fallback below goes through fileResponse, which
+  // hardcodes status 200 around a Bun.file handle whose file may not exist
+  // (the client gets a 404 body). Status alone therefore cannot tell a
+  // served document from a mid-redeploy miss.
   let indexHtmlCache: { mtimeMs: number; body: string } | null = null;
-  const serveIndexHtml = (distDir: string): Response => {
+  const serveIndexHtml = (distDir: string): { res: Response; rendered: boolean } => {
     const indexPath = path.join(distDir, "index.html");
     const headers = {
       "content-type": "text/html; charset=utf-8",
@@ -833,9 +845,9 @@ export function buildApp(opts: BuildOptions) {
       body = indexHtmlCache.body;
     } catch {
       // index.html vanished mid-redeploy — stream untransformed, don't 500.
-      return fileResponse(indexPath, headers);
+      return { res: fileResponse(indexPath, headers), rendered: false };
     }
-    return new Response(body, { status: 200, headers });
+    return { res: new Response(body, { status: 200, headers }), rendered: true };
   };
 
   if (webDistDir) {
@@ -858,11 +870,53 @@ export function buildApp(opts: BuildOptions) {
     });
   }
 
+  // Anonymous page-view counting (docs/configuration.md "Page views").
+  // Built unless the operator opts out; there is no identity to opt out of
+  // — a row is `{ts, path}`, no cookie, no visitor id, no IP, no UA.
+  // Null = collection off, and every call site below is a no-op.
+  const pageViewRecorder =
+    opts.pageViews === false
+      ? null
+      : new PageViewRecorder({
+          store,
+          // The SAME clock the admin read parses its range with (opts.now).
+          // Two clocks here would mean rows stamped with one and windows
+          // computed from the other — a frozen-time test would silently get
+          // totalViews: 0 with rows sitting in the table.
+          now,
+          ...(opts.pageViewFlushMs !== undefined ? { flushIntervalMs: opts.pageViewFlushMs } : {}),
+        });
+  pageViewRecorder?.start();
+
   // The SPA-vs-legacy fork lives here once; each route supplies its legacy fallback.
+  // It is also the one place a dashboard DOCUMENT load is served: serveIndexHtml
+  // memoizes the HTML string, not the response, so this really does run per
+  // request (and the responses are `cache-control: no-store` with no ETag, so
+  // no edge sits in front of it). Counting here therefore counts real loads.
   const spaOrLegacy =
     (legacy: (c: Context) => Response) =>
-    (c: Context): Response =>
-      webDistDir ? serveIndexHtml(webDistDir) : legacy(c);
+    (c: Context): Response => {
+      const spa = webDistDir ? serveIndexHtml(webDistDir) : null;
+      const res = spa ? spa.res : legacy(c);
+      // Count AFTER the handler, and only a document that actually rendered:
+      // for the SPA that means the memoized-HTML branch (`rendered`), not the
+      // vanished-index fallback, which returns 200 around a file the client
+      // will receive as a 404; for the no-web-build path the /admin fallback
+      // is a 302 to /, and counting the redirect plus the load it causes
+      // would double one visit. Bots/unfurls are classified from the UA in
+      // memory and dropped — the header is never stored. Recording is a push
+      // onto an array (the flush interval does the SQLite work), so this adds
+      // nothing measurable to the response. Note the dashboard-token gate
+      // runs BEFORE this handler, so a failed login renders the form and is
+      // never counted.
+      const counted = spa ? spa.rendered : res.status === 200;
+      if (pageViewRecorder && counted && !isBotUserAgent(c.req.header("user-agent"))) {
+        // PATHNAME only, never the URL: the one-shot `?token=` dashboard
+        // auth rides in the query string and must not land in a table.
+        pageViewRecorder.record(c.req.path);
+      }
+      return res;
+    };
 
   app.get(
     "/",
@@ -2160,6 +2214,40 @@ export function buildApp(opts: BuildOptions) {
     return c.json({ failures: store.listAuthFailures(user.length > 0 ? user : null) });
   });
 
+  // Anonymous dashboard traffic. The only read surface for page_views —
+  // there is no UI for this yet, and the table holds nothing per-viewer to
+  // build one from: `{ts, path}` per human document load, bots excluded at
+  // collection time. Range params are the shared /stats grammar
+  // (`range=<N>d` or `since`/`until` unix-ms); default = all of it.
+  //
+  // Uncached, and both aggregates below are TEMP B-TREE GROUP BYs that the
+  // page_views_ts index cannot cover (one groups on a strftime expression,
+  // the other on path) — narrowing the range shrinks the scan but never
+  // removes the sort. That is affordable only because the table is capped at
+  // PAGE_VIEWS_MAX: worst case is a bounded ~200k-row scan, not an unbounded
+  // one, on the synchronous shared-event-loop DB. Do not lift that cap
+  // without giving this route a cache or a mandatory window.
+  app.get("/admin/page-views", (c) => {
+    const denied = requireAdmin(c);
+    if (denied) return denied;
+    const range = parseStatsRange(new URL(c.req.url).searchParams, now());
+    if ("error" in range) return c.json({ error: range.error }, 400);
+    // Drain the buffer first so the answer includes the loads that happened
+    // since the last interval tick — an operator refreshing this after a
+    // visit should see it. A handful of rows in one transaction; the
+    // event-loop ban is on the REQUEST path, and this is an admin read.
+    pageViewRecorder?.flush();
+    const { since, until } = range;
+    return c.json({
+      enabled: pageViewRecorder !== null,
+      since,
+      until,
+      totalViews: store.countPageViews(since, until),
+      byDay: store.pageViewsByDay(since, until),
+      byPath: store.pageViewsByPath(since, until),
+    });
+  });
+
   // Mark a user uninstalled without their machine's cooperation — for
   // laptops that were wiped/reimaged and can never run the uninstall
   // script. Ends the eternal-stale-row noise: the user leaves /stats/fleet
@@ -2490,9 +2578,13 @@ export function buildApp(opts: BuildOptions) {
     startedAt,
     binaryMirror: mirror,
     cursorMirror,
+    pageViewRecorder,
     stop: async () => {
       if (refreshTimer) clearInterval(refreshTimer);
       if (alertSweepTimer) clearInterval(alertSweepTimer);
+      // Before the store closes: stop() flushes what SIGTERM interrupted.
+      // A hard kill still loses the buffer, which is an accepted trade.
+      pageViewRecorder?.stop();
       mirror?.stop();
       // Awaited: a cursor tick can be mid-insertMany; the store must not
       // be closed until it drains.
@@ -2538,6 +2630,7 @@ if (import.meta.main) {
     mirrorIntervalSec: cfg.mirrorIntervalSec,
     cursorIntervalSec: cfg.cursorIntervalSec,
     webDistDir: webDist,
+    pageViews: cfg.pageViews,
   };
   if (cfg.serverUrl !== undefined) buildOpts.serverUrl = cfg.serverUrl;
   if (cfg.teamName !== undefined) buildOpts.teamName = cfg.teamName;

@@ -44,6 +44,22 @@ describe("parseServerConfig defaults", () => {
     expect(cfg.joinToken).toBeUndefined();
     expect(cfg.ghRepo).toBeUndefined();
     expect(cfg.cursorUserMap).toBeUndefined();
+    // Anonymous page views are the one default-ON feature: the row is
+    // {ts, path}, so there is no privacy posture to opt into.
+    expect(cfg.pageViews).toBe(true);
+  });
+
+  test("TOKENLEADER_PAGE_VIEWS: same allow-list as the daemon's default-ON knobs", () => {
+    // Unset/empty means on; so do the four on-words.
+    for (const on of ["", "  ", "1", "true", "TRUE", "on", "yes", " yes "]) {
+      expect(parseServerConfig({ TOKENLEADER_PAGE_VIEWS: on }).pageViews).toBe(true);
+    }
+    // Everything else is off. A collector's opt-out must fail CLOSED: an
+    // operator who writes `disabled` or `none` meant "stop counting", and
+    // this matches isEnabledByDefault (src/parser/index.ts) exactly.
+    for (const off of ["0", "false", "FALSE", "off", " no ", "disabled", "none", "banana"]) {
+      expect(parseServerConfig({ TOKENLEADER_PAGE_VIEWS: off }).pageViews).toBe(false);
+    }
   });
 
   test("db + binary cache derive from TOKENLEADER_DATA_DIR", () => {

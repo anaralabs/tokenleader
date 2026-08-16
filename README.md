@@ -37,6 +37,11 @@ tokenleader ships **token counts, model names, and timestamps — never message 
   (token counts and costs, not message content) and forwards them on.
 - Each report also carries opaque session/message IDs — used purely for de-duplication,
   so re-posting an event can never double-count.
+- The server counts anonymous dashboard page views: one `{timestamp, path}` row per
+  human document load, and that is the entire record — no cookie (not even an anonymous
+  id), no visitor id, no session, no IP address, no stored user-agent. The `User-Agent`
+  is read in memory only to drop bots and link unfurls, then discarded. Read it back
+  with `GET /admin/page-views` (admin bearer); disable it with `TOKENLEADER_PAGE_VIEWS=0`.
 - Want certainty? The daemon source is in this repo. Read it and build it yourself
   ([docs/daemon.md](docs/daemon.md#building-and-running-your-own-daemon)), or watch a
   single tick's traffic with `TOKENLEADER_LOG_LEVEL=debug TOKENLEADER_RUN_ONCE=1`.
