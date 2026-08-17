@@ -22,12 +22,25 @@ export interface ParseCodexOptions {
   byteOffset: number;
   user: string;
   prevSessionTotals?: SessionTotals;
+  /** Model in effect at the end of the PREVIOUS read of this same file.
+   *  `turn_context` appears once per turn, not once per token_count line, so
+   *  an incremental read that starts mid-turn sees usage with no model in
+   *  its window. Without this the model resolved to LEGACY_FALLBACK_MODEL
+   *  and the turn was billed to a model nobody ran — the dominant source of
+   *  mislabelled Codex volume. Persisted across ticks in FileState.lastModel
+   *  exactly like lastSessionTotals. */
+  prevModel?: string;
 }
 
 export interface ParseCodexResult {
   events: TokenEvent[];
   newOffset: number;
   sessionTotals: SessionTotals;
+  /** Model in effect at the end of this read, to carry into the next one.
+   *  Undefined only when no turn_context has EVER been seen for this file
+   *  (pre-2025-11 rollouts predate the field entirely — those genuinely
+   *  have no recoverable model and keep the fallback). */
+  lastModel?: string;
   /** Count of records dropped because they exceeded the read window (data
    *  loss — surfaced so the daemon can warn). Absent/0 in the common case. */
   oversizeSkipped?: number;
@@ -144,7 +157,7 @@ function buildMessageId(sessionId: string, timestamp: string, ixForTimestamp: nu
 }
 
 export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCodexResult> {
-  const { path, byteOffset, user, prevSessionTotals } = opts;
+  const { path, byteOffset, user, prevSessionTotals, prevModel } = opts;
 
   const sessionId = basename(path, ".jsonl");
   const totals: SessionTotals =
@@ -155,7 +168,14 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
   const file = Bun.file(path);
   const totalSize = file.size;
   if (byteOffset >= totalSize) {
-    return { events: [], newOffset: totalSize, sessionTotals: totals };
+    // Nothing new to read — echo the model back so a no-op tick doesn't
+    // drop it and re-blind the next real read.
+    return {
+      events: [],
+      newOffset: totalSize,
+      sessionTotals: totals,
+      ...(prevModel !== undefined ? { lastModel: prevModel } : {}),
+    };
   }
 
   const events: TokenEvent[] = [];
@@ -163,7 +183,10 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
   // the offset put so the next read re-consumes it once it's complete.
   let newOffset = byteOffset;
 
-  let currentModel: string | null = null;
+  // Seeded from the previous read so a window that opens mid-turn (no
+  // turn_context inside it) still knows what is running. Only a byte-0 read
+  // starts blind, and a byte-0 read sees the file's own first turn_context.
+  let currentModel: string | null = byteOffset > 0 ? (prevModel ?? null) : null;
   // Track how many events share an identical timestamp so messageIds stay unique.
   let lastTs = "";
   let ixForTs = 0;
@@ -351,5 +374,11 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     });
   }
 
-  return { events, newOffset, sessionTotals: totals, oversizeSkipped };
+  return {
+    events,
+    newOffset,
+    sessionTotals: totals,
+    ...(currentModel !== null ? { lastModel: currentModel } : {}),
+    oversizeSkipped,
+  };
 }

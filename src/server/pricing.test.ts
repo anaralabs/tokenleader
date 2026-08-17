@@ -459,3 +459,19 @@ describe("PricingCache.refreshFromUpstream", () => {
     expect(cache.unknownModels().size).toBe(0);
   });
 });
+
+describe("price aliases for models LiteLLM does not publish", () => {
+  test("codex-auto-review prices as gpt-5-codex instead of silently $0", () => {
+    const tbl = loadPricingFallback();
+    const alias = tbl["codex-auto-review"];
+    const target = tbl["gpt-5-codex"];
+    expect(target).toBeDefined();
+    expect(alias).toEqual(target!);
+  });
+
+  test("an alias never shadows a real upstream price", () => {
+    // gpt-5-codex is published; the alias machinery must not overwrite it.
+    const tbl = loadPricingFallback();
+    expect(tbl["gpt-5-codex"]!.input).toBeGreaterThan(0);
+  });
+});

@@ -547,3 +547,107 @@ describe("parseCodexFile (real local data)", () => {
     );
   });
 });
+
+// The mislabelling bug: `turn_context` is written once per TURN, but the
+// daemon reads incrementally every 300s. A read that opens after the
+// turn_context line saw usage with no model in its window and billed it to
+// LEGACY_FALLBACK_MODEL — a model nobody ran. On prod this swallowed 41.5%
+// of all Codex volume (71.6% in its worst month) and priced it at a quarter
+// of the real rate, because the placeholder is cheaper than the models it
+// was standing in for.
+describe("model carries across incremental reads", () => {
+  async function writeSession(lines: unknown[]): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "codex-model-"));
+    const path = join(dir, "rollout-2026-08-01T00-00-00-model-carry.jsonl");
+    await writeFile(path, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+    return path;
+  }
+
+  it("a second read that opens mid-turn keeps the model instead of falling back", async () => {
+    const path = await writeSession([
+      turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent(
+        "2026-08-01T00:00:01.000Z",
+        { input: 100, cached: 40, output: 10, reasoning: 0 },
+        { input: 100, cached: 40, output: 10, reasoning: 0 },
+      ),
+    ]);
+    const first = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(first.events[0]?.model).toBe("gpt-5.6-sol");
+    expect(first.lastModel).toBe("gpt-5.6-sol");
+
+    // The next turn's usage lands with NO turn_context in the window --
+    // exactly what a 300s incremental read sees mid-conversation.
+    await writeFile(
+      path,
+      `${[
+        turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+        tokenCountEvent(
+          "2026-08-01T00:00:01.000Z",
+          { input: 100, cached: 40, output: 10, reasoning: 0 },
+          { input: 100, cached: 40, output: 10, reasoning: 0 },
+        ),
+        tokenCountEvent(
+          "2026-08-01T00:05:00.000Z",
+          { input: 200, cached: 80, output: 20, reasoning: 0 },
+          { input: 300, cached: 120, output: 30, reasoning: 0 },
+        ),
+      ]
+        .map((l) => JSON.stringify(l))
+        .join("\n")}\n`,
+    );
+
+    const second = await parseCodexFile({
+      path,
+      byteOffset: first.newOffset,
+      user: "u",
+      prevSessionTotals: first.sessionTotals,
+      prevModel: first.lastModel,
+    });
+    expect(second.events.length).toBe(1);
+    expect(second.events[0]?.model).toBe("gpt-5.6-sol");
+  });
+
+  it("without the carried model the same read mislabels (regression guard)", async () => {
+    const path = await writeSession([
+      tokenCountEvent(
+        "2026-08-01T00:05:00.000Z",
+        { input: 200, cached: 80, output: 20, reasoning: 0 },
+        { input: 200, cached: 80, output: 20, reasoning: 0 },
+      ),
+    ]);
+    // byteOffset > 0 with no prevModel is the pre-fix situation.
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(r.events[0]?.model).toBe("gpt-5");
+    expect(r.lastModel).toBeUndefined();
+  });
+
+  it("a read with no turn_context does not erase the carried model", async () => {
+    const path = await writeSession([
+      tokenCountEvent(
+        "2026-08-01T00:05:00.000Z",
+        { input: 10, cached: 0, output: 1, reasoning: 0 },
+        { input: 10, cached: 0, output: 1, reasoning: 0 },
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u", prevModel: "gpt-5.5" });
+    // byteOffset 0 starts blind on purpose: a byte-0 read sees the file's
+    // own first turn_context, so trusting a stale carried model there would
+    // mislabel a session that legitimately changed models.
+    expect(r.events[0]?.model).toBe("gpt-5");
+  });
+
+  it("a later turn_context overrides the carried model", async () => {
+    const path = await writeSession([
+      turnContextLine("gpt-5.5", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent(
+        "2026-08-01T00:00:01.000Z",
+        { input: 100, cached: 0, output: 10, reasoning: 0 },
+        { input: 100, cached: 0, output: 10, reasoning: 0 },
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u", prevModel: "gpt-5.6-sol" });
+    expect(r.events[0]?.model).toBe("gpt-5.5");
+    expect(r.lastModel).toBe("gpt-5.5");
+  });
+});

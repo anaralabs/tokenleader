@@ -344,6 +344,7 @@ export async function tick(
           byteOffset,
           user: deps.user,
           ...(prevTotals ? { prevSessionTotals: prevTotals } : {}),
+          ...(prev?.lastModel ? { prevModel: prev.lastModel } : {}),
         });
         collectDeduped(r.events, collected, seenThisTick);
         if (r.oversizeSkipped) {
@@ -361,6 +362,13 @@ export async function tick(
             ? { lastSessionTotals: r.sessionTotals }
             : prev?.lastSessionTotals
               ? { lastSessionTotals: prev.lastSessionTotals }
+              : {}),
+          // Carry the model forward; never let a read that saw no
+          // turn_context erase what the previous read established.
+          ...(r.lastModel
+            ? { lastModel: r.lastModel }
+            : prev?.lastModel
+              ? { lastModel: prev.lastModel }
               : {}),
         });
       }
