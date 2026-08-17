@@ -73,6 +73,13 @@ CREATE TABLE IF NOT EXISTS events_roll_day (
   user                TEXT    NOT NULL,
   model               TEXT    NOT NULL,
   messageType         TEXT    NOT NULL,
+  -- 1 when the rows behind this cell carried a source-provided cost
+  -- (costUsdMicros — only Cursor writes it), 0 when their cost must be
+  -- derived from tokens. It is part of the PRIMARY KEY so a cell is never
+  -- a MIX of the two: mixing them is what let a handful of Cursor rows
+  -- delete the price of half a million Codex rows sharing one model name,
+  -- because the cost branch ran on the summed bucket and stored-cost wins.
+  hasStored           INTEGER NOT NULL,
   events              INTEGER NOT NULL,
   inputTokens         INTEGER NOT NULL,
   outputTokens        INTEGER NOT NULL,
@@ -81,7 +88,7 @@ CREATE TABLE IF NOT EXISTS events_roll_day (
   reasoningTokens     INTEGER NOT NULL,
   storedCostMicros    INTEGER NOT NULL,
   maxTimestamp        INTEGER NOT NULL,
-  PRIMARY KEY (day, user, model, messageType)
+  PRIMARY KEY (day, user, model, messageType, hasStored)
 ) WITHOUT ROWID;
 -- The PK is day-leading (the timeseries access path). This one is
 -- user-leading for the per-user routes (/stats?user=, the
@@ -376,6 +383,26 @@ function migrateUninstalledAt(db: Database): void {
  * NULL means the user's daemon never sent X-Tokenleader-Company; an
  * absent header never clears a stored value.
  */
+/**
+ * Migration: give events_roll_day its `hasStored` dimension.
+ *
+ * The column is part of the PRIMARY KEY, so it cannot be added with ALTER
+ * TABLE — and it must not be, because every EXISTING cell may be a mix of
+ * stored-cost and derived rows and there is no way to split one after the
+ * fact. The rollup is pure derived data, so the honest migration is to drop
+ * it and let the constructor's rebuild recreate it from raw events.
+ *
+ * Idempotent, and a no-op on a fresh DB (SCHEMA already made the new shape).
+ * Runs BEFORE the rebuild so the recreate uses the current SCHEMA.
+ */
+function migrateRollupHasStored(db: Database): void {
+  const cols = db.prepare<{ name: string }, []>("PRAGMA table_info(events_roll_day)").all();
+  // Zero columns = table absent; the constructor creates and fills it.
+  if (cols.length === 0) return;
+  if (cols.some((c) => c.name === "hasStored")) return;
+  db.exec("DROP TABLE IF EXISTS events_roll_day; DELETE FROM events_roll_dirty;");
+}
+
 function migrateCompany(db: Database): void {
   const cols = db.prepare<{ name: string }, []>("PRAGMA table_info(user_secrets)").all();
   const hasCol = cols.some((c) => c.name === "company");
@@ -544,6 +571,15 @@ export interface ModelAggRow {
  *  admin route's former per-user userByModel loop + adminByModel scan. */
 export interface UserModelAggRow extends ModelAggRow {
   user: string;
+  /** Token sums restricted to rows that carried NO source-provided cost, so
+   *  a caller can price
+   *    storedCostMicros/1e6 + listPrice(model) x derived tokens
+   *  rather than letting one stored-cost row silence a whole bucket. */
+  derivedInputTokens: number;
+  derivedOutputTokens: number;
+  derivedCacheCreationTokens: number;
+  derivedCacheReadTokens: number;
+  derivedReasoningTokens: number;
 }
 
 export interface RecentEventRow {
@@ -1009,13 +1045,14 @@ function rollSource(bucket: Bucket | null, where = ""): string {
     from: string,
     to: string,
   ) => `SELECT ${key(`${rollDaySql("timestamp")} * 86400`)}user, model, messageType,
+              CASE WHEN COALESCE(costUsdMicros, 0) > 0 THEN 1 ELSE 0 END AS hasStored,
               1 AS events, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens,
               COALESCE(reasoningTokens, 0) AS reasoningTokens,
               COALESCE(costUsdMicros, 0)   AS storedCostMicros,
               timestamp                    AS maxTimestamp
          FROM events
         WHERE timestamp >= ${from} AND timestamp < ${to} ${where}`;
-  return `SELECT ${key("day * 86400")}user, model, messageType,
+  return `SELECT ${key("day * 86400")}user, model, messageType, hasStored,
               events, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens,
               reasoningTokens, storedCostMicros, maxTimestamp
          FROM events_roll_day
@@ -1226,6 +1263,10 @@ export class Store {
     // reads back 1073741824) — ask for exactly the cap.
     this.db.exec("PRAGMA mmap_size = 1073741824;");
     this.db.exec(`PRAGMA temp_store = ${TEMP_STORE};`);
+    // BEFORE exec(SCHEMA): SCHEMA's CREATE TABLE IF NOT EXISTS is a no-op
+    // against a pre-existing rollup, so an old-shape table has to be dropped
+    // first for the recreate below to land the new one.
+    migrateRollupHasStored(this.db);
     this.db.exec(SCHEMA);
     migrateMessageType(this.db);
     migrateUninstalledAt(this.db);
@@ -1286,13 +1327,13 @@ export class Store {
     // with the events it summarises — and rides Litestream for free,
     // because it lives in the one replicated file.
     this.rollUpsertStmt = this.db.prepare(
-      `INSERT INTO events_roll_day (day, user, model, messageType, events, inputTokens,
+      `INSERT INTO events_roll_day (day, user, model, messageType, hasStored, events, inputTokens,
             outputTokens, cacheCreationTokens, cacheReadTokens, reasoningTokens,
             storedCostMicros, maxTimestamp)
-       VALUES ($day, $user, $model, $messageType, $events, $inputTokens,
+       VALUES ($day, $user, $model, $messageType, $hasStored, $events, $inputTokens,
                $outputTokens, $cacheCreationTokens, $cacheReadTokens, $reasoningTokens,
                $storedCostMicros, $maxTimestamp)
-       ON CONFLICT (day, user, model, messageType) DO UPDATE SET
+       ON CONFLICT (day, user, model, messageType, hasStored) DO UPDATE SET
          events              = events              + excluded.events,
          inputTokens         = inputTokens         + excluded.inputTokens,
          outputTokens        = outputTokens        + excluded.outputTokens,
@@ -1318,13 +1359,14 @@ export class Store {
     // traffic on one day; rides events_user_cover, so no rowid lookups.
     this.rollRebuildCellStmt = this.db.prepare(
       `INSERT INTO events_roll_day
-       SELECT ${rollDaySql("timestamp")}, user, model, messageType, COUNT(*),
+       SELECT ${rollDaySql("timestamp")}, user, model, messageType,
+              CASE WHEN COALESCE(costUsdMicros, 0) > 0 THEN 1 ELSE 0 END, COUNT(*),
               SUM(inputTokens), SUM(outputTokens), SUM(cacheCreationTokens),
               SUM(cacheReadTokens), SUM(COALESCE(reasoningTokens, 0)),
               SUM(COALESCE(costUsdMicros, 0)), MAX(timestamp)
          FROM events
         WHERE user = ? AND timestamp >= ? AND timestamp < ?
-        GROUP BY 1, 2, 3, 4`,
+        GROUP BY 1, 2, 3, 4, 5`,
     );
     // The two halves of the chunked rebuild (see rebuildRollup for why it is
     // chunked at all). DISTINCT over the leading column of events_user_cover
@@ -1335,13 +1377,14 @@ export class Store {
     );
     this.rollRebuildUserStmt = this.db.prepare(
       `INSERT INTO events_roll_day
-       SELECT ${rollDaySql("timestamp")}, user, model, messageType, COUNT(*),
+       SELECT ${rollDaySql("timestamp")}, user, model, messageType,
+              CASE WHEN COALESCE(costUsdMicros, 0) > 0 THEN 1 ELSE 0 END, COUNT(*),
               SUM(inputTokens), SUM(outputTokens), SUM(cacheCreationTokens),
               SUM(cacheReadTokens), SUM(COALESCE(reasoningTokens, 0)),
               SUM(COALESCE(costUsdMicros, 0)), MAX(timestamp)
          FROM events
         WHERE user = ?
-        GROUP BY 1, 2, 3, 4`,
+        GROUP BY 1, 2, 3, 4, 5`,
     );
     // The audit: the RollAuditRow columns PER USER, which must agree between
     // the two tables. Per-user rather than grand totals, because the
@@ -1555,6 +1598,13 @@ export class Store {
     // is part of the payload contract, and it should be written down rather
     // than inherited from a plan that a future index could change.
     this.adminUserModelStmt = this.db.prepare<UserModelAggRow, RollWindowArgs>(
+      // The derived* columns are the token sums restricted to rows with NO
+      // source-provided cost. Callers price cost as
+      //   storedCostMicros/1e6  +  listPrice(model) x derived tokens
+      // instead of branching on whether the bucket contains ANY stored cost.
+      // The old branch meant 944 Cursor rows set the price for 571,006 Codex
+      // rows that merely shared a model name, and the Codex ones went to $0.
+      // Still one row per (user, model), so callers keep their shape.
       `SELECT user, model,
               COALESCE(SUM(events), 0)              AS count,
               COALESCE(SUM(inputTokens), 0)         AS inputTokens,
@@ -1562,7 +1612,12 @@ export class Store {
               COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
               COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
               COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros
+              COALESCE(SUM(storedCostMicros), 0)    AS storedCostMicros,
+              COALESCE(SUM(CASE WHEN hasStored=0 THEN inputTokens         ELSE 0 END), 0) AS derivedInputTokens,
+              COALESCE(SUM(CASE WHEN hasStored=0 THEN outputTokens        ELSE 0 END), 0) AS derivedOutputTokens,
+              COALESCE(SUM(CASE WHEN hasStored=0 THEN cacheCreationTokens ELSE 0 END), 0) AS derivedCacheCreationTokens,
+              COALESCE(SUM(CASE WHEN hasStored=0 THEN cacheReadTokens     ELSE 0 END), 0) AS derivedCacheReadTokens,
+              COALESCE(SUM(CASE WHEN hasStored=0 THEN reasoningTokens     ELSE 0 END), 0) AS derivedReasoningTokens
          FROM (${rollSource(null, ASSISTANT_ONLY)})
         GROUP BY user, model
         ORDER BY user ASC, model ASC`,
@@ -2323,6 +2378,7 @@ export class Store {
           $user: string;
           $model: string;
           $messageType: string;
+          $hasStored: number;
           $events: number;
           $inputTokens: number;
           $outputTokens: number;
@@ -2363,7 +2419,12 @@ export class Store {
           const messageType = e.messageType ?? "assistant";
           // NUL-separated: user and model are free-form, and a printable
           // delimiter could be forged to collide two distinct groups.
-          const key = `${day}\u0000${e.user}\u0000${e.model}\u0000${messageType}`;
+          // Rows carrying a source-provided cost live in their own cell (see
+          // hasStored in SCHEMA): a cell must be all-stored or all-derived,
+          // or the cost branch downstream prices the whole bucket off a
+          // stray Cursor row and zeroes everything else under that model.
+          const hasStored = (e.costUsdMicros ?? 0) > 0 ? 1 : 0;
+          const key = `${day}\u0000${e.user}\u0000${e.model}\u0000${messageType}\u0000${hasStored}`;
           let g = deltas.get(key);
           if (g === undefined) {
             g = {
@@ -2371,6 +2432,7 @@ export class Store {
               $user: e.user,
               $model: e.model,
               $messageType: messageType,
+              $hasStored: hasStored,
               $events: 0,
               $inputTokens: 0,
               $outputTokens: 0,
