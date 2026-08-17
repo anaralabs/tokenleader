@@ -1043,30 +1043,28 @@ export function buildApp(opts: BuildOptions) {
         ? null
         : new Map(umRows.filter((r) => r.model === model).map((r) => [r.user, r]));
 
-    // Per-user cost: the stored-cost-wins branch runs per (user, model)
-    // group — exactly the granularity of the old userByModel loop. Under a
-    // model filter only that model's rows count.
+    // Per-user cost. Source-provided cost (Cursor) is AUTHORITATIVE for the
+    // rows that carry it — it keeps max-mode multipliers intact — but only
+    // for those rows. The rest of the group is still derived from tokens,
+    // so the two are SUMMED, never chosen between: a model string used by
+    // both Cursor and another source (gpt-5 is used by Cursor AND Codex)
+    // would otherwise have the non-Cursor rows silently priced at zero.
     const usdByUser = new Map<string, number>();
     for (const m of modelByUser === null ? umRows : modelByUser.values()) {
       let usd = usdByUser.get(m.user) ?? 0;
-      // Source-provided cost (Cursor) wins over PricingCache derivation
-      // — keeps max-mode multipliers intact.
-      if (m.storedCostMicros > 0) {
-        usd += m.storedCostMicros / 1_000_000;
-      } else {
-        const price = pricing.lookup(m.model);
-        if (price) {
-          usd += computeRowCostUsd(
-            {
-              input: m.inputTokens,
-              output: m.outputTokens,
-              cacheCreation: m.cacheCreationTokens,
-              cacheRead: m.cacheReadTokens,
-              reasoning: m.reasoningTokens,
-            },
-            price,
-          );
-        }
+      usd += m.storedCostMicros / 1_000_000;
+      const price = pricing.lookup(m.model);
+      if (price) {
+        usd += computeRowCostUsd(
+          {
+            input: m.derivedInputTokens,
+            output: m.derivedOutputTokens,
+            cacheCreation: m.derivedCacheCreationTokens,
+            cacheRead: m.derivedCacheReadTokens,
+            reasoning: m.derivedReasoningTokens,
+          },
+          price,
+        );
       }
       usdByUser.set(m.user, usd);
     }
@@ -1115,6 +1113,11 @@ export function buildApp(opts: BuildOptions) {
         cacheReadTokens: number;
         reasoningTokens: number;
         storedCostMicros: number;
+        derivedInputTokens: number;
+        derivedOutputTokens: number;
+        derivedCacheCreationTokens: number;
+        derivedCacheReadTokens: number;
+        derivedReasoningTokens: number;
       }
     >();
     for (const m of umRows) {
@@ -1128,6 +1131,11 @@ export function buildApp(opts: BuildOptions) {
           cacheReadTokens: 0,
           reasoningTokens: 0,
           storedCostMicros: 0,
+          derivedInputTokens: 0,
+          derivedOutputTokens: 0,
+          derivedCacheCreationTokens: 0,
+          derivedCacheReadTokens: 0,
+          derivedReasoningTokens: 0,
         };
         modelAgg.set(m.model, agg);
       }
@@ -1138,32 +1146,40 @@ export function buildApp(opts: BuildOptions) {
       agg.cacheReadTokens += m.cacheReadTokens;
       agg.reasoningTokens += m.reasoningTokens;
       agg.storedCostMicros += m.storedCostMicros;
+      agg.derivedInputTokens += m.derivedInputTokens;
+      agg.derivedOutputTokens += m.derivedOutputTokens;
+      agg.derivedCacheCreationTokens += m.derivedCacheCreationTokens;
+      agg.derivedCacheReadTokens += m.derivedCacheReadTokens;
+      agg.derivedReasoningTokens += m.derivedReasoningTokens;
     }
     const byModel = Array.from(modelAgg.entries())
       .map(([model, m]) => {
-        let costUsd = 0;
+        // Stored and derived are SUMMED, not chosen between. Cursor is the
+        // only source that reports its own cost, and Cursor's bare model
+        // names collide with the ones Codex writes -- so branching on "does
+        // this bucket contain ANY stored cost" let 944 Cursor rows set the
+        // price for 571,006 Codex rows and send the Codex ones to $0.
+        let costUsd = m.storedCostMicros / 1_000_000;
         let unknownPrice = false;
-        if (m.storedCostMicros > 0) {
-          costUsd = roundUsd(m.storedCostMicros / 1_000_000);
-        } else {
-          const price = pricing.lookup(model);
-          if (price) {
-            costUsd = roundUsd(
-              computeRowCostUsd(
-                {
-                  input: m.inputTokens,
-                  output: m.outputTokens,
-                  cacheCreation: m.cacheCreationTokens,
-                  cacheRead: m.cacheReadTokens,
-                  reasoning: m.reasoningTokens,
-                },
-                price,
-              ),
-            );
-          } else {
-            unknownPrice = true;
-          }
+        const price = pricing.lookup(model);
+        if (price) {
+          costUsd += computeRowCostUsd(
+            {
+              input: m.derivedInputTokens,
+              output: m.derivedOutputTokens,
+              cacheCreation: m.derivedCacheCreationTokens,
+              cacheRead: m.derivedCacheReadTokens,
+              reasoning: m.derivedReasoningTokens,
+            },
+            price,
+          );
+        } else if (m.derivedInputTokens + m.derivedCacheReadTokens + m.derivedOutputTokens > 0) {
+          // Only flag unknown-price when there are derived tokens we could
+          // not price. A model whose rows ALL carry a stored cost is fully
+          // priced regardless of whether the price table knows the name.
+          unknownPrice = true;
         }
+        costUsd = roundUsd(costUsd);
         return {
           model,
           count: m.count,

@@ -121,7 +121,12 @@ function rawAdminUserModel(s: Store, since: number, until: number) {
               COALESCE(SUM(cacheCreationTokens), 0) AS cacheCreationTokens,
               COALESCE(SUM(cacheReadTokens), 0)     AS cacheReadTokens,
               COALESCE(SUM(reasoningTokens), 0)     AS reasoningTokens,
-              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros
+              COALESCE(SUM(costUsdMicros), 0)       AS storedCostMicros,
+              COALESCE(SUM(CASE WHEN COALESCE(costUsdMicros,0)=0 THEN inputTokens         ELSE 0 END), 0) AS derivedInputTokens,
+              COALESCE(SUM(CASE WHEN COALESCE(costUsdMicros,0)=0 THEN outputTokens        ELSE 0 END), 0) AS derivedOutputTokens,
+              COALESCE(SUM(CASE WHEN COALESCE(costUsdMicros,0)=0 THEN cacheCreationTokens ELSE 0 END), 0) AS derivedCacheCreationTokens,
+              COALESCE(SUM(CASE WHEN COALESCE(costUsdMicros,0)=0 THEN cacheReadTokens     ELSE 0 END), 0) AS derivedCacheReadTokens,
+              COALESCE(SUM(CASE WHEN COALESCE(costUsdMicros,0)=0 THEN reasoningTokens     ELSE 0 END), 0) AS derivedReasoningTokens
          FROM events
         WHERE timestamp >= ? AND timestamp < ? AND messageType = 'assistant'
         GROUP BY user, model
@@ -805,5 +810,183 @@ describe("the dirty queue is drained by the writer, not the reader", () => {
     // left for the next reader to pay for.
     expect(pending()).toBe(0);
     expectParity(store, "after span-wide reconcile");
+  });
+});
+
+/**
+ * The mixed-source cost bug, end to end.
+ *
+ * Cursor is the only source that reports its own cost, and Cursor uses BARE
+ * OpenAI model names — the same strings the Codex parser writes. When the
+ * cost branch asked "does this bucket contain ANY stored cost?", a handful
+ * of Cursor rows answered yes for the whole model and every Codex row under
+ * that name priced at $0. On prod that was 944 Cursor rows silencing
+ * 571,006 Codex rows, showing $109 where ~$13,500 was owed.
+ */
+describe("mixed stored-cost and derived rows under one model name", () => {
+  let s: Store;
+  let cleanup: () => void;
+  beforeEach(() => {
+    const t = makeTmpDirSync("tokenleader-mixed-");
+    cleanup = t.cleanup;
+    s = new Store(join(t.dir, "tl.sqlite"));
+  });
+  afterEach(() => {
+    s.close();
+    cleanup();
+  });
+
+  const TS = Date.UTC(2026, 7, 1);
+
+  test("a cell is never a mix — stored and derived rows land in separate rows", () => {
+    s.insertMany([
+      makeTokenEvent({
+        user: "u",
+        model: "gpt-5",
+        source: "cursor",
+        messageId: "c1",
+        timestamp: TS,
+        inputTokens: 10,
+        costUsdMicros: 5_000,
+      }),
+      makeTokenEvent({
+        user: "u",
+        model: "gpt-5",
+        source: "codex",
+        messageId: "k1",
+        timestamp: TS,
+        inputTokens: 1000,
+      }),
+    ]);
+    const cells = s.db
+      .prepare<{ hasStored: number; inputTokens: number }, []>(
+        "SELECT hasStored, inputTokens FROM events_roll_day WHERE model='gpt-5' ORDER BY hasStored",
+      )
+      .all();
+    expect(cells.length).toBe(2);
+    expect(cells[0]).toMatchObject({ hasStored: 0, inputTokens: 1000 });
+    expect(cells[1]).toMatchObject({ hasStored: 1, inputTokens: 10 });
+  });
+
+  test("the derived tokens survive alongside the stored cost", () => {
+    s.insertMany([
+      makeTokenEvent({
+        user: "u",
+        model: "gpt-5",
+        source: "cursor",
+        messageId: "c1",
+        timestamp: TS,
+        inputTokens: 10,
+        costUsdMicros: 5_000,
+      }),
+      makeTokenEvent({
+        user: "u",
+        model: "gpt-5",
+        source: "codex",
+        messageId: "k1",
+        timestamp: TS,
+        inputTokens: 1_000_000,
+        cacheReadTokens: 9_000_000,
+      }),
+    ]);
+    const [row] = s.adminUserModel(0, MAX_TS_MS);
+    expect(row).toBeDefined();
+    // Stored cost is preserved for the row that reported one...
+    expect(row!.storedCostMicros).toBe(5_000);
+    // ...and the Codex tokens are still there to be priced, NOT swallowed.
+    expect(row!.derivedInputTokens).toBe(1_000_000);
+    expect(row!.derivedCacheReadTokens).toBe(9_000_000);
+    // The stored row's own tokens are excluded from the derived sums, so
+    // nothing is counted twice when the two are summed downstream.
+    expect(row!.inputTokens).toBe(1_000_010);
+    expect(row!.derivedInputTokens).toBe(row!.inputTokens - 10);
+  });
+
+  test("a model with only stored-cost rows reports zero derived tokens", () => {
+    s.insertMany([
+      makeTokenEvent({
+        user: "u",
+        model: "cursor-only",
+        source: "cursor",
+        messageId: "c1",
+        timestamp: TS,
+        inputTokens: 42,
+        costUsdMicros: 7_000,
+      }),
+    ]);
+    const [row] = s.adminUserModel(0, MAX_TS_MS);
+    expect(row!.storedCostMicros).toBe(7_000);
+    expect(row!.derivedInputTokens).toBe(0);
+  });
+});
+
+/**
+ * Prod already holds an events_roll_day WITHOUT hasStored. The column is in
+ * the PRIMARY KEY, so ALTER TABLE cannot add it — and must not, since an
+ * existing cell may already be a mix of stored and derived rows that cannot
+ * be split after the fact. Reopening has to drop and rebuild, or the first
+ * query after deploy fails with "no such column".
+ */
+describe("migration from a pre-hasStored rollup", () => {
+  test("reopening an old-shape DB rebuilds the rollup and serves correct numbers", () => {
+    const t = makeTmpDirSync("tokenleader-migrate-");
+    const path = join(t.dir, "tl.sqlite");
+    const TS = Date.UTC(2026, 7, 1);
+
+    const first = new Store(path);
+    first.insertMany([
+      makeTokenEvent({
+        user: "u",
+        model: "gpt-5",
+        source: "cursor",
+        messageId: "c1",
+        timestamp: TS,
+        inputTokens: 10,
+        costUsdMicros: 5_000,
+      }),
+      makeTokenEvent({
+        user: "u",
+        model: "gpt-5",
+        source: "codex",
+        messageId: "k1",
+        timestamp: TS,
+        inputTokens: 1_000_000,
+      }),
+    ]);
+    // Recreate the OLD shape: no hasStored, and the two rows collapsed into
+    // one mixed cell exactly as the previous release would have stored them.
+    first.db.exec(`
+      DROP TABLE events_roll_day;
+      CREATE TABLE events_roll_day (
+        day INTEGER NOT NULL, user TEXT NOT NULL, model TEXT NOT NULL,
+        messageType TEXT NOT NULL, events INTEGER NOT NULL,
+        inputTokens INTEGER NOT NULL, outputTokens INTEGER NOT NULL,
+        cacheCreationTokens INTEGER NOT NULL, cacheReadTokens INTEGER NOT NULL,
+        reasoningTokens INTEGER NOT NULL, storedCostMicros INTEGER NOT NULL,
+        maxTimestamp INTEGER NOT NULL,
+        PRIMARY KEY (day, user, model, messageType)
+      ) WITHOUT ROWID;
+      INSERT INTO events_roll_day VALUES
+        (0, 'u', 'gpt-5', 'assistant', 2, 1000010, 0, 0, 0, 0, 5000, ${TS});
+    `);
+    first.close();
+
+    const reopened = new Store(path);
+    try {
+      const cols = reopened.db
+        .prepare<{ name: string }, []>("PRAGMA table_info(events_roll_day)")
+        .all();
+      expect(cols.some((c) => c.name === "hasStored")).toBe(true);
+
+      // Rebuilt from raw events, so the mixed cell is now split and the
+      // Codex tokens are recoverable rather than fused to a Cursor price.
+      const [row] = reopened.adminUserModel(0, MAX_TS_MS);
+      expect(row!.storedCostMicros).toBe(5_000);
+      expect(row!.derivedInputTokens).toBe(1_000_000);
+      expect(row!.inputTokens).toBe(1_000_010);
+    } finally {
+      reopened.close();
+      t.cleanup();
+    }
   });
 });
