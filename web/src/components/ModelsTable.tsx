@@ -4,6 +4,25 @@ import { fmtCompact, fmtInt, fmtUsd } from "../format";
 
 const COLS = 7;
 
+/**
+ * A cache column reads 0 for two very different reasons: the model really
+ * cached nothing, or the source never reports that field at all. OpenAI is
+ * the second case — Codex writes `cache_write_input_tokens` and it is
+ * always literally 0, because OpenAI caches automatically with no separate
+ * write step, unlike Anthropic which bills writes at 1.25x and reads at
+ * 0.1x. Rendering a bare "0" next to Claude's billions reads as a broken
+ * column; an em-dash says "not reported", which is what it means. Same
+ * treatment the unknown-price column already uses.
+ */
+function cacheCell(n: number) {
+  if (n > 0) return fmtCompact(n);
+  return (
+    <span className="muted-2" title="not reported by this source">
+      —
+    </span>
+  );
+}
+
 export function ModelsTable({
   rows,
   failed,
@@ -83,8 +102,8 @@ export function ModelsTable({
           <td className="num">{fmtInt(m.count)}</td>
           <td className="num">{fmtCompact(m.inputTokens)}</td>
           <td className="num">{fmtCompact(m.outputTokens)}</td>
-          <td className="num col-cache">{fmtCompact(m.cacheCreationTokens)}</td>
-          <td className="num col-cache">{fmtCompact(m.cacheReadTokens)}</td>
+          <td className="num col-cache">{cacheCell(m.cacheCreationTokens)}</td>
+          <td className="num col-cache">{cacheCell(m.cacheReadTokens)}</td>
           <td className="num">
             {m.unknownPrice ? <span className="muted-2">—</span> : fmtUsd(m.costUsd)}
           </td>

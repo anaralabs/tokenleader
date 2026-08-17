@@ -53,6 +53,29 @@ function normalizeEntry(raw: RawEntry): ModelPrice | null {
   };
 }
 
+/**
+ * Models that show up in real traffic but that LiteLLM does not publish a
+ * price for. Without an entry the model prices at $0 with `unknownPrice`,
+ * and a silent $0 understates a total far more misleadingly than a close
+ * approximation does — `codex-auto-review` alone carries ~4B cache-read
+ * tokens across the fleet.
+ *
+ * Each alias maps to the nearest PUBLISHED model, and each is a deliberate
+ * approximation, not a discovered rate:
+ *   codex-auto-review — the review sub-agent Codex spawns to check its own
+ *     diffs. Real inference on a real model, but OpenAI publishes no
+ *     separate rate for it. Mapped to gpt-5-codex (the cheaper of the two
+ *     plausible codex tiers) so the estimate errs low rather than
+ *     inventing spend.
+ *
+ * Applied inside buildMap so an upstream refresh cannot drop them, and only
+ * when upstream has no real entry — the moment LiteLLM publishes one, the
+ * real price wins.
+ */
+const PRICE_ALIASES: Record<string, string> = {
+  "codex-auto-review": "gpt-5-codex",
+};
+
 function buildMap(rawJson: Record<string, RawEntry>): Map<string, ModelPrice> {
   const out = new Map<string, ModelPrice>();
   for (const [name, entry] of Object.entries(rawJson)) {
@@ -61,6 +84,11 @@ function buildMap(rawJson: Record<string, RawEntry>): Map<string, ModelPrice> {
     const price = normalizeEntry(entry);
     if (!price) continue;
     out.set(name.toLowerCase(), price);
+  }
+  for (const [alias, target] of Object.entries(PRICE_ALIASES)) {
+    if (out.has(alias)) continue;
+    const price = out.get(target);
+    if (price) out.set(alias, price);
   }
   return out;
 }

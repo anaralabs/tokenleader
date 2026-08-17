@@ -114,6 +114,12 @@ export interface FileState {
     cachedInputTokens: number;
     reasoningTokens: number;
   };
+  /** Codex only: model in effect at the end of the last read of this file.
+   *  `turn_context` is written once per turn, so an incremental read can
+   *  open mid-turn and see token usage with no model line in its window;
+   *  without carrying it forward the parser fell back to a placeholder and
+   *  billed the turn to a model nobody ran. */
+  lastModel?: string;
 }
 
 export interface CursorLocalState {
