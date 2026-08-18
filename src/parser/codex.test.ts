@@ -16,6 +16,7 @@ interface UsageNums {
   input: number;
   output: number;
   cached: number;
+  cacheWrite?: number;
   reasoning: number;
 }
 
@@ -23,6 +24,7 @@ function usageJson(u: UsageNums) {
   return {
     input_tokens: u.input,
     cached_input_tokens: u.cached,
+    ...(u.cacheWrite !== undefined ? { cache_write_input_tokens: u.cacheWrite } : {}),
     output_tokens: u.output,
     reasoning_output_tokens: u.reasoning,
     total_tokens: u.input + u.output,
@@ -113,6 +115,65 @@ describe("parseCodexFile (synthetic)", () => {
     // messageIds unique within file
     const ids = new Set(r.events.map((e) => e.messageId));
     expect(ids.size).toBe(r.events.length);
+  });
+
+  it("splits input into plain / cache-read / cache-write when Codex reports cache_write_input_tokens", async () => {
+    // openai/codex `parses_cache_write_token_usage`: input 100 = cached 40 + write 60.
+    const path = await makeTempJsonl("rollout-CW.jsonl", [
+      JSON.stringify(turnContextLine("gpt-5.6")),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:01.000Z", {
+          input: 100,
+          output: 10,
+          cached: 40,
+          cacheWrite: 60,
+          reasoning: 5,
+        }),
+      ),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:02.000Z", {
+          input: 200,
+          output: 10,
+          cached: 120,
+          cacheWrite: 30,
+          reasoning: 0,
+        }),
+      ),
+      // ChatGPT-backend rollouts carry the field as a literal 0: nothing changes.
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:03.000Z", {
+          input: 100,
+          output: 1,
+          cached: 70,
+          cacheWrite: 0,
+          reasoning: 0,
+        }),
+      ),
+      // Overflowing write is clamped so the three buckets never exceed input.
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:04.000Z", {
+          input: 100,
+          output: 1,
+          cached: 70,
+          cacheWrite: 50,
+          reasoning: 0,
+        }),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.length).toBe(4);
+    expect(r.events[0]!.inputTokens).toBe(0);
+    expect(r.events[0]!.cacheReadTokens).toBe(40);
+    expect(r.events[0]!.cacheCreationTokens).toBe(60);
+    expect(r.events[1]!.inputTokens).toBe(50);
+    expect(r.events[1]!.cacheReadTokens).toBe(120);
+    expect(r.events[1]!.cacheCreationTokens).toBe(30);
+    expect(r.events[2]!.inputTokens).toBe(30);
+    expect(r.events[2]!.cacheReadTokens).toBe(70);
+    expect(r.events[2]!.cacheCreationTokens).toBe(0);
+    expect(r.events[3]!.inputTokens).toBe(0);
+    expect(r.events[3]!.cacheReadTokens).toBe(70);
+    expect(r.events[3]!.cacheCreationTokens).toBe(30);
   });
 
   it("preserves totals bookkeeping across reads via prevSessionTotals", async () => {

@@ -50,6 +50,7 @@ interface CodexUsage {
   input_tokens?: number;
   cached_input_tokens?: number;
   cache_read_input_tokens?: number;
+  cache_write_input_tokens?: number;
   output_tokens?: number;
   reasoning_output_tokens?: number;
   total_tokens?: number;
@@ -132,6 +133,7 @@ function usageNums(u: CodexUsage) {
     input: readNum(u.input_tokens),
     output: readNum(u.output_tokens),
     cached: readNum(u.cached_input_tokens, u.cache_read_input_tokens),
+    cacheWrite: readNum(u.cache_write_input_tokens),
     reasoning: readNum(u.reasoning_output_tokens),
   };
 }
@@ -291,12 +293,14 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     let dInput: number;
     let dOutput: number;
     let dCached: number;
+    let dCacheWrite = 0;
     let dReasoning: number;
     if (last) {
       ({
         input: dInput,
         output: dOutput,
         cached: dCached,
+        cacheWrite: dCacheWrite,
         reasoning: dReasoning,
       } = usageNums(last));
     } else {
@@ -333,7 +337,9 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     // child's cumulative continues the parent's), but nothing is billed.
     if (seedActive) continue;
 
-    if (dInput === 0 && dOutput === 0 && dCached === 0 && dReasoning === 0) continue;
+    if (dInput === 0 && dOutput === 0 && dCached === 0 && dCacheWrite === 0 && dReasoning === 0) {
+      continue;
+    }
 
     const tsStr = isString(raw.timestamp) ? raw.timestamp : new Date().toISOString();
     const tsMs = Date.parse(tsStr);
@@ -349,13 +355,19 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     if (eventModel) currentModel = eventModel;
     const model = currentModel ?? LEGACY_FALLBACK_MODEL;
 
-    // Codex reports `input_tokens` INCLUSIVE of `cached_input_tokens`.
-    // Normalize at the parse boundary so downstream cost math stays uniform:
-    //   inputTokens     := non-cached portion (paid at full input rate)
-    //   cacheReadTokens := cached portion     (paid at cache-read rate)
-    // Clamp cached at input to defend against out-of-order delta noise.
+    // Codex reports `input_tokens` INCLUSIVE of both `cached_input_tokens`
+    // and `cache_write_input_tokens` (openai/codex parses_cache_write_token_usage:
+    // input 100 = cached 40 + write 60). Normalize at the parse boundary so
+    // downstream cost math stays uniform:
+    //   inputTokens         := plain portion   (paid at full input rate)
+    //   cacheReadTokens     := cached portion  (paid at cache-read rate)
+    //   cacheCreationTokens := written portion (paid at cache-write rate)
+    // Clamp both at input to defend against out-of-order delta noise. The
+    // ChatGPT-backend rollouts seen so far carry the field as a literal 0,
+    // so cacheCreation stays 0 there — the dashboard renders that as "—".
     const cappedCached = Math.min(dCached, dInput);
-    const nonCachedInput = Math.max(0, dInput - cappedCached);
+    const cappedWrite = Math.min(dCacheWrite, Math.max(0, dInput - cappedCached));
+    const nonCachedInput = Math.max(0, dInput - cappedCached - cappedWrite);
 
     events.push({
       user,
@@ -368,7 +380,7 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
       messageType: "assistant",
       inputTokens: nonCachedInput,
       outputTokens: dOutput,
-      cacheCreationTokens: 0,
+      cacheCreationTokens: cappedWrite,
       cacheReadTokens: cappedCached,
       reasoningTokens: dReasoning,
     });
