@@ -14,6 +14,7 @@ import {
   classifyDevice,
   countUnexplainedResets,
   CRASH_LOOP_THRESHOLD,
+  devicePlatformHasWatchdog,
   type DaemonCheckinState,
   type DeviceSignals,
   lateThresholdMs,
@@ -92,6 +93,33 @@ describe("classifyDevice", () => {
     expect(classifyDevice(signals({ lastSeen: NOW - 45 * MIN }), NOW)).toBe("LATE");
     expect(classifyDevice(signals({ lastSeen: NOW - 12 * HOUR }), NOW)).toBe("LATE");
     expect(classifyDevice(signals({ lastSeen: NOW - 25 * HOUR }), NOW)).toBe("DARK");
+  });
+
+  test("a silent LINUX device goes DARK in an hour, not a day", () => {
+    // Linux is single-channel BY DESIGN (systemd is the supervisor; the
+    // daemon reports watchdog_installed=null and never sends a watchdog
+    // checkin). Treating it like a pre-0.6 Mac hid a destroyed VPS behind a
+    // 24h LATE — nobody gets paged for a day. A v0.6+ Mac with both channels
+    // silent goes DARK in an hour; so does a Linux box with its one channel
+    // silent.
+    const linux = { platform: "linux-arm64", watchdog_installed: null };
+    const silent = (ms: number): DeviceSignals =>
+      signals({
+        lastSeen: NOW - ms,
+        checkin: makeCheckinBody(linux as Partial<DaemonCheckinState>),
+      });
+    expect(classifyDevice(silent(45 * MIN), NOW)).toBe("LATE");
+    expect(classifyDevice(silent(90 * MIN), NOW)).toBe("DARK");
+    // A darwin device that never reported a watchdog is genuinely pre-0.6 —
+    // an overnight sleep is indistinguishable from death, so it keeps the
+    // full-day bar.
+    const mac = signals({
+      lastSeen: NOW - 90 * MIN,
+      checkin: makeCheckinBody({ platform: "darwin-arm64" } as Partial<DaemonCheckinState>),
+    });
+    expect(classifyDevice(mac, NOW)).toBe("LATE");
+    // …as does a device that reports no platform at all (pre-v0.7 daemon).
+    expect(classifyDevice(signals({ lastSeen: NOW - 90 * MIN }), NOW)).toBe("LATE");
   });
 
   test("version-aware: identical daemon silence is WEDGED with a live watchdog, LATE without one", () => {
@@ -304,6 +332,25 @@ describe("countUnexplainedResets", () => {
 });
 
 describe("body sanitizers", () => {
+  test("devicePlatformHasWatchdog: darwin yes, linux no, ABSENT yes (pre-v0.7 is all darwin)", () => {
+    expect(devicePlatformHasWatchdog("darwin-arm64")).toBe(true);
+    expect(devicePlatformHasWatchdog("darwin-x64")).toBe(true);
+    expect(devicePlatformHasWatchdog("linux-x64")).toBe(false);
+    expect(devicePlatformHasWatchdog("linux-arm64")).toBe(false);
+    // The default MUST stay true: every fielded daemon before v0.7 sends no
+    // platform at all, and every one of them is a Mac that still needs to
+    // converge onto the watchdog.
+    expect(devicePlatformHasWatchdog(null)).toBe(true);
+    expect(devicePlatformHasWatchdog(undefined)).toBe(true);
+    expect(devicePlatformHasWatchdog("")).toBe(true);
+  });
+
+  test("sanitizeCheckinBody keeps a platform token and drops a junk one", () => {
+    expect(sanitizeCheckinBody({ platform: "linux-arm64" })?.platform).toBe("linux-arm64");
+    expect(sanitizeCheckinBody({ platform: 42 })?.platform).toBeUndefined();
+    expect(sanitizeCheckinBody({})?.platform).toBeUndefined();
+  });
+
   test("sanitizeCheckinBody: non-objects are null; junk fields fall to defaults; tail is filtered + capped", () => {
     expect(sanitizeCheckinBody("nope")).toBeNull();
     expect(sanitizeCheckinBody(null)).toBeNull();
@@ -663,6 +710,66 @@ describe("sweepFleetAlerts", () => {
     setTimes("zola", t0 - 2 * MIN, null);
     await sweep(t0 + 10 * MIN);
     expect(store.listDirectives("zola").length).toBe(0);
+  });
+
+  test("convergence: a LINUX device is never nudged — it has no watchdog by design", async () => {
+    // systemd is the supervisor on Linux (Restart=always +
+    // StartLimitIntervalSec=0), so the watchdog channel is silent FOREVER by
+    // design. Without this gate the sweep queued a reinstall_watchdog at
+    // every Linux device every dedup window: a fake self-heal loop that also
+    // burned the one-directive-per-checkin slot. Verified in Docker: a real
+    // Linux daemon checks in with platform="linux-arm64",
+    // watchdog_installed=null, and classifies HEALTHY.
+    const deviceId = await claim("linus", "vps01");
+    const t0 = Date.now();
+    park([...PRIOR_USERS, "wanda", "yves", "zola", "noor"], t0);
+    store.db
+      .prepare("UPDATE user_devices SET version = ? WHERE username = ?")
+      .run("v0.7.0", "linus");
+    setTimes("linus", t0 - 2 * MIN, null); // daemon fresh, watchdog NEVER
+    store.saveDeviceCheckinState(
+      "linus",
+      deviceId,
+      "daemon",
+      JSON.stringify(makeCheckinBody({ watchdog_installed: null, platform: "linux-arm64" })),
+      t0,
+    );
+    const sweep = (now: number) =>
+      sweepFleetAlerts({ store, webhookUrl: null, suppressed: false, now, log: quiet });
+
+    const rows = await sweep(t0);
+    expect(store.listDirectives("linus").length).toBe(0);
+    // …and a missing watchdog must not make it look broken either.
+    expect(rows.find((d) => d.user === "linus")).toBeUndefined();
+
+    // Still quiet a full dedup window later — this is the "forever" part.
+    await sweep(t0 + ALERT_DEDUP_MS + MIN);
+    expect(store.listDirectives("linus").length).toBe(0);
+  });
+
+  test("convergence: a DARWIN device that reports its platform is still nudged", async () => {
+    // The gate must not accidentally silence macOS. v0.7+ darwin daemons send
+    // platform="darwin-*"; every daemon before v0.7 sends nothing at all, and
+    // all of those are darwin — so an ABSENT platform must keep converging or
+    // the whole fielded fleet would stop.
+    const deviceId = await claim("dana", "mbp16");
+    const t0 = Date.now();
+    park([...PRIOR_USERS, "wanda", "yves", "zola", "noor", "linus"], t0);
+    store.db
+      .prepare("UPDATE user_devices SET version = ? WHERE username = ?")
+      .run("v0.7.0", "dana");
+    setTimes("dana", t0 - 2 * MIN, null);
+    store.saveDeviceCheckinState(
+      "dana",
+      deviceId,
+      "daemon",
+      JSON.stringify(makeCheckinBody({ watchdog_installed: null, platform: "darwin-arm64" })),
+      t0,
+    );
+    await sweepFleetAlerts({ store, webhookUrl: null, suppressed: false, now: t0, log: quiet });
+    expect(store.listDirectives("dana").filter((d) => d.verb === "reinstall_watchdog").length).toBe(
+      1,
+    );
   });
 
   test("WATCHDOG_MISSING: watchdog_installed=false pages after 1h, dedups, resets on recovery", async () => {

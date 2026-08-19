@@ -27,15 +27,18 @@ Optional: `--company=anara.com` tags the handle with a company affiliation
 
 The script:
 
-1. Detects your arch (Apple Silicon or Intel) and downloads the matching
-   daemon binary **from your server's own `/bin` route** — teammate machines
-   never talk to GitHub.
+1. Detects your OS + arch (`darwin-{arm64,x64}`, `linux-{x64,arm64}`) and
+   downloads the matching daemon binary **from your server's own `/bin` route**
+   — teammate machines never talk to GitHub. On Linux it first checks systemd,
+   glibc and curl and refuses cleanly, having installed nothing, if any is
+   missing ([self-hosting.md → Linux clients](self-hosting.md#linux-clients)).
 2. Verifies the binary's sha256 against your server's `/manifest.json`
    (transport integrity only — trust model in
    [updating.md](updating.md#how-updates-reach-your-team)).
-3. Installs the binary, registers a per-user LaunchAgent
-   (`launchctl bootstrap gui/$UID`), and kickstarts it. The first tick replays
-   your existing local history — the dashboard fills within minutes.
+3. Installs the binary and registers a background service — a per-user
+   LaunchAgent on macOS (`launchctl bootstrap gui/$UID`, then kickstart), or a
+   systemd unit on Linux (`systemctl enable --now`) — and starts it. The first
+   tick replays your existing local history; the dashboard fills within minutes.
 
 Idempotent: a reinstall keeps your state dir (and TOFU secret), so history
 continues under the same handle.
@@ -45,9 +48,11 @@ continues under the same handle.
 | Path | What |
 |---|---|
 | `~/.local/bin/tokenleader` | the daemon binary |
-| `~/Library/LaunchAgents/com.tokenleader.daemon.plist` | the LaunchAgent (env config lives here — see [configuration.md](configuration.md#daemon)) |
+| `~/Library/LaunchAgents/com.tokenleader.daemon.plist` | **macOS:** the LaunchAgent (env config lives here — see [configuration.md](configuration.md#daemon)) |
+| `/etc/systemd/system/tokenleader.service` (or `~/.config/systemd/user/…`) | **Linux:** the systemd unit |
+| `<stateDir>/daemon.env` | **Linux:** the config store the unit and the CLI share — the plist's counterpart ([configuration.md](configuration.md#the-daemon-config-store)) |
 | `~/.local/share/tokenleader/` | state dir: `secret` (TOFU identity), `state.json` (per-file read offsets), optional `endpoint` (server-migration override) |
-| `~/Library/Logs/tokenleader/` | structured logs (`daemon.jsonl`, rotated at 5 MB ×3) |
+| `~/Library/Logs/tokenleader/` · Linux `~/.local/state/anara-leaderboard/` | structured logs (`daemon.jsonl`, rotated at 5 MB ×3) |
 
 Nothing else: it reads `~/.claude/projects/`, the Claude Desktop app's Cowork
 session tree (`~/Library/Application Support/Claude/{local-agent-mode-sessions,claude-code-sessions}/**/.claude/projects/`),
@@ -168,10 +173,19 @@ secret, but the server holds the old hash. Three ways out:
 ## Uninstall
 
 ```bash
+# macOS, and any Linux box running a `systemd --user` unit
 curl -fsSL https://leaderboard.example.com/uninstall | bash
+
+# Linux installed with sudo (the default: a system unit under /etc)
+curl -fsSL https://leaderboard.example.com/uninstall | sudo bash
 ```
 
-Stops and removes the LaunchAgent and binary, and notifies the server
+The installer's summary prints whichever form matches the install it
+performed; against a system unit the sudo-less form refuses up front and
+changes nothing.
+
+Stops and removes the service (LaunchAgent on macOS, systemd unit on Linux)
+and the binary, and notifies the server
 (`POST /events/uninstall`, authenticated with the on-disk secret) so the name
 becomes re-claimable. You'll be asked whether to also delete state + logs;
 pre-answer with `TOKENLEADER_PURGE=y` (deletes the TOFU secret too) or
@@ -182,8 +196,16 @@ pre-answer with `TOKENLEADER_PURGE=y` (deletes the TOFU secret too) or
 The daemon polls your server's `/manifest.json` about hourly (first check
 ~30 s after boot, never overlapping a tick). On a sha256 difference for its
 platform it downloads from `/bin/*`, verifies, atomically renames over its own
-binary, and restarts via `launchctl kickstart -k`. Propagation timing, trust
-model, rollback: [updating.md](updating.md).
+binary, and exits so the supervisor respawns it (launchd on macOS, systemd on
+Linux). Propagation timing, trust model, rollback: [updating.md](updating.md).
+
+Fetching a binary by hand: the asset suffix for **darwin is the bare arch**
+(`/bin/anara-leaderboard-arm64`, `-x64`, and the legacy `-x86_64` alias), and
+Linux is platform-qualified (`-linux-x64`, `-linux-arm64`). So
+`curl $SERVER/bin/anara-leaderboard-$(uname -m)` on a Linux box hands back a
+**Mach-O** — the bare spellings are frozen darwin contracts. Use the
+qualified form (`darwin-arm64` / `darwin-x64` work too) when spelling it out
+by hand.
 
 ## Building and running your own daemon
 
@@ -228,6 +250,15 @@ This opts out of fleet updates entirely — you own keeping the binary current.
 
 ## Platform support
 
-macOS (Apple Silicon + Intel) today; Linux (x64/arm64, systemd user unit,
-covers WSL) is next; native Windows later. The update manifest already carries
-the OS dimension, so new platforms arrive without breaking existing daemons.
+| Platform | Service | Notes |
+|---|---|---|
+| macOS arm64 / x64 | launchd LaunchAgent + the v0.6.0 watchdog pair | |
+| Linux x86_64 / aarch64 (glibc) | systemd **system** unit by default; `--user` + lingering as the no-root fallback | Needs systemd and curl; Alpine/musl is refused. No watchdog — systemd is the supervisor, and the daemon reports `watchdog_installed: null` so its absence never reads as degraded. Details: [self-hosting.md → Linux clients](self-hosting.md#linux-clients). |
+| Windows / WSL | — | not yet. |
+
+`--version` prints `<version> <build-sha> <os>-<arch>`, and the same
+`${os}-${arch}` token keys `manifest.platforms`, names the `/bin` asset, and is
+reported on every checkin — one name for "which build am I", so the four can
+never drift apart. The two darwin `/bin` asset names (`anara-leaderboard-arm64`,
+`-x64`) and the legacy top-level manifest keys are frozen for the fielded fleet;
+Linux is additive.

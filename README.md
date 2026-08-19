@@ -116,10 +116,19 @@ on disk.)
 
 ### 2. Teammates install the daemon
 
-Each teammate runs one command on their Mac (pick your own leaderboard name):
+Each teammate runs one command (pick your own leaderboard name).
+
+**macOS:**
 
 ```bash
 curl -fsSL https://leaderboard.example.com/install | bash -s -- --name=alice
+```
+
+**Linux** (including headless VPSes) — same script, run it with `sudo` so it installs a
+systemd **system** unit that survives logout and reboot:
+
+```bash
+curl -fsSL https://leaderboard.example.com/install | sudo bash -s -- --name=alice
 ```
 
 If your server sets `TOKENLEADER_JOIN_TOKEN`, new names also pass the join code (the
@@ -129,23 +138,38 @@ dashboard renders the full command for you):
 curl -fsSL https://leaderboard.example.com/install | bash -s -- --name=alice --join=<code>
 ```
 
-That's it. The installer registers a LaunchAgent, posts every 5 minutes, and the daemon
-auto-updates itself from your server. The dashboard fills up within minutes.
+That's it. The installer registers a background service — a LaunchAgent on macOS, a
+systemd unit on Linux — posts every 5 minutes, and the daemon auto-updates itself from
+your server. The dashboard fills up within minutes.
 
 Got two Macs? Run `tokenleader link` on the first to mint a one-time pairing code, then
 install on the second with `--link=<code>` — both machines count under one name, and
 nobody can claim a handle they don't hold a secret (or a live code) for. Details:
 [docs/daemon.md](docs/daemon.md#one-handle-multiple-machines).
 
-> The daemon is macOS-only today (Apple Silicon + Intel). Linux + WSL support is the
-> headline item of the next release — the update manifest already carries the OS
-> dimension, so it lands without breaking anything.
+> **Supported daemon platforms:** macOS (Apple Silicon + Intel) and Linux
+> (x86_64 + aarch64, glibc). Linux needs **systemd** and **curl** — the installer checks
+> for both and refuses cleanly, installing nothing, if they're missing. Alpine/musl is
+> not supported. Without root the installer falls back to a `systemd --user` unit and
+> requires lingering (`sudo loginctl enable-linger <user>`), because a user unit is
+> killed seconds after you log out. See
+> [docs/self-hosting.md](docs/self-hosting.md#linux-clients). Windows/WSL is not
+> supported yet.
 
 ### Uninstall
 
 ```bash
+# macOS, and any Linux box running a `systemd --user` unit
 curl -fsSL https://leaderboard.example.com/uninstall | bash
+
+# Linux installed with sudo (the default: a system unit under /etc)
+curl -fsSL https://leaderboard.example.com/uninstall | sudo bash
 ```
+
+The installer prints whichever form matches the install it performed. Run the
+sudo-less form against a system unit and it refuses up front, changing
+nothing — rather than notifying the server and then failing to remove the
+unit.
 
 ## Supported sources
 

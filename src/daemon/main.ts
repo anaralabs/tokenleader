@@ -25,7 +25,8 @@ import {
   postDirectiveAck,
   type TransportOpts,
 } from "./transport";
-import { checkForUpdate, pickArch, RESTART_EXIT_CODE } from "./update";
+import { platformKey } from "./platform";
+import { checkForUpdate, RESTART_EXIT_CODE } from "./update";
 import { resolveWatchdogStateDir, runWatchdog } from "./watchdog";
 import { ensureWatchdogInstalled, type WatchdogInstallStatus } from "./watchdog-install";
 
@@ -164,10 +165,12 @@ function isTruthy(v: string | undefined): boolean {
 }
 
 // `--version` output: "<BUILD_VERSION> <BUILD_SHA> <platformKey>". Field 1 is
-// the bare tag CI's release guard compares against the pushed tag. The
-// platform key is the literal darwin-<arch> while the binary is darwin-only.
+// the bare tag CI's release guard compares against the pushed tag. Field 3 is
+// the real ${os}-${arch} token: it used to be a hardcoded "darwin-", so a
+// Linux daemon self-reported as darwin in every incident thread. On macOS the
+// rendered string is unchanged.
 export function versionLine(): string {
-  return `${BUILD_VERSION} ${BUILD_SHA} darwin-${pickArch()}`;
+  return `${BUILD_VERSION} ${BUILD_SHA} ${platformKey()}`;
 }
 
 /**
@@ -510,6 +513,10 @@ export async function runDaemon(cfg: ResolvedConfig, deps: RunDeps = {}): Promis
       exit_journal_tail: journalTail(cfg.stateDir, Date.now() - 24 * 60 * 60_000).slice(-20),
       watchdog_installed:
         ws === undefined || ws === "skipped" ? null : ws === "installed" || ws === "already",
+      // Lets the fleet sweep tell a Linux box (no watchdog BY DESIGN — systemd
+      // is the supervisor) from a Mac whose watchdog has gone silent. Absent
+      // on pre-v0.7 daemons, which the server reads as darwin.
+      platform: platformKey(),
     };
   };
 

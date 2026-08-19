@@ -1,8 +1,23 @@
 # Tag-driven release pipeline. ONE channel: push an annotated tag `vX.Y.Z`
-# (cut with scripts/release.sh) and this workflow builds the darwin daemons,
-# emits the dual-shape manifest, creates the GitHub release (draft ->
-# published flip = the atomic publication event), and pushes the multi-arch
-# server image to ghcr.
+# (cut with scripts/release.sh) and this workflow builds the darwin AND linux
+# daemons on native runners, emits the dual-shape manifest from one place,
+# creates the GitHub release (draft -> published flip = the atomic publication
+# event), and pushes the multi-arch server image to ghcr.
+#
+# Why the build is split across runners: `bun build --compile` cross-compiles
+# fine, but only a NATIVE runner can EXECUTE the artifact, and executing it is
+# what guards (b) and (f) are for. Linux therefore gets stronger release
+# coverage than darwin has (see guard (b)'s note on Rosetta/AVX2).
+#
+# COUPLING, ON PURPOSE: `manifest` needs BOTH build jobs, so a `daemons-linux`
+# failure (a queued-out ubuntu-24.04-arm runner class, an apt mirror error in
+# guard (b2)) blocks the darwin release too — including a macOS-only hotfix
+# for the 23 fielded Macs. The alternative is worse: publishing a darwin-only
+# manifest DE-LISTS `platforms.linux-*`, and every fielded Linux daemon then
+# resolves no entry for its arch and stops updating until the next tag. If you
+# are cutting an emergency darwin fix and linux CI is wedged, do NOT hand-edit
+# a short manifest — use scripts/publish-release.sh, which cross-compiles all
+# four binaries locally and emits the same four-platform manifest.
 #
 # Versioning: TAGS ARE THE VERSION. package.json stays 0.1.0 and is not
 # consulted — there is deliberately NO tag==package.json guard.
@@ -10,8 +25,20 @@
 #   (b) `--version` field 1 of every built binary == the tag (a manifest/
 #       binary version divergence would false-flag the whole fleet as stale
 #       on /stats/fleet);
+#   (b2) the linux-x64 artifact runs on a pre-AVX2 CPU (qemu -cpu Nehalem),
+#       skipped-with-a-warning if the emulator itself can't run it.
+#       It is compiled from bun's `-baseline` target on purpose: cheap and
+#       virtualised VPS hosts mask AVX2 (Proxmox/QEMU default kvm64/qemu64
+#       CPU models do it on brand-new silicon), and the failure mode is a
+#       diagnostic-free SIGILL crash-loop under Restart=always. This guard is
+#       the executable proof nobody has quietly "optimised" the target back.
 #   (c) legacy manifest arm64/x64 keys byte-equal their platforms.darwin-*
-#       mirrors (the fleet-frozen v1 consumer shape);
+#       mirrors (the fleet-frozen v1 consumer shape). NEVER extend it to
+#       linux: the legacy keys mean darwin forever;
+#   (c2) the manifest carries linux-x64 + linux-arm64, neither shares a sha
+#       with a darwin entry, and they do not share one with each other
+#       (catches a cross-wired artifact upload / both matrix legs pointed at
+#       the same target);
 #   (e) no .env/.env.local at build time (`bun build --compile` can inline
 #       build-cwd env files into compiled binaries).
 #
@@ -99,8 +126,129 @@ jobs:
           VERSION=v0.0.0-updategate bash scripts/build-daemon.sh '' /tmp/gate-next
           bun scripts/update-gate.ts bin/tokenleader-darwin-arm64 /tmp/gate-next
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bin-darwin
+          path: |
+            bin/tokenleader-darwin-arm64
+            bin/tokenleader-darwin-x64
+          if-no-files-found: error
+
+  daemons-linux:
+    strategy:
+      # Let BOTH legs report. With fail-fast a flaky x64 leg cancels arm64 and
+      # the rerun tells you nothing about whether arm64 was also broken —
+      # and the whole tag is blocked either way (see COUPLING in the header).
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners so guards (b) and (f) can EXECUTE the artifacts.
+          - runner: ubuntu-24.04
+            arch: x64
+            # BASELINE on purpose — see guard (b2) in the header.
+            target: bun-linux-x64-baseline
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            # bun-linux-arm64-baseline is an alias of bun-linux-arm64 (same
+            # ELF BuildID); there is no separate arm64 baseline runtime.
+            target: bun-linux-arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Guard (e) — no env files in the build cwd
+        run: test ! -e .env -a ! -e .env.local
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build linux daemon (version = tag)
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          bash scripts/build-daemon.sh ${{ matrix.target }} bin/tokenleader-linux-${{ matrix.arch }}
+          ls -lh bin/
+
+      - name: Guard (b) — built binary reports the tag (executed natively)
+        run: |
+          set -euo pipefail
+          got="$(bin/tokenleader-linux-${{ matrix.arch }} --version | awk '{print $1}')"
+          if [ "${got}" != "${GITHUB_REF_NAME}" ]; then
+            echo "guard (b) failed: linux-${{ matrix.arch }} --version reports '${got}', tag is '${GITHUB_REF_NAME}'" >&2
+            exit 1
+          fi
+          echo "guard (b) ok: bin/tokenleader-linux-${{ matrix.arch }} -> ${got} (executed)"
+
+      - name: Guard (b2) — linux-x64 runs on a pre-AVX2 CPU
+        if: matrix.arch == 'x64'
+        # qemu-user with an SSE4.2-era CPU mask distinguishes the two bun
+        # targets: non-baseline dies with SIGILL (exit 132), baseline runs.
+        #
+        # THE TOOLING IS NOT THE PROPERTY. Two things can fail here: the
+        # emulator (apt mirror hiccup, a qemu-user bug — reproduced locally,
+        # where qemu-user on an arm64 host dies with its own internal SIGSEGV
+        # before the guest starts) and the artifact. Only the second is a
+        # release-blocking fact. So: prove qemu can run this binary AT ALL
+        # first; if it cannot, warn and move on rather than burning a tag on
+        # infrastructure. If the unmasked run works and the masked run does
+        # not, that IS the AVX2 regression and it fails the build.
+        run: |
+          set -uo pipefail
+          if ! (sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static); then
+            echo "::warning::guard (b2) SKIPPED — could not install qemu-user-static"
+            exit 0
+          fi
+          if ! qemu-x86_64-static bin/tokenleader-linux-x64 --version >/dev/null 2>&1; then
+            echo "::warning::guard (b2) SKIPPED — qemu-user cannot run the artifact even unmasked (emulator problem, not an artifact problem)"
+            exit 0
+          fi
+          if ! qemu-x86_64-static -cpu Nehalem bin/tokenleader-linux-x64 --version; then
+            echo "guard (b2) failed: the linux-x64 artifact needs a post-Nehalem CPU." >&2
+            echo "It must be built from bun's -baseline target: cheap/virtualised VPS" >&2
+            echo "hosts mask AVX2 and the failure there is a silent SIGILL crash-loop." >&2
+            exit 1
+          fi
+          echo "guard (b2) ok: baseline artifact runs without AVX2"
+
+      - name: Guard (f) — released binary completes a real update cycle
+        run: |
+          VERSION=v0.0.0-updategate bash scripts/build-daemon.sh ${{ matrix.target }} /tmp/gate-next
+          bun scripts/update-gate.ts bin/tokenleader-linux-${{ matrix.arch }} /tmp/gate-next
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bin-linux-${{ matrix.arch }}
+          path: bin/tokenleader-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  manifest:
+    # ONE manifest, hashed from every artifact in one place. make-manifest
+    # throws when a platform's binary is missing, so a partially-failed matrix
+    # cannot silently publish a short manifest.
+    needs: [daemons, daemons-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+          pattern: release-bin-*
+          merge-multiple: true
+
       - name: Build manifest.json (dual shape)
-        run: bun scripts/make-manifest.ts --version "${GITHUB_REF_NAME}" --bin-dir bin --out bin/manifest.json
+        run: |
+          ls -lh bin/
+          bun scripts/make-manifest.ts --version "${GITHUB_REF_NAME}" --bin-dir bin --out bin/manifest.json
 
       - name: Guard (c) — legacy keys byte-equal the darwin platforms map
         run: |
@@ -108,17 +256,24 @@ jobs:
                  and .arm64 == .platforms."darwin-arm64"
                  and .x64 == .platforms."darwin-x64"' bin/manifest.json
 
+      - name: Guard (c2) — linux entries exist and are not darwin bytes
+        run: |
+          jq -e '(.platforms."linux-x64".sha256 | test("^[0-9a-f]{64}$"))
+                 and (.platforms."linux-arm64".sha256 | test("^[0-9a-f]{64}$"))
+                 and (.platforms."linux-x64".sha256 != .platforms."darwin-x64".sha256)
+                 and (.platforms."linux-x64".sha256 != .platforms."darwin-arm64".sha256)
+                 and (.platforms."linux-arm64".sha256 != .platforms."darwin-x64".sha256)
+                 and (.platforms."linux-arm64".sha256 != .platforms."darwin-arm64".sha256)
+                 and (.platforms."linux-x64".sha256 != .platforms."linux-arm64".sha256)' bin/manifest.json
+
       - uses: actions/upload-artifact@v4
         with:
-          name: release-bin
-          path: |
-            bin/tokenleader-darwin-arm64
-            bin/tokenleader-darwin-x64
-            bin/manifest.json
+          name: release-manifest
+          path: bin/manifest.json
           if-no-files-found: error
 
   publish-release:
-    needs: daemons
+    needs: manifest
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -127,13 +282,17 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: release-bin
           path: bin
+          pattern: release-*
+          merge-multiple: true
 
       - name: Legacy-named asset copies for the fielded fleet
-        # Fielded daemons (and server mirrors) still fetch
+        # Fielded DARWIN daemons (and server mirrors) still fetch
         # `anara-leaderboard-{arm64,x64}`. Publish byte-identical
         # copies under the legacy names alongside the canonical ones.
+        # Linux deliberately gets NO legacy alias: there is no fielded linux
+        # daemon to be compatible with, and the mirror fetches the canonical
+        # `tokenleader-linux-*` names directly.
         run: |
           cp bin/tokenleader-darwin-arm64 bin/anara-leaderboard-arm64
           cp bin/tokenleader-darwin-x64 bin/anara-leaderboard-x64
@@ -154,6 +313,8 @@ jobs:
             --notes "tokenleader ${TAG} — daemon binaries + manifest. Server image: ghcr.io/${GH_REPO%%/*}/tokenleader:${TAG}." \
             bin/tokenleader-darwin-arm64 \
             bin/tokenleader-darwin-x64 \
+            bin/tokenleader-linux-x64 \
+            bin/tokenleader-linux-arm64 \
             bin/anara-leaderboard-arm64 \
             bin/anara-leaderboard-x64 \
             bin/manifest.json

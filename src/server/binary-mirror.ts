@@ -1,10 +1,19 @@
 // BinaryMirror — server side of the daemon auto-update channel. Polls the
 // `latest` GitHub Release on TOKENLEADER_GH_REPO and caches manifest.json +
-// both arch binaries on disk; /manifest.json and /bin/* serve from that
+// the per-platform binaries on disk; /manifest.json and /bin/* serve from that
 // cache so daemons never talk to GitHub directly. Assets are written
-// tmp-then-rename with the manifest renamed LAST, so a polling daemon sees
-// a new sha only after both binaries are servable. Transient fetch errors
-// log and retry next tick. Callers MUST stop() on shutdown/teardown.
+// tmp-then-rename with the manifest renamed LAST, so a polling daemon sees a
+// new sha only after every binary THE RELEASE CARRIES is servable.
+//
+// That last clause is the honest form of the invariant: the linux assets are
+// OPTIONAL (see REQUIRED_ASSETS), so a release can advertise a linux sha in
+// its manifest while carrying no linux asset — e.g. an operator deletes a bad
+// linux binary from the published release as incident response. The darwin
+// channel must keep flowing in that case, so the cycle proceeds and
+// warnUnservableManifestEntries() logs every advertised-but-unservable
+// platform loudly instead of letting linux daemons re-download forever with
+// no signal. Transient fetch errors log and retry next tick. Callers MUST
+// stop() on shutdown/teardown.
 
 import { createHash } from "node:crypto";
 import { existsSync, promises as fsp, readFileSync, statSync } from "node:fs";
@@ -15,12 +24,46 @@ import { gzip as gzipCb } from "node:zlib";
 const gzipAsync = promisify(gzipCb);
 
 /**
- * Architectures the mirror manages. The `anara-leaderboard-<arch>` filenames
- * match the GH Release asset names (.github/workflows/release-binaries.yml)
- * and are intentionally legacy — fielded daemons depend on them.
+ * Assets the mirror manages, named by the suffix that appears BOTH in the
+ * on-disk cache filename `anara-leaderboard-<suffix>` and in the `/bin`
+ * route. The two darwin suffixes are the bare arch and are intentionally
+ * legacy — fielded daemons build that URL from `process.arch`, so those two
+ * names are frozen forever. Linux is additive and platform-keyed.
  */
-export const MIRRORED_ARCHES = ["arm64", "x64"] as const;
-export type MirroredArch = (typeof MIRRORED_ARCHES)[number];
+export const MIRRORED_ASSETS = ["arm64", "x64", "linux-x64", "linux-arm64"] as const;
+export type MirroredAsset = (typeof MIRRORED_ASSETS)[number];
+
+/**
+ * Assets whose absence from a release aborts the whole mirror cycle.
+ *
+ * ONLY the darwin pair. The mirror follows the `releases/latest` marker,
+ * which routinely points at a release older than the running server image
+ * (a rollback, or a server deployed ahead of the next tag). If the linux
+ * assets were required, the first such release would stop mirroring
+ * ENTIRELY — no manifest, no binaries — and take the 23-machine darwin
+ * fleet's update channel down with it.
+ */
+export const REQUIRED_ASSETS: readonly MirroredAsset[] = ["arm64", "x64"];
+
+/** `platforms` key of the v2 manifest per mirrored asset — the inverse of the
+ *  frozen darwin spelling: the manifest is platform-keyed even where the
+ *  asset name and /bin route are the bare legacy arch. */
+const MANIFEST_PLATFORM_KEY: Record<MirroredAsset, string> = {
+  arm64: "darwin-arm64",
+  x64: "darwin-x64",
+  "linux-x64": "linux-x64",
+  "linux-arm64": "linux-arm64",
+};
+
+/** GH Release asset name per mirrored asset. darwin keeps the legacy fleet
+ *  names; linux uses the canonical release artifact name directly, so no
+ *  duplicate ~94 MB upload is needed just to rename it. */
+const GH_ASSET_NAME: Record<MirroredAsset, string> = {
+  arm64: "anara-leaderboard-arm64",
+  x64: "anara-leaderboard-x64",
+  "linux-x64": "tokenleader-linux-x64",
+  "linux-arm64": "tokenleader-linux-arm64",
+};
 
 export const DEFAULT_MIRROR_INTERVAL_SEC = 15 * 60;
 export const INITIAL_FETCH_DELAY_MS = 5_000;
@@ -86,11 +129,24 @@ function isGhRelease(v: unknown): v is GhRelease {
   );
 }
 
-/** Daemons send `arm64`/`x64`; curl users may pass `x86_64` (→ x64).
- *  Anything else → null. */
-export function normalizeArch(raw: string): MirroredArch | null {
-  if (raw === "arm64") return "arm64";
-  if (raw === "x64" || raw === "x86_64") return "x64";
+/**
+ * Map a `/bin/anara-leaderboard-<suffix>` suffix onto a mirrored asset.
+ *
+ * The three legacy spellings (`arm64`, `x64`, `x86_64`) must keep resolving
+ * to DARWIN forever — fielded daemons build that URL from `process.arch` and
+ * the mac install script uses `x64` for Intel. Note the consequence: a bare
+ * `x86_64` means DARWIN, so `curl $SERVER/bin/anara-leaderboard-$(uname -m)`
+ * on a Linux box hands back a Mach-O. The platform-qualified spellings are
+ * the unambiguous ones, and `darwin-*` exists so both platforms can be named
+ * the same way. Linux spellings are additive, with the same `uname -m`
+ * courtesy aliases a hand-rolled curl user would reach for. Anything else →
+ * null (404).
+ */
+export function normalizeArch(raw: string): MirroredAsset | null {
+  if (raw === "arm64" || raw === "darwin-arm64") return "arm64";
+  if (raw === "x64" || raw === "x86_64" || raw === "darwin-x64") return "x64";
+  if (raw === "linux-x64" || raw === "linux-x86_64" || raw === "linux-amd64") return "linux-x64";
+  if (raw === "linux-arm64" || raw === "linux-aarch64") return "linux-arm64";
   return null;
 }
 
@@ -98,12 +154,12 @@ function manifestPath(cacheDir: string): string {
   return path.join(cacheDir, "manifest.json");
 }
 
-function binaryPath(cacheDir: string, arch: MirroredArch): string {
-  return path.join(cacheDir, `anara-leaderboard-${arch}`);
+function binaryPath(cacheDir: string, asset: MirroredAsset): string {
+  return path.join(cacheDir, `anara-leaderboard-${asset}`);
 }
 
-function gzipPath(cacheDir: string, arch: MirroredArch): string {
-  return `${binaryPath(cacheDir, arch)}.gz`;
+function gzipPath(cacheDir: string, asset: MirroredAsset): string {
+  return `${binaryPath(cacheDir, asset)}.gz`;
 }
 
 function sha256Hex(buf: Uint8Array): string {
@@ -235,7 +291,7 @@ export class BinaryMirror {
 
   /** On-disk path of the cached binary for `arch`, or null if not present.
    *  Caller streams via `Bun.file(path)`. */
-  getBinary(arch: MirroredArch): { path: string; size: number } | null {
+  getBinary(arch: MirroredAsset): { path: string; size: number } | null {
     const p = binaryPath(this.cacheDir, arch);
     try {
       const st = statSync(p);
@@ -253,7 +309,7 @@ export class BinaryMirror {
    *  manifest sha is unchanged. Returns null when no fresh .gz exists yet
    *  (ensureGzip hasn't run, or it's stale after a refresh) — the route then
    *  falls back to the raw binary. */
-  getBinaryGzip(arch: MirroredArch): { path: string; size: number } | null {
+  getBinaryGzip(arch: MirroredAsset): { path: string; size: number } | null {
     try {
       const rawStat = statSync(binaryPath(this.cacheDir, arch));
       const gzStat = statSync(gzipPath(this.cacheDir, arch));
@@ -271,7 +327,7 @@ export class BinaryMirror {
    *  start() and after each successful refresh so /bin can serve gzip. Errors
    *  are logged, never thrown — gzip is an optimization; raw serving still works. */
   async ensureGzip(): Promise<void> {
-    for (const arch of MIRRORED_ARCHES) {
+    for (const arch of MIRRORED_ASSETS) {
       const raw = binaryPath(this.cacheDir, arch);
       const gz = gzipPath(this.cacheDir, arch);
       let rawStat: ReturnType<typeof statSync>;
@@ -340,19 +396,25 @@ export class BinaryMirror {
       this.log.warn("[tokenleader] binary-mirror: release missing manifest.json asset");
       return;
     }
-    const archAssets: Record<MirroredArch, GhAsset | undefined> = {
-      arm64: release.assets.find((a) => a.name === "anara-leaderboard-arm64"),
-      x64: release.assets.find((a) => a.name === "anara-leaderboard-x64"),
-    };
-    for (const arch of MIRRORED_ARCHES) {
-      if (!archAssets[arch]) {
-        this.log.warn(
-          "[tokenleader] binary-mirror: release missing asset",
-          `anara-leaderboard-${arch}`,
-        );
+    // Required assets missing => bail the cycle. Optional (linux) assets
+    // missing => mirror what the release actually has; a pre-linux release
+    // must not stop the darwin update channel.
+    const found: Partial<Record<MirroredAsset, GhAsset>> = {};
+    for (const asset of MIRRORED_ASSETS) {
+      const gh = release.assets.find((a) => a.name === GH_ASSET_NAME[asset]);
+      if (gh) {
+        found[asset] = gh;
+      } else if (REQUIRED_ASSETS.includes(asset)) {
+        this.log.warn("[tokenleader] binary-mirror: release missing asset", GH_ASSET_NAME[asset]);
         return;
+      } else {
+        this.log.info(
+          "[tokenleader] binary-mirror: release has no optional asset",
+          GH_ASSET_NAME[asset],
+        );
       }
     }
+    const present = MIRRORED_ASSETS.filter((a) => found[a] !== undefined);
 
     let manifestBytes: Uint8Array;
     try {
@@ -372,15 +434,12 @@ export class BinaryMirror {
       return;
     }
 
-    const tmpPaths: Record<MirroredArch, string> = {
-      arm64: `${binaryPath(this.cacheDir, "arm64")}.tmp.${process.pid}`,
-      x64: `${binaryPath(this.cacheDir, "x64")}.tmp.${process.pid}`,
-    };
+    const tmpPath = (asset: MirroredAsset): string =>
+      `${binaryPath(this.cacheDir, asset)}.tmp.${process.pid}`;
     try {
-      for (const arch of MIRRORED_ARCHES) {
-        const asset = archAssets[arch]!;
-        const bytes = await this.fetchAssetBytes(asset);
-        await fsp.writeFile(tmpPaths[arch], bytes);
+      for (const asset of present) {
+        const bytes = await this.fetchAssetBytes(found[asset]!);
+        await fsp.writeFile(tmpPath(asset), bytes);
         // Daemons fetch + chmod themselves; we don't need +x here.
       }
     } catch (err: unknown) {
@@ -389,9 +448,9 @@ export class BinaryMirror {
         String((err as Error)?.message ?? err),
       );
       // Clean up any tmp file we did write before bailing.
-      for (const arch of MIRRORED_ARCHES) {
+      for (const asset of present) {
         try {
-          await fsp.unlink(tmpPaths[arch]);
+          await fsp.unlink(tmpPath(asset));
         } catch {}
       }
       return;
@@ -400,8 +459,8 @@ export class BinaryMirror {
     // Rename binaries first, manifest LAST: a daemon polling /manifest.json
     // sees the new sha only after both binaries are reachable.
     try {
-      for (const arch of MIRRORED_ARCHES) {
-        await fsp.rename(tmpPaths[arch], binaryPath(this.cacheDir, arch));
+      for (const asset of present) {
+        await fsp.rename(tmpPath(asset), binaryPath(this.cacheDir, asset));
       }
       const manifestTmp = `${manifestPath(this.cacheDir)}.tmp.${process.pid}`;
       await fsp.writeFile(manifestTmp, manifestBytes);
@@ -421,8 +480,61 @@ export class BinaryMirror {
       `sha=${newManifestSha.slice(0, 12)}`,
     );
 
+    // Assets the release did NOT carry but the manifest still advertises: the
+    // daemons for those platforms will fetch a binary whose sha can't match.
+    // Nothing to fix automatically (rewriting the manifest would fork it from
+    // the release), so make the gap loud.
+    await this.warnUnservableManifestEntries(
+      manifestBytes,
+      MIRRORED_ASSETS.filter((a) => found[a] === undefined),
+    );
+
     // Regenerate gzip copies for the freshly-swapped binaries.
     await this.ensureGzip();
+  }
+
+  /**
+   * Log every platform the manifest advertises that this mirror cannot serve.
+   *
+   * Only reachable for OPTIONAL (linux) assets a release omitted while its
+   * manifest still names them — deleting a bad linux asset from a published
+   * release is the natural way to un-ship it, and it is exactly the action
+   * that produces this state. We do not rewrite or withhold the manifest: the
+   * darwin channel is 23 machines and must keep flowing, and a mirror-forked
+   * manifest would be worse than a loud log.
+   */
+  private async warnUnservableManifestEntries(
+    manifestBytes: Uint8Array,
+    missing: readonly MirroredAsset[],
+  ): Promise<void> {
+    if (missing.length === 0) return;
+    let advertised: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(Buffer.from(manifestBytes).toString("utf8")) as unknown;
+      const p = isRecord(parsed) ? parsed.platforms : null;
+      if (isRecord(p)) advertised = p;
+    } catch {
+      return; // unparseable manifest is its own problem; daemons reject it
+    }
+    for (const asset of missing) {
+      const entry = advertised[MANIFEST_PLATFORM_KEY[asset]];
+      const want = isRecord(entry) && typeof entry.sha256 === "string" ? entry.sha256 : null;
+      if (!want) continue; // not advertised → nothing promised, nothing broken
+      let have: string | null = null;
+      try {
+        have = sha256Hex(await fsp.readFile(binaryPath(this.cacheDir, asset)));
+      } catch {
+        have = null;
+      }
+      if (have === want) continue; // an older cycle already cached those bytes
+      this.log.error(
+        "[tokenleader] binary-mirror: manifest advertises a binary this release does not carry",
+        `asset=${GH_ASSET_NAME[asset]}`,
+        `want=${want.slice(0, 12)}`,
+        `have=${have ? have.slice(0, 12) : "absent"}`,
+        "- daemons on that platform will re-download every cycle until the asset is restored",
+      );
+    }
   }
 
   /** GitHub's "latest" MARKER endpoint first (vX.Y.Z releases, excludes

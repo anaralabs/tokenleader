@@ -202,6 +202,7 @@ export function sanitizeCheckinBody(raw: unknown): DaemonCheckinState | null {
     exit_journal_tail: tail,
     watchdog_installed: typeof o.watchdog_installed === "boolean" ? o.watchdog_installed : null,
     interval_s: intervalSOr(o.interval_s),
+    ...(strOrNull(o.platform, 32) ? { platform: strOrNull(o.platform, 32) as string } : {}),
   };
 }
 
@@ -319,9 +320,18 @@ export function classifyDevice(s: DeviceSignals, now: number): FleetState {
     return now - lastAny > DUAL_DARK_MS ? "DARK" : "LATE";
   }
 
-  // Pre-0.6 device: last_seen is the only channel — silence shorter than a
-  // day is LATE (sleep is indistinguishable from death here).
-  return daemonSilenceMs > PRE_WATCHDOG_DARK_MS ? "DARK" : "LATE";
+  // One channel only. WHY there is only one decides the bar:
+  //   * Linux (and any non-darwin platform): single-channel BY DESIGN —
+  //     systemd is the supervisor, there is no watchdog role, and a VPS does
+  //     not sleep. Silence means the daemon or the box is gone, so it gets
+  //     the same 1h dual-silence bar a v0.6+ Mac gets. The 24h bar would hide
+  //     a destroyed VPS for a full day.
+  //   * A device that reports NO platform is a pre-v0.7 daemon, i.e. a Mac
+  //     without the watchdog: an overnight sleep is indistinguishable from
+  //     death there, so it keeps the full-day bar.
+  const singleChannelByDesign = !devicePlatformHasWatchdog(s.checkin?.platform ?? null);
+  const darkBar = singleChannelByDesign ? DUAL_DARK_MS : PRE_WATCHDOG_DARK_MS;
+  return daemonSilenceMs > darkBar ? "DARK" : "LATE";
 }
 
 /** Assemble DeviceSignals for one device from the store (latest sanitized
@@ -355,6 +365,25 @@ export function collectDeviceSignals(
 }
 
 // --- alert sweep ---------------------------------------------------------
+
+/**
+ * Does this device's PLATFORM have a watchdog role at all?
+ *
+ * The launchd watchdog pair is macOS-only: on Linux systemd is the supervisor
+ * (Restart=always + StartLimitIntervalSec=0), the daemon reports
+ * watchdog_installed=null, and its watchdog channel is silent forever BY
+ * DESIGN. Without this gate the sweep below queued a reinstall_watchdog at
+ * every Linux device every dedup window, forever — a fake self-heal loop that
+ * also burned the one-directive-per-checkin slot.
+ *
+ * A missing platform means a pre-v0.7 daemon, all of which are darwin; the
+ * default must therefore stay `true` or the whole fielded fleet would stop
+ * converging.
+ */
+export function devicePlatformHasWatchdog(platform: string | null | undefined): boolean {
+  if (!platform) return true;
+  return platform.startsWith("darwin");
+}
 
 /** Does this device's reported daemon build ship the watchdog role
  *  (>= 0.6.0)? Lenient 'vX.Y.Z' parse; unknown/dev/unparseable versions are
@@ -506,6 +535,7 @@ export async function sweepFleetAlerts(opts: SweepOptions): Promise<FleetAlertDe
     let reinstallQueued = false;
     if (
       daemonFresh &&
+      devicePlatformHasWatchdog(signals.checkin?.platform ?? null) &&
       watchdogCapableVersion(device.version) &&
       (device.watchdogLastSeen === null ||
         now - device.watchdogLastSeen > WATCHDOG_REINSTALL_SILENT_MS) &&

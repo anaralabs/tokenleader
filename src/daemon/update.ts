@@ -1,10 +1,12 @@
 // Silent self-update for the daemon.
 //
 // Flow: GET <endpoint>/manifest.json, compare the manifest sha256 for our
-// arch against the SHA-256 of the running binary; if different, download
-// /bin/anara-leaderboard-<arch> via a curl subprocess, sha-verify, smoke-run
-// it, atomically rename it over `execPath`, then exit non-zero so launchd's
-// KeepAlive respawns the new binary.
+// platform against the SHA-256 of the running binary; if different, download
+// /bin/anara-leaderboard-<suffix> via a curl subprocess, sha-verify, smoke-run
+// it, atomically rename it over `execPath`, then exit non-zero so the
+// supervisor respawns the new binary (launchd KeepAlive on macOS, systemd
+// Restart=always on Linux — see resolveManifestEntry / binaryAssetSuffix for
+// how darwin's frozen bare-arch names and linux's platform-keyed ones split).
 //
 // The binary download deliberately does NOT use Bun's fetch: the compiled
 // daemon's fetch of this exact transfer (a ~24MB gzip-encoded body from the
@@ -14,8 +16,11 @@
 // daemons found dead right after logging "update_available" with launchd
 // showing `last exit code = 0` — which the legacy {SuccessfulExit:false}
 // plists then refused to respawn (the v0.5.x fleet-stuck incident). curl is
-// the same tool the install script uses for the same bytes, ships with every
-// macOS, and its exit codes are honest.
+// the same tool the install script uses for the same bytes and its exit codes
+// are honest. curl ships with every macOS; on Linux minimal images it often
+// does NOT, so the Linux installer hard-checks for it before installing
+// anything — a daemon that reports healthy but can never take an update is
+// the worst failure this file can produce.
 //
 // Updates come from the daemon's OWN server, never GitHub: a single network
 // dependency (if /ingest is reachable, updates are reachable) and no gh CLI
@@ -36,6 +41,7 @@ import {
   writeEndpointOverride,
 } from "./endpoint-override";
 import { clearUpdateMarker, journalExit, writeUpdateMarker } from "./heartbeat";
+import { binaryAssetSuffix, daemonArch, platformKey } from "./platform";
 import type { Logger } from "./log";
 
 // Exit code of the deliberate post-update restart. Non-zero on purpose:
@@ -103,8 +109,8 @@ export interface ManifestEntry {
 }
 
 // Dual-shape manifest. The legacy top-level arm64/x64 keys are frozen and
-// remain what this daemon CONSUMES; the v2 fields (platforms map et al.) are
-// validated when present but not yet consumed. Unknown fields are ignored.
+// remain what a DARWIN daemon consumes; every other platform consumes the v2
+// `platforms` map (see resolveManifestEntry). Unknown fields are ignored.
 export interface Manifest {
   version: string;
   publishedAt: string;
@@ -185,6 +191,9 @@ export interface UpdateOpts {
   fetchImpl?: typeof fetch;
   execPath?: string;
   arch?: ManifestArch;
+  /** Test seam; defaults to process.platform. Selects the manifest entry and
+   *  the /bin asset name. */
+  platform?: string;
   /**
    * Downloads `url` to `dest` within `timeoutMs`; resolves null on success,
    * else a short reason. Default shells out to curl — see the header comment
@@ -220,7 +229,38 @@ export interface UpdateOpts {
 }
 
 export function pickArch(): ManifestArch {
-  return process.arch === "arm64" ? "arm64" : "x64";
+  return daemonArch();
+}
+
+/**
+ * Which manifest entry describes THIS build.
+ *
+ * darwin is frozen and byte-identical to what it has always been: the legacy
+ * top-level `arm64`/`x64` keys, nothing else. Those keys are the v1 consumer
+ * contract 23 fielded daemons validate and read, and release.yml guard (c)
+ * asserts they mirror `platforms["darwin-*"]`, so there is nothing to gain
+ * from looking anywhere else and a hand-written transition manifest to lose.
+ *
+ * Every other platform resolves through the v2 `platforms` map. Before this
+ * existed a Linux daemon read `manifest["arm64"]`, i.e. the MACH-O: the sha
+ * matched (right file, wrong OS), the `--version` smoke test refused the swap
+ * — so nothing bricked, but Linux could never update, every cycle, forever.
+ *
+ * The resolved platforms entry is VALIDATED here, not in isManifest: every
+ * real manifest carries the legacy pair, and isManifest short-circuits on it,
+ * so `platforms` is otherwise unchecked. A malformed entry ({} or a numeric
+ * sha) would sail through and leave a Linux daemon re-downloading ~34 MB an
+ * hour forever, reporting only `update_sha_mismatch expected=undefined`.
+ * Returning undefined turns that into the honest `no_entry_for_arch`.
+ */
+export function resolveManifestEntry(
+  manifest: Manifest,
+  platform: string = process.platform,
+  arch: ManifestArch = pickArch(),
+): ManifestEntry | undefined {
+  if (platform === "darwin") return manifest[arch];
+  const entry = manifest.platforms?.[`${platform}-${arch}`];
+  return isManifestEntry(entry) ? entry : undefined;
 }
 
 function isManifestEntry(e: unknown): e is ManifestEntry {
@@ -234,9 +274,12 @@ function isManifestEntry(e: unknown): e is ManifestEntry {
 // Tolerant dual-shape validator: a manifest is valid when it carries the
 // frozen legacy {arm64,x64} pair, OR a v2 platforms map with at least one
 // valid entry. When the legacy keys are present at all, BOTH must be valid —
-// a half-broken legacy pair is garbage, not a v2 manifest. Consumption stays
-// legacy-keys-only: a platforms-only manifest validates but resolves to
-// `no_entry_for_arch` below.
+// a half-broken legacy pair is garbage, not a v2 manifest, and the check
+// short-circuits there. That means `platforms` is NOT validated as a whole on
+// any CI-published manifest (they all carry the legacy pair); the entry a
+// non-darwin daemon actually consumes is validated in resolveManifestEntry
+// instead, so one bad platform entry can never invalidate the manifest for
+// the 23 darwin machines that never read it.
 function isManifest(value: unknown): value is Manifest {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
@@ -342,12 +385,16 @@ function defaultVerifyBinary(p: string): string | null {
 }
 
 function defaultRestart(log: Logger): void {
-  // launchd IS the restart mechanism: exit non-zero and let KeepAlive respawn
+  // THE SUPERVISOR is the restart mechanism — launchd KeepAlive:true on macOS,
+  // systemd `Restart=always` + `SuccessExitStatus=75` on Linux. Exit and let it
+  // respawn
   // us as the already-swapped binary at execPath. No `launchctl kickstart -k`
   // — dispatching an async kill of our own job and racing it against our own
   // exit is exactly what made post-update restarts flaky enough to strand
-  // daemons (the v0.5.x fleet-stuck incident). The logger writes
-  // synchronously, so exiting right after the log line is safe.
+  // daemons (the v0.5.x fleet-stuck incident). The same rule holds on systemd
+  // and for a second reason: `systemctl restart` from inside the unit
+  // deadlocks against your own stop job. The logger writes synchronously, so
+  // exiting right after the log line is safe.
   log.info("update_restart_exit", { code: RESTART_EXIT_CODE });
   process.exit(RESTART_EXIT_CODE);
 }
@@ -385,6 +432,7 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
   const fetchImpl = opts.fetchImpl ?? fetch;
   const execPath = opts.execPath ?? process.execPath;
   const arch = opts.arch ?? pickArch();
+  const platform = opts.platform ?? process.platform;
   const base = normalizeEndpoint(opts.endpoint);
   const cache = opts.cache ?? defaultManifestCache;
 
@@ -471,9 +519,9 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
     }
   }
 
-  const entry = manifest[arch];
+  const entry = resolveManifestEntry(manifest, platform, arch);
   if (!entry) {
-    log.warn("update_no_entry_for_arch", { arch });
+    log.warn("update_no_entry_for_arch", { arch, platform: platformKey(platform, arch) });
     return { updated: false, reason: "no_entry_for_arch" };
   }
 
@@ -508,13 +556,16 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
     currentSha,
     newSha: entry.sha256,
     arch,
+    platform: platformKey(platform, arch),
   });
 
   // 3. Download the new binary. Prefer the manifest's `url` field if
   // present (so historical / external manifests still work), otherwise
   // construct from the same server endpoint.
   const binaryUrl =
-    entry.url && entry.url.length > 0 ? entry.url : `${base}${BINARY_PATH_PREFIX}${arch}`;
+    entry.url && entry.url.length > 0
+      ? entry.url
+      : `${base}${BINARY_PATH_PREFIX}${binaryAssetSuffix(platform, arch)}`;
 
   // 3b. Download via curl (never Bun's fetch — see header). Retry to absorb
   // transient resets; whatever lands is sha-verified below before any swap,
@@ -585,11 +636,16 @@ export async function checkForUpdate(opts: UpdateOpts): Promise<UpdateResult> {
 
     // macOS quarantine xattr can prevent execution if the bytes arrived via
     // browser-style download. `bun build --compile` outputs are already
-    // ad-hoc signed, so `xattr -cr` is enough — never re-sign.
-    try {
-      spawnSync("xattr", ["-cr", tmpPath], { stdio: "ignore" });
-    } catch {
-      // Non-fatal; rename still proceeds.
+    // ad-hoc signed, so `xattr -cr` is enough — never re-sign. Gatekeeper
+    // quarantine has no Linux analogue and `xattr` is not installed there;
+    // spawnSync merely returns an error on ENOEXEC, but skipping the spawn
+    // altogether is cheaper and says what we mean.
+    if (process.platform === "darwin") {
+      try {
+        spawnSync("xattr", ["-cr", tmpPath], { stdio: "ignore" });
+      } catch {
+        // Non-fatal; rename still proceeds.
+      }
     }
 
     // 5b. Smoke-run the new binary before it replaces a working one. Refusing
@@ -663,6 +719,7 @@ export const __internal = {
   sha256OfBytes,
   sha256OfFile,
   pickArch,
+  resolveManifestEntry,
   defaultRestart,
   defaultDownloadBinary,
   defaultVerifyBinary,

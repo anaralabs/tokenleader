@@ -43,9 +43,19 @@ fi
 printf "%stokenleader installer starting...%s\n" "$C_DIM" "$C_RESET" >&2
 
 # --- platform check -------------------------------------------------------
+# This LOCAL-CLONE installer is macOS-only by choice: it builds from source and
+# registers a LaunchAgent. Linux is supported through the SERVER-rendered
+# installer (src/server/install-script.ts), which writes a systemd unit —
+# keeping one Linux service definition instead of two that must stay in sync.
 if [ "$(uname -s)" != "Darwin" ]; then
-  printf "%sThis installer only supports macOS. Detected: %s.%s\n" \
+  printf "%sThis local-clone installer only supports macOS. Detected: %s.%s\n" \
     "$C_RED" "$(uname -s)" "$C_RESET" >&2
+  if [ "$(uname -s)" = "Linux" ]; then
+    printf "%sLinux IS supported — install from your server instead:%s\n" \
+      "$C_YELLOW" "$C_RESET" >&2
+    printf "  curl -fsSL https://<your-server>/install | sudo bash -s -- --name=<handle>\n" >&2
+    printf "%s(see docs/self-hosting.md \xe2\x80\x94 Linux clients)%s\n" "$C_DIM" "$C_RESET" >&2
+  fi
   exit 1
 fi
 

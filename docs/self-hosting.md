@@ -10,9 +10,14 @@ mirror (15 min), daily pricing refresh. No external database, queue, or cache.
   importing an existing multi-million-row DB: the one-time dashboard-rollup
   build at first boot peaks around 200–220 MB on top of the runtime (it is
   chunked per user, so that figure stays put as the table grows).
-- **Disk:** give the data dir ≥1 GB. Mirrored daemon binaries are the bulk
-  (~120–240 MB per cached release plus transient space during swaps); the DB
-  grows slowly — token counts, not content.
+- **Disk:** give the data dir ≥2 GB. Mirrored daemon binaries are the bulk:
+  four platforms (darwin arm64/x64, linux x64/arm64) are cached raw **and**
+  gzipped, ~420 MB steady state, and a refresh writes every new binary to a
+  `.tmp` before renaming any of them — so peak is ~760 MB while a release
+  swaps. Undersize the volume and the swap hits ENOSPC, nothing renames, and
+  **every** platform's update channel silently stalls (retried every 15 min,
+  visible only as `binary-mirror: failed to fetch arch binary`). The DB grows
+  slowly — token counts, not content.
 - **Topology: single replica, always.** Two replicas = two SQLite writers =
   corruption. Never scale horizontally; never put the data dir on NFS/SMB.
 - **TLS terminates in front of Bun, always** — a platform edge (Railway/Fly),
@@ -63,7 +68,7 @@ docker compose up -d
 
 ```sh
 fly launch --no-deploy --ha=false      # --ha=false is load-bearing: two machines = two SQLite writers
-fly volumes create tokenleader_data --size 1
+fly volumes create tokenleader_data --size 2
 fly secrets set TOKENLEADER_ADMIN_TOKEN=$(openssl rand -hex 32)
 fly secrets set TOKENLEADER_SERVER_URL=https://<your-app>.fly.dev
 fly deploy
@@ -76,7 +81,7 @@ fly deploy
 - Fly volumes are single-host NVMe with 5-day snapshots; add Litestream
   (below) for real durability.
 
-~$2–3/mo for a single shared-CPU machine with a 1 GB volume.
+~$2–3/mo for a single shared-CPU machine with a 2 GB volume.
 
 ## A machine on your desk
 
@@ -91,6 +96,117 @@ TOKENLEADER_SERVER_URL=https://leaderboard.example.com ./bin/<server-binary>
 Run it under launchd / systemd / tmux — anything that restarts it on crash
 and reboot. For HTTPS without port-forwarding, put the box in a tailnet and
 use `tailscale serve`, or any reverse proxy you already run.
+
+## Linux clients
+
+The daemon runs on Linux (x86_64 + aarch64, glibc) as a **systemd** service.
+Same `/install` URL as macOS — the script branches on `uname -s`.
+
+### The one-liner
+
+```bash
+# Recommended: a SYSTEM unit. Needs root; runs as the invoking human.
+curl -fsSL https://leaderboard.example.com/install | sudo bash -s -- --name=alice
+```
+
+`sudo` is not ceremony. A system unit at `/etc/systemd/system/tokenleader.service`
+starts at boot with **no login at all**, needs no logind, no lingering, no
+`XDG_RUNTIME_DIR` and no session bus, and cannot be torn down when you log out.
+systemd fills `HOME`/`USER` from the passwd entry for `User=`, so `~/.claude`,
+`~/.codex` and `~/.cursor` resolve exactly as they do on a Mac. Under
+`curl … | sudo bash` the installer reads `$SUDO_USER` and installs **for the human**,
+never for root — a root-owned daemon would tail root's empty `~/.claude` and report
+nothing.
+
+### If you cannot use sudo: lingering is mandatory
+
+Without root the installer falls back to a `systemd --user` unit at
+`~/.config/systemd/user/tokenleader.service`. **A user unit is killed roughly ten
+seconds after your SSH session ends** unless the account lingers — this is *the*
+classic headless-VPS failure. The installer enables lingering and verifies the
+resulting state; if it can't (most non-root accounts can't, there is no polkit
+agent on a typical VPS) it **aborts having installed nothing** and prints:
+
+```bash
+sudo loginctl enable-linger <user>
+# then re-run the installer
+```
+
+Force either mode with `TOKENLEADER_SERVICE_SCOPE=system` / `=user`. The installer
+never leaves both installed — re-running in the other scope tears the first one down,
+because two daemons would double-report the same logs.
+
+### Prerequisites (checked before anything is downloaded)
+
+| Requirement | Check | If it fails |
+|---|---|---|
+| systemd as init | `/run/systemd/system` exists (this is `sd_booted(3)`; `systemctl` can exist without systemd being PID 1) | Refuses, installs nothing. Run the binary under your own supervisor with `TOKENLEADER_USER` + `TOKENLEADER_ENDPOINT` set. |
+| glibc | no `/lib/ld-musl-*`, `ldd --version` doesn't say musl | Refuses. **Alpine/musl is not supported** — the glibc binary fails there as a misleading `not found`. Use Debian/Ubuntu/RHEL/Fedora/Arch. |
+| `curl` | on `PATH` | Refuses. curl is a **runtime** dependency: the daemon shells out to it for every auto-update download (Bun's `fetch` is banned on that transfer — it can kill the process with a silent `exit(0)`). Without curl the daemon looks healthy and never updates. |
+| `sha256sum` or `shasum` | on `PATH` | Refuses (the download is sha-verified against `manifest.json`). |
+
+Every one of these runs **before** the ~36 MB download, so a refusal never leaves a
+half-installed daemon behind.
+
+The published `linux-x64` build is compiled from bun's **baseline** target: it needs
+only SSE4.2, not AVX2. Cheap and virtualised hosts routinely mask AVX2 (Proxmox/QEMU
+default `kvm64`/`qemu64` CPU models do it on brand-new silicon), and the failure mode
+would be a diagnostic-free `SIGILL` crash-loop. glibc floor is 2.17 (CentOS 7 era).
+
+### Where things land
+
+| Path | What |
+|---|---|
+| `/etc/systemd/system/tokenleader.service` | the unit (system scope) |
+| `~/.config/systemd/user/tokenleader.service` | the unit (user scope) |
+| `~/.local/share/anara-leaderboard/daemon.env` | **the config store** — handle, endpoint, join/link codes. Referenced by the unit's `EnvironmentFile=` and read by the CLI. This is the Linux counterpart of the LaunchAgent plist. |
+| `~/.local/share/anara-leaderboard/` | state: TOFU secret, read offsets, heartbeat |
+| `~/.local/state/anara-leaderboard/daemon.jsonl` | structured logs (XDG state, **not** `~/Library`) |
+| `~/.local/bin/anara-leaderboard`, `~/.local/bin/tokenleader` | binary + CLI symlink |
+
+```bash
+systemctl status tokenleader          # or: systemctl --user status tokenleader
+journalctl -u tokenleader -f          # or: journalctl --user -u tokenleader -f
+tail -f ~/.local/state/anara-leaderboard/daemon.jsonl
+```
+
+### The unit stanzas that matter
+
+If you ever hand-edit the unit, these four are load-bearing:
+
+```ini
+[Unit]
+StartLimitIntervalSec=0     # systemd's default (5 starts/10s) latches the unit
+                            # into `failed` FOREVER; launchd's KeepAlive never
+                            # gives up, systemd does.
+[Service]
+Restart=always              # respawn on ANY exit: clean, crash, or 75
+RestartSec=30               # with the line above, the only throttle left
+SuccessExitStatus=75        # 75 is the deliberate post-update restart exit
+```
+
+**Never** set `Restart=on-failure`. Combined with `SuccessExitStatus=75` it classifies
+the post-update exit as a success, declines to restart, and the daemon is gone until
+the next reboot — while `systemctl status` reads perfectly healthy.
+
+### No watchdog on Linux, by design
+
+macOS ships a second launchd job (the v0.6.0 watchdog pair) because launchd's
+supervision needed reconstructing. systemd already provides that half, so Linux ships
+none: the daemon reports `watchdog_installed: null`, the fleet panel shows the device
+as HEALTHY, and the server's `reinstall_watchdog` convergence sweep skips non-darwin
+platforms entirely.
+
+### Uninstall
+
+```bash
+curl -fsSL https://leaderboard.example.com/uninstall | sudo bash
+```
+
+Notifies the server (so the device is marked UNINSTALLED rather than going dark and
+paging someone), then disables + removes the unit in **both** scopes, and removes the
+binary and CLI symlink. State and logs are kept unless you answer `y` (or set
+`TOKENLEADER_PURGE=y`).
 
 ## Auth and tokens
 
@@ -212,3 +328,7 @@ checkpoint state.
 - **Vercel / serverless** — tokenleader needs a long-running process and a
   SQLite file on local disk; a serverless adaptation would be a rewrite.
 - **Multiple replicas** — single SQLite writer, see above.
+- **Daemon on Alpine/musl, or on a Linux box without systemd** — the published
+  binaries are glibc and the Linux service is a systemd unit. The installer detects
+  both and refuses cleanly rather than leaving something broken behind.
+- **Daemon on Windows/WSL** — not yet.

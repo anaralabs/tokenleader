@@ -14,7 +14,8 @@
 #
 # Prereqs:
 #   * gh CLI installed + authed (`gh auth status`) with write access to this repo.
-#   * bun installed (used to compile the daemon binaries).
+#   * bun installed (used to cross-compile all four daemon binaries: darwin
+#     arm64/x64 and linux x64/arm64 — the manifest covers all four).
 #   * TOKENLEADER_SERVER_URL env var set, or override via --server-url=.
 #
 # Usage:
@@ -99,16 +100,23 @@ SHORT_SHA="$(git rev-parse --short HEAD)"
 if [ -z "$SKIP_BUILD" ]; then
   info "Installing dependencies..."
   bun install --frozen-lockfile >/dev/null 2>&1 || bun install >/dev/null
-  info "Building cross-arch daemons (arm64 + x64, version=${SHORT_SHA})..."
+  info "Building cross-arch daemons (darwin + linux, version=${SHORT_SHA})..."
   VERSION="${SHORT_SHA}" bun run build:daemon-arm64 >/dev/null
   VERSION="${SHORT_SHA}" bun run build:daemon-x64 >/dev/null
-  ok "Built bin/anara-leaderboard-{arm64,x64}"
+  # Linux is NOT optional here: make-manifest.ts hashes all four published
+  # platforms and throws on a missing one, so a darwin-only build dies at the
+  # manifest step — mid-incident, after the slow part already ran. bun
+  # cross-compiles these from the Mac; they are never codesigned (ELF).
+  VERSION="${SHORT_SHA}" bun run build:daemon-linux-x64 >/dev/null
+  VERSION="${SHORT_SHA}" bun run build:daemon-linux-arm64 >/dev/null
+  ok "Built bin/anara-leaderboard-{arm64,x64} + bin/tokenleader-linux-{x64,arm64}"
 else
-  info "Skipping build (--skip-build); reusing bin/anara-leaderboard-*"
+  info "Skipping build (--skip-build); reusing bin/anara-leaderboard-* + bin/tokenleader-linux-*"
   warn "Reused binaries must have been built with VERSION=${SHORT_SHA} or the fleet will read as stale."
 fi
 
-for f in bin/anara-leaderboard-arm64 bin/anara-leaderboard-x64; do
+for f in bin/anara-leaderboard-arm64 bin/anara-leaderboard-x64 \
+         bin/tokenleader-linux-x64 bin/tokenleader-linux-arm64; do
   if [ ! -s "$f" ]; then
     err "$f missing or empty. Drop --skip-build or run \`bun run build:all\`."
     exit 1
@@ -138,11 +146,16 @@ cat bin/manifest.json
 ok "Wrote bin/manifest.json"
 
 # --- publish --------------------------------------------------------------
+# The mirror looks these names up verbatim (GH_ASSET_NAME in
+# src/server/binary-mirror.ts): darwin keeps the legacy fleet names, linux
+# ships under its canonical name.
 ASSETS=(
   bin/install.sh
   bin/uninstall.sh
   bin/anara-leaderboard-arm64
   bin/anara-leaderboard-x64
+  bin/tokenleader-linux-x64
+  bin/tokenleader-linux-arm64
   bin/manifest.json
 )
 
