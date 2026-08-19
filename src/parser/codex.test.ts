@@ -712,3 +712,438 @@ describe("model carries across incremental reads", () => {
     expect(r.lastModel).toBe("gpt-5.5");
   });
 });
+
+// v0.6.4 carried the model across incremental reads, but a byte-0 read still
+// started blind — and some rollouts write token_count / user-prompt lines
+// BEFORE their first `turn_context`, so that prefix kept billing to
+// LEGACY_FALLBACK_MODEL. The answer is sitting further down the same file, so
+// a bounded look-ahead recovers it (see LOOKAHEAD_MAX_BYTES in codex.ts).
+describe("byte-0 model look-ahead", () => {
+  const userLine = (ts: string) => ({
+    timestamp: ts,
+    type: "response_item",
+    payload: { role: "user", content: "please optimize this loop" },
+  });
+
+  it("labels usage that precedes the first turn_context with that turn's model", async () => {
+    const path = await makeTempJsonl("rollout-lookahead.jsonl", [
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:01.000Z",
+          { input: 100, output: 10, cached: 40, reasoning: 0 },
+          { input: 100, output: 10, cached: 40, reasoning: 0 },
+        ),
+      ),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:02.000Z")),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:03.000Z",
+          { input: 200, output: 20, cached: 80, reasoning: 0 },
+          { input: 300, output: 30, cached: 120, reasoning: 0 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.map((e) => e.model)).toEqual(["gpt-5.6-sol", "gpt-5.6-sol"]);
+    expect(r.lastModel).toBe("gpt-5.6-sol");
+  });
+
+  it("gives up cleanly when the look-ahead is disabled", async () => {
+    // The peek is the only thing labelling this prefix (test 1 above is the
+    // pre-v0.6.5 regression guard — it fails against the v0.6.4 parser).
+    // Turning it off must fall back rather than misbehave.
+    const path = await makeTempJsonl("rollout-lookahead-prefix.jsonl", [
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:01.000Z",
+          { input: 100, output: 10, cached: 40, reasoning: 0 },
+          { input: 100, output: 10, cached: 40, reasoning: 0 },
+        ),
+      ),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:02.000Z")),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k", lookAheadMaxBytes: 0 });
+    expect(r.events[0]!.model).toBe("gpt-5");
+  });
+
+  it("gives up at the cap instead of scanning an unbounded file", async () => {
+    const path = await makeTempJsonl("rollout-lookahead-cap.jsonl", [
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:01.000Z",
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+        ),
+      ),
+      // Padding that pushes the turn_context past the (tiny) cap below.
+      JSON.stringify({
+        timestamp: "2026-08-01T00:00:01.500Z",
+        type: "response_item",
+        payload: { role: "assistant", content: "x".repeat(2000) },
+      }),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:02.000Z")),
+    ]);
+    const capped = await parseCodexFile({ path, byteOffset: 0, user: "k", lookAheadMaxBytes: 512 });
+    // Past the cap we keep the fallback rather than invent a model...
+    expect(capped.events[0]!.model).toBe("gpt-5");
+    // ...and the turn_context still lands normally once the parse reaches it.
+    expect(capped.lastModel).toBe("gpt-5.6-sol");
+    const uncapped = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(uncapped.events[0]!.model).toBe("gpt-5.6-sol");
+  });
+
+  it("takes the FIRST turn_context, not a later one that switched models", async () => {
+    // The peek stops at the first turn_context on purpose: it is the turn the
+    // prefix actually belongs to, and it is what keeps the scan bounded. A
+    // refactor that dropped the early return would relabel the prefix with
+    // whatever model the session switched to hours later, and would scan to
+    // the cap on every byte-0 read.
+    const path = await makeTempJsonl("rollout-lookahead-first-wins.jsonl", [
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:01.000Z",
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+        ),
+      ),
+      JSON.stringify(turnContextLine("gpt-5.5", "2026-08-01T00:00:02.000Z")),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:03.000Z",
+          { input: 20, output: 5, cached: 0, reasoning: 0 },
+          { input: 120, output: 15, cached: 0, reasoning: 0 },
+        ),
+      ),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:04.000Z")),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:05.000Z",
+          { input: 30, output: 7, cached: 0, reasoning: 0 },
+          { input: 150, output: 22, cached: 0, reasoning: 0 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.map((e) => e.model)).toEqual(["gpt-5.5", "gpt-5.5", "gpt-5.6-sol"]);
+    expect(r.lastModel).toBe("gpt-5.6-sol");
+  });
+
+  it("never invents a model for a rollout with no turn_context anywhere", async () => {
+    // Pre-2025-11 rollouts predate the field. Relabelling them would be
+    // fabrication, so they keep the fallback and report no lastModel.
+    const path = await makeTempJsonl("rollout-lookahead-legacy.jsonl", [
+      JSON.stringify(userLine("2026-08-01T00:00:00.000Z")),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:01.000Z",
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.map((e) => e.model)).toEqual(["gpt-5", "gpt-5"]);
+    expect(r.lastModel).toBeUndefined();
+  });
+
+  it("labels a user prompt written before the first turn_context", async () => {
+    // The dominant real-world shape: Codex logs the prompt, then opens the
+    // turn. Measured locally, this alone mislabelled 1,118 user rows across
+    // 1,085 of 1,149 rollouts.
+    const path = await makeTempJsonl("rollout-lookahead-user.jsonl", [
+      JSON.stringify(userLine("2026-08-01T00:00:00.000Z")),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:01.000Z")),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-08-01T00:00:02.000Z",
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+          { input: 100, output: 10, cached: 0, reasoning: 0 },
+        ),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    const userEv = r.events.find((e) => e.messageType === "user");
+    expect(userEv!.model).toBe("gpt-5.6-sol");
+  });
+
+  it("does not disturb fork-seed suppression, ids, offsets or totals", async () => {
+    const T0 = "2026-07-11T18:37:42.852Z";
+    const path = await makeTempJsonl("rollout-lookahead-fork.jsonl", [
+      JSON.stringify(sessionMetaLine(T0, "parent-thread-id")),
+      // Seed burst copied from the parent, with no turn_context of its own.
+      JSON.stringify({ timestamp: T0, type: "response_item", payload: { role: "user" } }),
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-07-11T18:37:42.853Z",
+          { input: 24860, output: 697, cached: 9984, reasoning: 516 },
+          { input: 24860, output: 697, cached: 9984, reasoning: 516 },
+        ),
+      ),
+      // The child's own first turn, a model round-trip later — still ahead of
+      // the file's first turn_context.
+      JSON.stringify(
+        tokenCountEvent(
+          "2026-07-11T18:37:51.100Z",
+          { input: 51000, output: 300, cached: 50000, reasoning: 100 },
+          { input: 75860, output: 997, cached: 59984, reasoning: 616 },
+        ),
+      ),
+      JSON.stringify(turnContextLine("gpt-5.6-sol", "2026-07-11T18:37:52.000Z")),
+    ]);
+    const withPeek = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    const noPeek = await parseCodexFile({ path, byteOffset: 0, user: "k", lookAheadMaxBytes: 0 });
+
+    // The seed is still dropped: only the child's own turn is billed.
+    expect(withPeek.events.length).toBe(1);
+    expect(withPeek.events[0]!.inputTokens + withPeek.events[0]!.cacheReadTokens).toBe(51000);
+    // The peek changes the label and nothing else.
+    expect(withPeek.events[0]!.model).toBe("gpt-5.6-sol");
+    expect(noPeek.events[0]!.model).toBe("gpt-5");
+    expect(withPeek.events.map((e) => e.messageId)).toEqual(noPeek.events.map((e) => e.messageId));
+    expect(withPeek.newOffset).toBe(noPeek.newOffset);
+    expect(withPeek.sessionTotals).toEqual(noPeek.sessionTotals);
+  });
+
+  it("only ever replaces the fallback on real local rollouts", async () => {
+    const all = await listCodexFiles();
+    if (all.length === 0) {
+      console.warn("no codex session files on this machine — skipping");
+      return;
+    }
+    // Bounded so the suite stays fast: newest files first, up to ~150 MB.
+    const BUDGET_BYTES = 150 * 1024 * 1024;
+    const recent = all
+      .map((p) => ({ p, mt: Bun.file(p).lastModified, size: Bun.file(p).size }))
+      .sort((a, b) => b.mt - a.mt);
+
+    let scanned = 0;
+    let bytes = 0;
+    let relabelled = 0;
+    for (const { p, size } of recent) {
+      if (bytes + size > BUDGET_BYTES) continue;
+      bytes += size;
+      scanned++;
+      const withPeek = await parseCodexFile({ path: p, byteOffset: 0, user: "k" });
+      if (withPeek.events.length === 0) continue;
+      const noPeek = await parseCodexFile({
+        path: p,
+        byteOffset: 0,
+        user: "k",
+        lookAheadMaxBytes: 0,
+      });
+      // A live Codex session can append between the two parses, which would
+      // make them legitimately disagree. Compare only files that held still.
+      if (Bun.file(p).size !== size) continue;
+      // Same events, same ids, same ledger — only labels may move.
+      expect(withPeek.events.map((e) => e.messageId)).toEqual(
+        noPeek.events.map((e) => e.messageId),
+      );
+      expect(withPeek.newOffset).toBe(noPeek.newOffset);
+      expect(withPeek.sessionTotals).toEqual(noPeek.sessionTotals);
+      for (let i = 0; i < withPeek.events.length; i++) {
+        const a = withPeek.events[i]!;
+        const b = noPeek.events[i]!;
+        if (a.model === b.model) continue;
+        // The peek may only turn the fallback into a real model, never the
+        // other way round and never one real model into another.
+        expect(b.model).toBe("gpt-5");
+        expect(a.model).not.toBe("gpt-5");
+        relabelled++;
+      }
+    }
+    console.log(`[codex look-ahead] files=${scanned} relabelledEvents=${relabelled}`);
+  });
+});
+
+// FileState is persisted, so the cumulative ledger has to carry cache-write
+// the same way it carries cache-read. Inert while Codex reports the field as
+// a literal 0 — this keeps the total-only path honest the day it doesn't.
+describe("cumulative cache-write on the totals path", () => {
+  it("deltas cache-write out of the cumulative totals when last_token_usage is absent", async () => {
+    const path = await makeTempJsonl("rollout-cw-total.jsonl", [
+      JSON.stringify(turnContextLine("gpt-5.5")),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:01.000Z", null, {
+          input: 100,
+          output: 10,
+          cached: 40,
+          cacheWrite: 60,
+          reasoning: 0,
+        }),
+      ),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
+          input: 250,
+          output: 30,
+          cached: 100,
+          cacheWrite: 100,
+          reasoning: 0,
+        }),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.length).toBe(2);
+    // input is inclusive of both cached and written portions.
+    expect(r.events[0]).toMatchObject({
+      inputTokens: 0,
+      cacheReadTokens: 40,
+      cacheCreationTokens: 60,
+    });
+    expect(r.events[1]).toMatchObject({
+      inputTokens: 50,
+      cacheReadTokens: 60,
+      cacheCreationTokens: 40,
+    });
+    expect(r.sessionTotals.cacheWriteInputTokens).toBe(100);
+  });
+
+  it("carries the cumulative cache-write across reads via prevSessionTotals", async () => {
+    const first = [
+      JSON.stringify(turnContextLine("gpt-5.5")),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:01.000Z", null, {
+          input: 100,
+          output: 10,
+          cached: 0,
+          cacheWrite: 60,
+          reasoning: 0,
+        }),
+      ),
+    ];
+    const path = await makeTempJsonl("rollout-cw-carry.jsonl", first);
+    const r1 = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r1.events[0]!.cacheCreationTokens).toBe(60);
+
+    await writeFile(
+      path,
+      `${[
+        ...first,
+        JSON.stringify(
+          tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
+            input: 200,
+            output: 20,
+            cached: 0,
+            cacheWrite: 90,
+            reasoning: 0,
+          }),
+        ),
+      ].join("\n")}\n`,
+    );
+    const r2 = await parseCodexFile({
+      path,
+      byteOffset: r1.newOffset,
+      user: "k",
+      prevSessionTotals: r1.sessionTotals,
+      prevModel: r1.lastModel,
+    });
+    // Only the 30 newly-written tokens, not the 90 cumulative.
+    expect(r2.events.length).toBe(1);
+    expect(r2.events[0]!.cacheCreationTokens).toBe(30);
+    expect(r2.sessionTotals.cacheWriteInputTokens).toBe(90);
+  });
+
+  it("treats a pre-v0.6.5 state file with no cache-write field as 0", async () => {
+    const path = await makeTempJsonl("rollout-cw-legacy-state.jsonl", [
+      JSON.stringify(turnContextLine("gpt-5.5")),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
+          input: 200,
+          output: 20,
+          cached: 0,
+          cacheWrite: 60,
+          reasoning: 0,
+        }),
+      ),
+    ]);
+    // Exactly what an older daemon persisted: no cacheWriteInputTokens key.
+    const legacy = {
+      sessionId: "rollout-cw-legacy-state",
+      inputTokens: 100,
+      outputTokens: 10,
+      cachedInputTokens: 0,
+      reasoningTokens: 0,
+    } as unknown as SessionTotals;
+    const r = await parseCodexFile({
+      path,
+      byteOffset: 0,
+      user: "k",
+      prevSessionTotals: legacy,
+    });
+    expect(r.events[0]!.cacheCreationTokens).toBe(60);
+    expect(Number.isFinite(r.events[0]!.inputTokens)).toBe(true);
+    expect(r.sessionTotals.cacheWriteInputTokens).toBe(60);
+  });
+
+  it("rebaselines cache-write alone without re-billing the other buckets", async () => {
+    // Cache-write regresses while input/output/cached keep climbing. The
+    // bucket must self-heal (never emit a negative delta) WITHOUT tripping the
+    // shared reset, which would re-bill the whole session cumulative as one
+    // event on the strength of a field no build has been observed populating.
+    const path = await makeTempJsonl("rollout-cw-only-reset.jsonl", [
+      JSON.stringify(turnContextLine("gpt-5.5")),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:01.000Z", null, {
+          input: 100,
+          output: 10,
+          cached: 0,
+          cacheWrite: 80,
+          reasoning: 0,
+        }),
+      ),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
+          input: 200,
+          output: 30,
+          cached: 0,
+          cacheWrite: 50,
+          reasoning: 0,
+        }),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events.length).toBe(2);
+    // outputTokens 20 (the delta), NOT 30 (the cumulative): the other buckets
+    // kept deltaing normally.
+    expect(r.events[1]).toMatchObject({
+      inputTokens: 50,
+      outputTokens: 20,
+      cacheReadTokens: 0,
+      cacheCreationTokens: 50,
+    });
+    expect(r.events[1]!.cacheCreationTokens).toBeGreaterThanOrEqual(0);
+    expect(r.sessionTotals.cacheWriteInputTokens).toBe(50);
+  });
+
+  it("treats a regressed cumulative cache-write as a fresh baseline", async () => {
+    const path = await makeTempJsonl("rollout-cw-reset.jsonl", [
+      JSON.stringify(turnContextLine("gpt-5.5")),
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:01.000Z", null, {
+          input: 100,
+          output: 10,
+          cached: 0,
+          cacheWrite: 80,
+          reasoning: 0,
+        }),
+      ),
+      // Cumulatives regress (new sub-session / rotation): the numbers on this
+      // line ARE the new baseline, not a negative delta.
+      JSON.stringify(
+        tokenCountEvent("2026-05-01T00:00:02.000Z", null, {
+          input: 90,
+          output: 5,
+          cached: 0,
+          cacheWrite: 30,
+          reasoning: 0,
+        }),
+      ),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "k" });
+    expect(r.events[1]).toMatchObject({
+      inputTokens: 60,
+      cacheCreationTokens: 30,
+      outputTokens: 5,
+    });
+    expect(r.sessionTotals.cacheWriteInputTokens).toBe(30);
+  });
+});

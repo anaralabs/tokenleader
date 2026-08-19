@@ -3,6 +3,7 @@ import {
   clampCostMicros,
   clampToken,
   cursorMessageId,
+  cursorModel,
   cursorSessionId,
 } from "../parser/cursor-dedup.ts";
 import { CURSOR_WATERMARK_META_KEY } from "./db.ts";
@@ -361,9 +362,15 @@ export class CursorMirror {
 
     // Deterministic messageId → re-fetched events dedupe via events_dedup.
     // Token counts included so same-ms same-model events don't collide.
+    // The model goes through cursorModel, and cursorMessageId normalises the
+    // counts itself, so this key is byte-identical to the one the daemon's
+    // dashboard path computes for the same event even when Cursor reports a
+    // fractional count or omits a cache field — a user covered by BOTH paths
+    // must dedup, not double-count.
+    const model = cursorModel(ev);
     const messageId = cursorMessageId({
       timestamp: tsMs,
-      model: ev.model,
+      model,
       inputTokens: tu.inputTokens,
       outputTokens: tu.outputTokens,
       cacheWriteTokens: tu.cacheWriteTokens,
@@ -380,7 +387,7 @@ export class CursorMirror {
       messageId,
       requestId: null,
       timestamp: tsMs,
-      model: ev.model,
+      model,
       messageType: "assistant",
       inputTokens: clampToken(tu.inputTokens),
       outputTokens: clampToken(tu.outputTokens),

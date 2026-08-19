@@ -112,6 +112,9 @@ export interface FileState {
     inputTokens: number;
     outputTokens: number;
     cachedInputTokens: number;
+    /** Added in v0.6.5. Optional because state files written by older
+     *  daemons have no such key — a missing value means 0, never a reset. */
+    cacheWriteInputTokens?: number;
     reasoningTokens: number;
   };
   /** Codex only: model in effect at the end of the last read of this file.

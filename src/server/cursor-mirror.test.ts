@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { makeTmpDirSync } from "../test-helpers.ts";
 import { Store } from "./db.ts";
 import { CursorMirror, type CursorMirrorOpts } from "./cursor-mirror.ts";
+import { mapCursorDashboardEvent } from "../parser/cursor-api.ts";
 import { buildApp } from "./main.ts";
 
 // A logger that swallows output so test runs stay clean. We can grab
@@ -68,7 +69,14 @@ function fakeCursorApi(events: Array<Record<string, unknown>>) {
 function mkEvent(
   ts: number,
   email: string,
-  opts: { model?: string; input?: number; output?: number; cents?: number } = {},
+  opts: {
+    model?: string;
+    input?: number;
+    output?: number;
+    cents?: number;
+    /** Replaces the whole tokenUsage object — for fractional or absent counts. */
+    tokenUsage?: Record<string, unknown>;
+  } = {},
 ): Record<string, unknown> {
   return {
     timestamp: String(ts),
@@ -77,7 +85,7 @@ function mkEvent(
     kind: "Free",
     maxMode: false,
     isTokenBasedCall: true,
-    tokenUsage: {
+    tokenUsage: opts.tokenUsage ?? {
       inputTokens: opts.input ?? 100,
       outputTokens: opts.output ?? 50,
       cacheWriteTokens: 0,
@@ -209,6 +217,76 @@ describe("CursorMirror", () => {
     expect(r.inserted).toBe(0);
     expect(r.duplicates).toBe(2);
     expect(calls.length).toBeGreaterThan(0);
+  });
+
+  test("the daemon dashboard path dedups against a mirrored row for the same event", async () => {
+    // A user can be on BOTH paths at once: mapped into the team mirror here
+    // AND running `tokenleader login-cursor` on their laptop. Both write
+    // source="cursor" rows carrying stored cost, so a dedup key that differs
+    // between the paths double-counts real dollars. The keys agree only while
+    // both spell the model the same way (cursorModel), which is why the
+    // daemon path stores the slug and not the dashboard's display name.
+    const ts = 1_700_000_000_000;
+    const { mirror } = build([
+      mkEvent(ts, "alice@example.com", { model: "gpt-5.3-codex", input: 100, output: 50 }),
+    ]);
+    expect((await mirror.tick()).inserted).toBe(1);
+
+    // The same event as the personal dashboard returns it: same tokens, same
+    // millisecond, slug plus a display name, and no event id.
+    const viaDaemon = mapCursorDashboardEvent(
+      {
+        timestamp: ts,
+        model: "gpt-5.3-codex",
+        modelName: "Premium (Codex 5.3)",
+        tokenUsage: {
+          inputTokens: 100,
+          outputTokens: 50,
+          cacheWriteTokens: 0,
+          cacheReadTokens: 0,
+          totalCents: 12.34,
+        },
+      },
+      "alice",
+    );
+    const r = store.insertMany([viaDaemon!]);
+    expect(r.inserted).toBe(0);
+    expect(r.duplicates).toBe(1);
+  });
+
+  test("dedups across paths when Cursor reports fractional or absent counts", async () => {
+    // The counts are hashed into the key too, and Cursor reports fractional
+    // tokens (and the team API omits the cache fields entirely). The mirror
+    // used to hash the raw values while the daemon hashed clamped ones, so
+    // 100.5 vs 101 — and "undefined" vs "0" — split the same event into two
+    // rows, each carrying stored cost. cursorMessageId now normalises inside
+    // the hash so neither caller can drift.
+    const ts = 1_700_000_000_000;
+    const { mirror } = build([
+      mkEvent(ts, "alice@example.com", {
+        model: "gpt-5.3-codex",
+        tokenUsage: { inputTokens: 100.5, outputTokens: 5.5, totalCents: 12.34 },
+      }),
+    ]);
+    expect((await mirror.tick()).inserted).toBe(1);
+
+    const viaDaemon = mapCursorDashboardEvent(
+      {
+        timestamp: ts,
+        model: "gpt-5.3-codex",
+        tokenUsage: {
+          inputTokens: 100.5,
+          outputTokens: 5.5,
+          cacheWriteTokens: 0,
+          cacheReadTokens: 0,
+          totalCents: 12.34,
+        },
+      },
+      "alice",
+    );
+    const r = store.insertMany([viaDaemon!]);
+    expect(r.inserted).toBe(0);
+    expect(r.duplicates).toBe(1);
   });
 
   test("skips events whose email isn't in userMap", async () => {
