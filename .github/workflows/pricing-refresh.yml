@@ -1,0 +1,66 @@
+# Weekly re-vendor of src/server/pricing-fallback.json from LiteLLM.
+#
+# Deliberately NOT part of ci.yml: that would put a live network fetch on every
+# PR and make CI fail when raw.githubusercontent.com rate-limits. The PR-time
+# guard is offline instead — pricing-coverage.test.ts asserts every model seen
+# in traffic prices from the committed snapshot.
+#
+# This job is the other half: it notices when upstream has moved and opens a PR
+# with the diff, so the snapshot can't quietly rot between releases.
+
+name: Pricing refresh
+
+on:
+  schedule:
+    # Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: pricing-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Re-vendor the snapshot
+        run: bun run scripts/vendor-pricing.ts
+
+      - name: Open a PR when it moved
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/server/pricing-fallback.json; then
+            echo "Snapshot already current."
+            exit 0
+          fi
+
+          BRANCH="chore/pricing-snapshot-$(date -u +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH}"
+          git add src/server/pricing-fallback.json
+          git commit -m "chore(pricing): re-vendor the LiteLLM snapshot"
+          git push -u origin "${BRANCH}"
+
+          gh pr create \
+            --title "chore(pricing): re-vendor the LiteLLM snapshot" \
+            --body "Automated weekly refresh of \`src/server/pricing-fallback.json\` from LiteLLM.
+
+          The snapshot is what the server prices on before its first upstream refresh lands, and forever on an egress-blocked self-host. Review the diff as a price diff: new models, and rate changes on existing ones.
+
+          If a model in this diff is one we see in traffic, add it to \`MODELS_SEEN_IN_TRAFFIC\` in \`src/server/pricing-coverage.test.ts\`." \
+            --base main
