@@ -1,8 +1,11 @@
 // `anara-leaderboard link|devices|revoke` — multi-device management run from
-// the user's shell (not under launchd). User + endpoint resolve from env
-// when set, else from the installed LaunchAgent plist; the daemon-written
-// endpoint override file wins over both, mirroring the daemon's own boot
-// precedence. Auth is this machine's TOFU secret from `<stateDir>/secret`.
+// the user's shell (not under the service manager). User + endpoint resolve
+// from env when set, else from the installed service's config store — the
+// LaunchAgent plist on macOS, `<stateDir>/daemon.env` on Linux (see
+// env-file.ts for why the systemd unit is NOT the config store). The
+// daemon-written endpoint override file wins over both, mirroring the
+// daemon's own boot precedence. Auth is this machine's TOFU secret from
+// `<stateDir>/secret`.
 import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -11,6 +14,7 @@ import { extractCursorSessionToken } from "./cursor-auto-login";
 import { runCursorCloudSync } from "./cursor-sync";
 import { loadCursorToken, saveCursorCredentials, saveCursorToken } from "./cursor-token";
 import { readEndpointOverride } from "./endpoint-override";
+import { daemonEnvFilePath, parseEnvFile } from "./env-file";
 import { loadState, saveState } from "./state";
 import { DEFAULT_BATCH_SIZE } from "./transport";
 
@@ -24,7 +28,8 @@ export interface CliDeps {
   fetchImpl?: typeof fetch;
   /** Test seam for `login-cursor --auto`. */
   extractCursorSession?: typeof extractCursorSessionToken;
-  /** Test seam for the plist read; default reads the real LaunchAgent. */
+  /** Test seam for the macOS plist read; default reads the real LaunchAgent.
+   *  When set it wins on every platform, so existing tests are unaffected. */
   readPlist?: () => Promise<string>;
   /** Reads a Cursor token from stdin for `login-cursor -`. Default reads stdin. */
   readStdin?: () => Promise<string>;
@@ -64,16 +69,35 @@ function resolveStateDir(env: NodeJS.ProcessEnv = process.env): string {
   );
 }
 
+/**
+ * Read the installed daemon's config store: the LaunchAgent plist on macOS,
+ * `<stateDir>/daemon.env` on Linux. Without the Linux arm every command here
+ * — including the `--link` device pairing the installer advertises — died
+ * with "can't determine your handle" unless the user hand-exported the env.
+ */
+async function readInstalledEnv(deps: CliDeps, stateDir: string): Promise<Record<string, string>> {
+  if (deps.readPlist) {
+    try {
+      return parsePlistEnv(await deps.readPlist());
+    } catch {
+      return {};
+    }
+  }
+  try {
+    if (process.platform === "darwin") {
+      return parsePlistEnv(await fs.readFile(plistPath(), "utf8"));
+    }
+    return parseEnvFile(await fs.readFile(daemonEnvFilePath(stateDir), "utf8"));
+  } catch {
+    // Not installed (or unreadable) — env vars may still carry everything.
+    return {};
+  }
+}
+
 async function resolveCliContext(deps: CliDeps): Promise<CliContext> {
   const env = deps.env ?? process.env;
-  const readPlist = deps.readPlist ?? (() => fs.readFile(plistPath(), "utf8"));
-
-  let plistEnv: Record<string, string> = {};
-  try {
-    plistEnv = parsePlistEnv(await readPlist());
-  } catch {
-    // No LaunchAgent (or unreadable) — env vars may still carry everything.
-  }
+  const stateDir = resolveStateDir(env);
+  const plistEnv = await readInstalledEnv(deps, stateDir);
 
   const user = env.TOKENLEADER_USER?.trim() || plistEnv.TOKENLEADER_USER || "";
   if (!user) {
@@ -83,7 +107,6 @@ async function resolveCliContext(deps: CliDeps): Promise<CliContext> {
   }
 
   let endpoint = env.TOKENLEADER_ENDPOINT?.trim() || plistEnv.TOKENLEADER_ENDPOINT || "";
-  const stateDir = resolveStateDir(env);
   try {
     const override = await readEndpointOverride(stateDir);
     if (override) endpoint = override;
@@ -181,8 +204,18 @@ async function runLink(deps: CliDeps): Promise<number> {
   print(`Link code for '${ctx.user}': ${String(r.json.code)}`);
   print(`Valid for ${mins} minutes, single use.`);
   print("");
+  const command = String(r.json.command);
   print("On the machine you want to add, run:");
-  print(`  ${String(r.json.command)}`);
+  print(`  ${command}`);
+  // The server can't know what the NEW machine is. On a headless Linux VPS
+  // the sudo-less form installs a `systemd --user` unit — which needs
+  // lingering and refuses outright without it — so name the system-unit form
+  // too, exactly as the README splits it.
+  if (command.includes("| bash ")) {
+    print("");
+    print("…or, on a headless Linux VPS (system unit, survives logout):");
+    print(`  ${command.replace("| bash ", "| sudo bash ")}`);
+  }
   return 0;
 }
 

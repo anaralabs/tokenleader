@@ -85,6 +85,12 @@ export interface CheckinBody {
   heartbeat_write_failures: number;
   exit_journal_tail: { ts: number; reason: string; code: number }[];
   watchdog_installed: boolean | null;
+  /** `${os}-${arch}` of the running daemon (e.g. "darwin-arm64",
+   *  "linux-x64"). Added in v0.7.0; ABSENT from every fielded daemon before
+   *  it, which the server must read as darwin. The fleet sweep uses it to
+   *  stop queueing reinstall_watchdog at Linux devices, which have no
+   *  watchdog by design — systemd is the supervisor. */
+  platform?: string;
 }
 
 /** Body of the watchdog's ~200B curl checkin to /watchdog-checkin. */

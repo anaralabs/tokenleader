@@ -14,8 +14,13 @@ ok()   { printf "%sOK%s %s\n" "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf "%s!!%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
 err()  { printf "%sXX%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
 
+# macOS-only for the same reason as scripts/install.sh: it tears down a
+# LaunchAgent. Linux installs are removed with the server-rendered uninstaller.
 if [ "$(uname -s)" != "Darwin" ]; then
-  err "This uninstaller only supports macOS."
+  err "This local-clone uninstaller only supports macOS."
+  if [ "$(uname -s)" = "Linux" ]; then
+    err "For a Linux install: curl -fsSL https://<your-server>/uninstall | sudo bash"
+  fi
   exit 1
 fi
 

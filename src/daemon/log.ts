@@ -32,13 +32,32 @@ function envMinLevel(): LogLevel {
 }
 
 // --- bounded rotating file sink ------------------------------------------
-// Default dir matches the LaunchAgent's StandardOutPath dir so all daemon logs
-// live in one place. Override with TOKENLEADER_LOG_DIR (tests/dev). Set
+// Default dir matches the service definition's stdout/stderr dir so all daemon
+// logs live in one place: on macOS the LaunchAgent's StandardOutPath dir; on
+// Linux `~/.local/state` (a systemd unit sends stderr to the journal, but the
+// `upload_logs` directive reads THIS file, so it must land somewhere a Linux
+// operator would look — the daemon used to create a literal ~/Library/Logs on
+// Linux boxes). Override with TOKENLEADER_LOG_DIR (tests/dev). Set
 // TOKENLEADER_LOG_FILE_DISABLED=1 to skip the file sink entirely.
+//
+// DELIBERATELY homedir-only, NOT $XDG_STATE_HOME: the state dir
+// (src/daemon/main.ts) resolves from the home directory alone, and the
+// installer and uninstaller both hardcode ~/.local/state. Honouring
+// XDG_STATE_HOME here — it IS inherited by `systemd --user` units on distros
+// whose environment.d sets it — put daemon.jsonl somewhere the installer had
+// not announced and `TOKENLEADER_PURGE=y` would not delete.
+export function defaultLogDir(
+  platform: string = process.platform,
+  home: string = homedir(),
+): string {
+  if (platform === "darwin") return path.join(home, "Library", "Logs", "anara-leaderboard");
+  return path.join(home, ".local", "state", "anara-leaderboard");
+}
+
 export const LOG_DIR =
   process.env.TOKENLEADER_LOG_DIR && process.env.TOKENLEADER_LOG_DIR.length > 0
     ? process.env.TOKENLEADER_LOG_DIR
-    : path.join(homedir(), "Library", "Logs", "anara-leaderboard");
+    : defaultLogDir();
 export const LOG_FILE = path.join(LOG_DIR, "daemon.jsonl");
 const MAX_LOG_BYTES = 5 * 1024 * 1024; // 5 MB per file
 const KEEP_ROTATIONS = 3; // daemon.jsonl + .1 + .2 + .3 => <= 20 MB total

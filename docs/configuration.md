@@ -1,9 +1,11 @@
 # Configuration reference
 
 Every environment variable tokenleader reads: [server](#server) (platform env
-UI, compose file, or `.env`), [daemon](#daemon) (written into the LaunchAgent
-plist by the installer), and [installer / uninstaller](#installer--uninstaller)
-(the rendered `curl | bash` scripts).
+UI, compose file, or `.env`), [daemon](#daemon) (written by the installer into
+the LaunchAgent plist on macOS, or into `<stateDir>/daemon.env` on Linux — see
+[the daemon config store](#the-daemon-config-store)), and
+[installer / uninstaller](#installer--uninstaller) (the rendered `curl | bash`
+scripts).
 
 Source of truth is [`src/server/config.ts`](../src/server/config.ts); a test
 keeps this table, [.env.example](../.env.example), and the code in lockstep.
@@ -176,8 +178,9 @@ backup under a new generation; let the supervisor retry instead.
 
 ## Daemon
 
-Written into the LaunchAgent plist by the installer — documented for debugging
-and for [running your own build](daemon.md#building-and-running-your-own-daemon).
+Written by the installer into the platform's config store (see
+[below](#the-daemon-config-store)) — documented for debugging and for
+[running your own build](daemon.md#building-and-running-your-own-daemon).
 Out-of-range numerics clamp; truthy flags accept `1`, `true`, `yes`, `on`.
 
 | Variable | Default | What it does |
@@ -194,11 +197,34 @@ Out-of-range numerics clamp; truthy flags accept `1`, `true`, `yes`, `on`.
 | `TOKENLEADER_UPDATE_INTERVAL_SEC` | `3600` (1 h) | Auto-update check cadence (±10% jitter so a fleet doesn't herd downloads). Clamped to `[60, 604800]`. |
 | `TOKENLEADER_UPDATE_DISABLED` | off | Disable auto-update entirely. **Required** when running a self-built binary, or the updater swaps it back within the hour. |
 | `TOKENLEADER_LOG_LEVEL` | `info` | `debug` \| `info` \| `warn` \| `error`. |
-| `TOKENLEADER_LOG_DIR` | `~/Library/Logs/tokenleader` | Structured JSONL log location (`daemon.jsonl`, rotated at 5 MB, 3 rotations kept). |
+| `TOKENLEADER_LOG_DIR` | macOS: `~/Library/Logs/anara-leaderboard` · Linux: `~/.local/state/anara-leaderboard` (homedir-only, deliberately NOT `$XDG_STATE_HOME` — the installer, the daemon and the uninstaller must agree on one path) | Structured JSONL log location (`daemon.jsonl`, rotated at 5 MB, 3 rotations kept). The `upload_logs` directive reads this path, so a Linux box's remote debugging depends on it. |
 | `TOKENLEADER_LOG_FILE_DISABLED` | off | `1` skips the file sink entirely (logs to stdout/stderr only). |
 | `TOKENLEADER_CLAUDE_COWORK` | on | Parse Claude Cowork (Claude Desktop "local agent mode") sessions, tagged `claude_cowork`. Set `0` to disable. Cloud/remote Cowork runs server-side and leaves nothing on disk, so it is never tracked regardless. |
 | `TOKENLEADER_CLAUDE_COWORK_DIR` | macOS: `~/Library/Application Support/Claude` · Linux: `~/.config/Claude` · Windows: `%APPDATA%/Claude` | Claude Desktop data dir scanned for Cowork session transcripts. Override for non-default installs. |
 | `TOKENLEADER_TOKEN` | unset | **Legacy.** A historical shared bearer token. Parsed so old plists don't crash, never sent — the per-user TOFU secret replaced it. |
+
+### The daemon config store
+
+The installer has to put the handle and endpoint somewhere the daemon reads at
+boot **and** the CLI (`tokenleader link`, `devices`, `revoke`) reads from your
+shell. That store is platform-specific:
+
+| Platform | Store | Read by |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/sh.anara.leaderboard.plist` → `EnvironmentVariables` | launchd, the CLI, the watchdog |
+| Linux | `<stateDir>/daemon.env` (default `~/.local/share/anara-leaderboard/daemon.env`, mode `0600`) | the systemd unit's `EnvironmentFile=`, and the CLI |
+
+The systemd **unit file** is deliberately *not* the store: a system unit lives
+under `/etc` where an unprivileged `tokenleader link` can't be relied on to read
+it, and a user unit lives somewhere else again. One file, in the state dir,
+beside the TOFU secret it shares a fate with.
+
+Format is the intersection of systemd's `EnvironmentFile` and a plain dotenv:
+one `KEY=VALUE` per line, no quoting, no interpolation, `#` comments.
+
+`TOKENLEADER_HOME` appears in the legacy plist and is read **nowhere** — it is
+never written to the Linux env file. Use `TOKENLEADER_STATE_DIR` to move state,
+or the daemon and the CLI will disagree about where the heartbeat lives.
 
 ## Installer / uninstaller
 
@@ -220,6 +246,11 @@ Your server renders these scripts at `GET /install` and `GET /uninstall`.
 | `TOKENLEADER_INSTALL_URL` | both | Override the server URL baked into the rendered script (e.g. point at a staging server). |
 | `TOKENLEADER_BINARY_URL` | install | Override the binary download base (default `$SERVER_URL/bin`). |
 | `TOKENLEADER_PURGE` | uninstall | Pre-answer the "also delete state + logs?" prompt: `y`/`yes` deletes the state dir (including the TOFU secret) and logs; anything else keeps them. Unset → interactive prompt. |
+| `TOKENLEADER_SERVICE_SCOPE` | install (**Linux only**) | `system` (default when root or passwordless sudo is available) installs `/etc/systemd/system/tokenleader.service` with `User=<you>`. `user` installs `~/.config/systemd/user/tokenleader.service` and REQUIRES lingering — the installer enables it, verifies the resulting state, and aborts having installed nothing if it can't. See [self-hosting.md → Linux clients](self-hosting.md#linux-clients). |
+
+Under `curl … | sudo bash` on Linux the installer reads `$SUDO_USER` and installs
+for that human, not for root — a root-owned daemon would tail root's empty
+`~/.claude`.
 
 ## Fleet migration
 

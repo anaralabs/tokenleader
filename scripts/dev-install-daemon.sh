@@ -15,8 +15,10 @@ BIN_SRC="$REPO_DIR/bin/anara-leaderboard"
 BIN_DST="$HOME/.local/bin/anara-leaderboard"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
 
+# Dev convenience only (LaunchAgent). On Linux, install from a running server:
+#   curl -fsSL http://localhost:8787/install | sudo bash -s -- --name=<handle>
 if [ "$(uname -s)" != "Darwin" ]; then
-  echo "error: macOS only" >&2
+  echo "error: this dev helper is macOS only; on Linux install from a running server (see docs/self-hosting.md)" >&2
   exit 1
 fi
 

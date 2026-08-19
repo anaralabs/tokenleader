@@ -13,7 +13,10 @@
 //   * v2 additive fields: `schemaVersion: 2`, `buildSha`, `channel`, and the
 //     `platforms` map keyed by `${os}-${arch}` tokens. The legacy keys are
 //     byte-equal mirrors of platforms["darwin-*"] BY CONSTRUCTION here (same
-//     object); release.yml re-asserts equality with jq as guard (c).
+//     object); release.yml re-asserts equality with jq as guard (c). The
+//     linux-* entries are ADDITIVE inside `platforms` and are the only place
+//     a Linux daemon looks; a darwin daemon never reads them because it
+//     resolves the legacy keys.
 //   * No `url` fields: daemons fetch binaries from their own server's /bin
 //     routes, so a stale or hostile manifest cannot redirect them.
 //     `canonicalEndpoint` is reserved for hand-crafted transition manifests
@@ -31,6 +34,7 @@ import { createHash } from "node:crypto";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { PUBLISHED_PLATFORM_KEYS, type PublishedPlatformKey } from "../src/daemon/platform.ts";
 
 export interface ManifestEntryJson {
   sha256: string;
@@ -61,18 +65,30 @@ export interface MakeManifestOptions {
   channel?: string;
 }
 
-/** Currently published platforms; linux-{x64,arm64} are not published yet. */
-export const PUBLISHED_PLATFORMS = ["darwin-arm64", "darwin-x64"] as const;
-export type PublishedPlatform = (typeof PUBLISHED_PLATFORMS)[number];
+/** Currently published platforms — the daemon's OWN list (it builds its
+ *  `/bin` asset name and reads its manifest entry from the same tokens), so
+ *  the generator and the consumer can never disagree about what shipped. */
+export const PUBLISHED_PLATFORMS = PUBLISHED_PLATFORM_KEYS;
+export type PublishedPlatform = PublishedPlatformKey;
 
-const LEGACY_KEY: Record<PublishedPlatform, "arm64" | "x64"> = {
+/**
+ * Legacy top-level manifest keys — DARWIN ONLY, forever. They are the v1
+ * consumer shape every fielded daemon validates and reads. Linux is additive
+ * inside `platforms` and must never grow a legacy alias: there is no fielded
+ * Linux daemon to be compatible with, and inventing one would give the same
+ * bytes two names.
+ */
+const LEGACY_KEY: Record<"darwin-arm64" | "darwin-x64", "arm64" | "x64"> = {
   "darwin-arm64": "arm64",
   "darwin-x64": "x64",
 };
 
 /** Candidate file names per platform, new canonical name first. */
 export function binaryCandidates(platform: PublishedPlatform): string[] {
-  return [`tokenleader-${platform}`, `anara-leaderboard-${LEGACY_KEY[platform]}`];
+  const legacy = (LEGACY_KEY as Record<string, "arm64" | "x64" | undefined>)[platform];
+  return legacy
+    ? [`tokenleader-${platform}`, `anara-leaderboard-${legacy}`]
+    : [`tokenleader-${platform}`];
 }
 
 function resolveBinary(binDir: string, platform: PublishedPlatform): string {

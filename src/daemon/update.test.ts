@@ -12,6 +12,7 @@ import {
   emptyManifestCache,
   MANIFEST_PATH,
   type Manifest,
+  resolveManifestEntry,
 } from "./update";
 
 const ENDPOINT = "https://leaderboard.example.com";
@@ -99,6 +100,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {
         restarted = true;
       },
@@ -135,6 +137,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "x64",
+      platform: "darwin",
       downloadBinary: mkDownload(newBytes, calledUrls),
       // The fixture "binary" is a text payload, not an executable — skip the
       // real smoke run (it has its own tests below).
@@ -196,6 +199,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: mkDownload(newBytes, calledUrls),
       verifyBinary: () => null,
       restart: () => {},
@@ -232,6 +236,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: mkDownload(actualBytes),
       restart: () => {
         restarted = true;
@@ -272,6 +277,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {
         restarted = true;
       },
@@ -296,6 +302,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response("svc down", { status: 503 })),
     });
@@ -315,6 +322,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response("not found", { status: 404 })),
     });
@@ -334,6 +342,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response(JSON.stringify({ version: "x" }), { status: 200 })),
     });
@@ -358,6 +367,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: async () => {
         attempts++;
         return "curl exit 22: The requested URL returned error: 404";
@@ -406,6 +416,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
     });
@@ -436,6 +447,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
     });
@@ -484,6 +496,7 @@ describe("checkForUpdate", () => {
         endpoint: ENDPOINT,
         execPath,
         arch: "arm64",
+        platform: "darwin",
         restart: () => {},
         fetchImpl: mkFetch(() => new Response(JSON.stringify(m), { status: 200 })),
       });
@@ -518,6 +531,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64" as const,
+      platform: "darwin",
       restart: () => {},
       cache,
       fetchImpl,
@@ -569,6 +583,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64" as const,
+      platform: "darwin",
       downloadBinary: async (url: string, dest: string) => {
         expect(url).toBe(binaryUrl);
         binaryHits++;
@@ -612,6 +627,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {
@@ -650,6 +666,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {
@@ -686,6 +703,7 @@ describe("checkForUpdate", () => {
       endpoint: `  ${ENDPOINT}/  `,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {
@@ -723,6 +741,7 @@ describe("checkForUpdate", () => {
         endpoint: ENDPOINT,
         execPath,
         arch: "arm64",
+        platform: "darwin",
         stateDir,
         cache: emptyManifestCache(),
         restart: () => {
@@ -768,6 +787,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {},
@@ -799,6 +819,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       cache: emptyManifestCache(),
       restart: () => {
         restarts++;
@@ -834,6 +855,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch((url) => {
         calledUrls.push(url);
@@ -867,6 +889,7 @@ describe("binary verification", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: mkDownload(newBytes),
       verifyBinary: () => "exit 3",
       restart: () => {
@@ -949,5 +972,199 @@ describe("defaultDownloadBinary (real curl)", () => {
     } finally {
       server.stop(true);
     }
+  });
+});
+
+// The dual-shape resolution contract. darwin is FROZEN on the legacy
+// top-level keys; every other platform consumes the v2 `platforms` map.
+// Before this split existed, a Linux daemon resolved manifest["arm64"] — the
+// MACH-O — sha-matched it (right file, wrong OS), and was saved only by the
+// pre-swap smoke test, so Linux never updated. Ever. Reproduced in Docker.
+describe("resolveManifestEntry (platform-aware manifest consumption)", () => {
+  const darwinArm = { sha256: "a".repeat(64) };
+  const darwinX64 = { sha256: "b".repeat(64) };
+  const linuxX64 = { sha256: "c".repeat(64) };
+  const linuxArm = { sha256: "d".repeat(64) };
+  const production: Manifest = {
+    schemaVersion: 2,
+    version: "v9.9.9",
+    publishedAt: new Date().toISOString(),
+    platforms: {
+      "darwin-arm64": darwinArm,
+      "darwin-x64": darwinX64,
+      "linux-x64": linuxX64,
+      "linux-arm64": linuxArm,
+    },
+    arm64: darwinArm,
+    x64: darwinX64,
+  };
+
+  test("darwin reads the legacy keys and NOTHING else", () => {
+    expect(resolveManifestEntry(production, "darwin", "arm64")).toBe(darwinArm);
+    expect(resolveManifestEntry(production, "darwin", "x64")).toBe(darwinX64);
+    // A platforms-only manifest must still resolve to nothing on darwin —
+    // that is the frozen v1 consumer behaviour 23 fielded daemons rely on,
+    // and widening it would change what a hand-crafted transition manifest
+    // does to the live fleet.
+    const platformsOnly: Manifest = {
+      version: "v9.9.9",
+      publishedAt: production.publishedAt,
+      platforms: { "darwin-arm64": darwinArm },
+    };
+    expect(resolveManifestEntry(platformsOnly, "darwin", "arm64")).toBeUndefined();
+  });
+
+  test("linux reads platforms[linux-*], never the darwin legacy keys", () => {
+    expect(resolveManifestEntry(production, "linux", "x64")).toBe(linuxX64);
+    expect(resolveManifestEntry(production, "linux", "arm64")).toBe(linuxArm);
+    // The blocker, stated as an assertion: linux must not land on darwin.
+    expect(resolveManifestEntry(production, "linux", "arm64")).not.toBe(darwinArm);
+    expect(resolveManifestEntry(production, "linux", "x64")).not.toBe(darwinX64);
+  });
+
+  test("a malformed platforms entry resolves to NOTHING, not to a bad sha", () => {
+    // isManifest short-circuits on the legacy pair, which every published
+    // manifest carries — so `platforms` is otherwise never validated, and
+    // the linux half of the contract is the only half a Linux daemon reads.
+    // An entry like {} used to survive validation and then re-download ~34 MB
+    // hourly forever, logging `update_sha_mismatch expected=undefined`.
+    const broken = {
+      schemaVersion: 2,
+      version: "v9.9.9",
+      publishedAt: production.publishedAt,
+      platforms: {
+        "linux-x64": {} as unknown as { sha256: string },
+        "linux-arm64": { sha256: 123 } as unknown as { sha256: string },
+      },
+      arm64: darwinArm,
+      x64: darwinX64,
+    } as Manifest;
+    expect(resolveManifestEntry(broken, "linux", "x64")).toBeUndefined();
+    expect(resolveManifestEntry(broken, "linux", "arm64")).toBeUndefined();
+    // …while darwin, which never reads that map, is untouched by the rot.
+    expect(resolveManifestEntry(broken, "darwin", "arm64")).toBe(darwinArm);
+  });
+
+  test("a darwin-only manifest gives linux no entry (fails loud, never swaps a Mach-O)", () => {
+    const darwinOnly: Manifest = {
+      version: "v9.9.9",
+      publishedAt: production.publishedAt,
+      arm64: darwinArm,
+      x64: darwinX64,
+    };
+    expect(resolveManifestEntry(darwinOnly, "linux", "arm64")).toBeUndefined();
+  });
+});
+
+describe("checkForUpdate on linux", () => {
+  test("downloads the linux asset described by platforms[linux-arm64]", async () => {
+    const dir = await makeTmpDir();
+    const execPath = path.join(dir, "anara-leaderboard");
+    await fsp.writeFile(execPath, "old-linux-binary");
+
+    const newBytes = new TextEncoder().encode("new-linux-binary");
+    const machO = new TextEncoder().encode("a-mach-o-that-must-never-be-fetched");
+    const manifest: Manifest = {
+      schemaVersion: 2,
+      version: "v9.9.9",
+      publishedAt: new Date().toISOString(),
+      platforms: {
+        "darwin-arm64": { sha256: sha(machO) },
+        "darwin-x64": { sha256: sha(machO) },
+        "linux-arm64": { sha256: sha(newBytes) },
+      },
+      // Legacy keys mirror darwin, exactly as CI publishes them.
+      arm64: { sha256: sha(machO) },
+      x64: { sha256: sha(machO) },
+    };
+
+    const urls: string[] = [];
+    let restarts = 0;
+    const { log } = makeLog();
+    const r = await checkForUpdate({
+      log,
+      endpoint: ENDPOINT,
+      execPath,
+      arch: "arm64",
+      platform: "linux",
+      downloadBinary: mkDownload(newBytes, urls),
+      verifyBinary: () => null,
+      restart: () => {
+        restarts++;
+      },
+      fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
+    });
+
+    expect(r.updated).toBe(true);
+    expect(restarts).toBe(1);
+    // The platform-keyed asset, NOT /bin/anara-leaderboard-arm64.
+    expect(urls).toEqual([`${ENDPOINT}${BINARY_PATH_PREFIX}linux-arm64`]);
+    expect(await fsp.readFile(execPath, "utf8")).toBe("new-linux-binary");
+  });
+
+  test("a darwin-only manifest is no_entry_for_arch on linux — no download attempted", async () => {
+    const dir = await makeTmpDir();
+    const execPath = path.join(dir, "anara-leaderboard");
+    await fsp.writeFile(execPath, "old-linux-binary");
+
+    const manifest = manifestFor("arm64", sha("something-darwin"));
+    const urls: string[] = [];
+    const { log, records } = makeLog();
+    const r = await checkForUpdate({
+      log,
+      endpoint: ENDPOINT,
+      execPath,
+      arch: "arm64",
+      platform: "linux",
+      downloadBinary: mkDownload("never", urls),
+      restart: () => {},
+      fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
+    });
+
+    expect(r.reason).toBe("no_entry_for_arch");
+    expect(urls).toEqual([]);
+    expect(records.some((x) => x.msg === "update_no_entry_for_arch")).toBe(true);
+    // The old binary is untouched.
+    expect(await fsp.readFile(execPath, "utf8")).toBe("old-linux-binary");
+  });
+
+  test("darwin still resolves the legacy keys when linux entries are also present", async () => {
+    const dir = await makeTmpDir();
+    const execPath = path.join(dir, "anara-leaderboard");
+    await fsp.writeFile(execPath, "old-darwin-binary");
+
+    const darwinBytes = new TextEncoder().encode("new-darwin-binary");
+    const linuxBytes = new TextEncoder().encode("new-linux-binary");
+    const manifest: Manifest = {
+      schemaVersion: 2,
+      version: "v9.9.9",
+      publishedAt: new Date().toISOString(),
+      platforms: {
+        "darwin-arm64": { sha256: sha(darwinBytes) },
+        "darwin-x64": { sha256: sha(darwinBytes) },
+        "linux-arm64": { sha256: sha(linuxBytes) },
+        "linux-x64": { sha256: sha(linuxBytes) },
+      },
+      arm64: { sha256: sha(darwinBytes) },
+      x64: { sha256: sha(darwinBytes) },
+    };
+
+    const urls: string[] = [];
+    const { log } = makeLog();
+    const r = await checkForUpdate({
+      log,
+      endpoint: ENDPOINT,
+      execPath,
+      arch: "arm64",
+      platform: "darwin",
+      downloadBinary: mkDownload(darwinBytes, urls),
+      verifyBinary: () => null,
+      restart: () => {},
+      fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
+    });
+
+    expect(r.updated).toBe(true);
+    // The frozen bare-arch asset name, unchanged by the linux entries.
+    expect(urls).toEqual([`${ENDPOINT}${BINARY_PATH_PREFIX}arm64`]);
   });
 });

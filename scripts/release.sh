@@ -13,6 +13,15 @@
 # builds the daemons, the manifest, the GitHub release, and the ghcr image
 # from the tag. Keeping the push manual gives you one last look.
 #
+# EVERY release is four-platform. The manifest job needs BOTH the macOS and
+# the Linux build jobs, so a wedged Linux runner blocks a macOS-only hotfix
+# too — that coupling is deliberate (a darwin-only manifest de-lists Linux
+# and freezes every Linux daemon's update channel; see the header of
+# .github/workflows/release.yml). If Actions is down or the Linux legs are
+# stuck and 23 Macs need a fix now, the break-glass lever is
+# scripts/publish-release.sh: it cross-compiles all four binaries locally and
+# publishes the same four-platform manifest.
+#
 # Versioning: TAGS ARE THE VERSION. package.json stays 0.1.0
 # forever — this script bumps nothing and asserts nothing about it.
 # Stable X.Y.Z only; rc tags are cut by hand when needed:
@@ -73,5 +82,7 @@ ok "created annotated tag ${TAG} on $(git rev-parse --short HEAD)"
 
 printf "\n  %sNot pushed.%s Review, then publish with:\n\n" "$C_BOLD" "$C_RESET"
 printf "    %sgit push origin %s%s\n\n" "$C_BOLD" "$TAG" "$C_RESET"
-printf "  (the tag push triggers .github/workflows/release.yml — daemons,\n"
-printf "   manifest, GitHub release, and the ghcr server image)\n"
+printf "  (the tag push triggers .github/workflows/release.yml — darwin AND\n"
+printf "   linux daemons, manifest, GitHub release, and the ghcr server image.\n"
+printf "   The manifest job needs both build jobs: a wedged linux runner blocks\n"
+printf "   the whole tag. Emergency bypass: scripts/publish-release.sh)\n"

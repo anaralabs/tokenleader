@@ -5,13 +5,19 @@
 Releases are maintainer-cut **git tags** (`vX.Y.Z`). One tag push drives the
 whole pipeline (`.github/workflows/release.yml`):
 
-1. Builds the macOS daemon binaries (`tokenleader-darwin-arm64`,
-   `tokenleader-darwin-x64`); a guard asserts every built binary's `--version`
-   reports exactly the tag.
-2. Emits `manifest.json` with the version, publish timestamp, and per-platform
-   sha256 entries (a `platforms` map keyed `darwin-arm64`/`darwin-x64`;
-   schema v2, with byte-equal legacy mirror keys so older daemons keep
-   parsing it).
+1. Builds the daemon binaries on **native runners per platform** —
+   `tokenleader-darwin-{arm64,x64}` on macOS, `tokenleader-linux-{x64,arm64}`
+   on Ubuntu — so the guards can actually execute what they check. A guard
+   asserts every built binary's `--version` reports exactly the tag, and the
+   linux binaries additionally complete a real update cycle (guard `f`) and,
+   for x64, run under a pre-AVX2 CPU mask (guard `b2`) to prove the baseline
+   target hasn't been silently swapped out.
+2. Emits `manifest.json` from ONE job that hashes all four artifacts, with the
+   version, publish timestamp, and per-platform sha256 entries (a `platforms`
+   map keyed `darwin-arm64`/`darwin-x64`/`linux-x64`/`linux-arm64`; schema v2,
+   with byte-equal legacy mirror keys — always DARWIN — so older daemons keep
+   parsing it). A darwin daemon resolves the legacy keys and never looks at the
+   linux entries; every other platform resolves `platforms["${os}-${arch}"]`.
 3. Creates the GitHub release as a **draft, uploads everything, then flips it
    live** — "latest" never points at a half-uploaded release. Tags containing
    `-` (e.g. `v0.2.0-rc.1`) publish as prereleases and never take the latest
@@ -39,8 +45,10 @@ your server ──(daemon poll, every ~60 min)──► every teammate's machine
 2. **Daemon self-update.** Each daemon checks `/manifest.json` about hourly
    (±10% jitter so a fleet doesn't herd downloads). If the manifest sha256 for
    its platform differs from the running binary, it downloads, verifies the
-   sha256, atomically renames over its own binary, and restarts via
-   `launchctl kickstart -k`. State and read-offsets live in a separate
+   sha256, smoke-tests `--version` on the new bytes, atomically renames over
+   its own binary, and exits `75` so **the supervisor** respawns it — launchd's
+   `KeepAlive` on macOS, systemd's `Restart=always` + `SuccessExitStatus=75` on
+   Linux. It never restarts itself. State and read-offsets live in a separate
    directory, so a swap never loses or double-counts events.
 
 **Worst-case propagation: ~75 minutes** (15 min mirror + 60 min daemon poll).

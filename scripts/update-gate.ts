@@ -30,6 +30,36 @@ if (!releaseBin || !nextBin) {
 const nextBytes = await fsp.readFile(nextBin);
 const nextSha = createHash("sha256").update(nextBytes).digest("hex");
 
+// PRODUCTION-SHAPED manifest, not a legacy-keys-only stub.
+//
+// The stub version of this gate served one sha under `arm64`/`x64` and the
+// same bytes at every /bin path, so it passed no matter WHICH manifest entry
+// the daemon resolved — it would have green-lit the exact bug it exists to
+// catch (a Linux daemon reading the darwin entry and downloading a Mach-O).
+// Here only the entry for the running platform carries the real sha; every
+// other platform is a decoy whose bytes are not an executable at all. A
+// daemon that resolves the wrong key downloads the decoy, sha-matches it,
+// fails the `--version` smoke test, refuses the swap, and never exits 75 —
+// so the gate fails.
+const ARCH = process.arch === "arm64" ? "arm64" : "x64";
+const PLATFORM_KEY = `${process.platform}-${ARCH}`;
+// darwin's asset suffix is the frozen bare arch; everything else is the
+// full platform token (mirrors src/daemon/platform.ts binaryAssetSuffix).
+const ASSET_SUFFIX = process.platform === "darwin" ? ARCH : PLATFORM_KEY;
+
+const decoyBytes = new TextEncoder().encode(
+  "update-gate decoy: a binary for another platform, deliberately not executable\n",
+);
+const decoySha = createHash("sha256").update(decoyBytes).digest("hex");
+
+const entryFor = (key: string) => ({ sha256: key === PLATFORM_KEY ? nextSha : decoySha });
+const platforms: Record<string, { sha256: string }> = {
+  "darwin-arm64": entryFor("darwin-arm64"),
+  "darwin-x64": entryFor("darwin-x64"),
+  "linux-x64": entryFor("linux-x64"),
+  "linux-arm64": entryFor("linux-arm64"),
+};
+
 // Local stand-in for the real server: manifest + binary + a JSON sink for
 // ingest/checkin so the daemon's other requests never error.
 const server = Bun.serve({
@@ -38,13 +68,18 @@ const server = Bun.serve({
     const p = new URL(req.url).pathname;
     if (p === "/manifest.json") {
       return Response.json({
+        schemaVersion: 2,
         version: GATE_VERSION,
         publishedAt: new Date().toISOString(),
-        arm64: { sha256: nextSha },
-        x64: { sha256: nextSha },
+        channel: "stable",
+        platforms,
+        // Legacy v1 mirror keys — darwin, forever (release.yml guard (c)).
+        arm64: platforms["darwin-arm64"],
+        x64: platforms["darwin-x64"],
       });
     }
-    if (p.startsWith("/bin/")) return new Response(nextBytes);
+    if (p === `/bin/anara-leaderboard-${ASSET_SUFFIX}`) return new Response(nextBytes);
+    if (p.startsWith("/bin/")) return new Response(decoyBytes);
     return Response.json({ inserted: 0, duplicates: 0 });
   },
 });

@@ -28,6 +28,8 @@
     "build:daemon": "bash scripts/build-daemon.sh '' bin/anara-leaderboard",
     "build:daemon-arm64": "bash scripts/build-daemon.sh bun-darwin-arm64 bin/anara-leaderboard-arm64",
     "build:daemon-x64": "bash scripts/build-daemon.sh bun-darwin-x64 bin/anara-leaderboard-x64",
+    "build:daemon-linux-x64": "bash scripts/build-daemon.sh bun-linux-x64-baseline bin/tokenleader-linux-x64",
+    "build:daemon-linux-arm64": "bash scripts/build-daemon.sh bun-linux-arm64 bin/tokenleader-linux-arm64",
     "build": "bun run build:server && bun run build:daemon",
     "build:all": "bun run build:server && bun run build:daemon && bun run build:daemon-arm64 && bun run build:daemon-x64",
     "test": "bun test",

@@ -24,9 +24,20 @@ function sha256(text: string): string {
   return createHash("sha256").update(text).digest("hex");
 }
 
-function makeBinDir(names: Record<string, string>): string {
+/** Every published platform must be present or makeManifest throws (that is
+ *  the point — a partially-failed release matrix cannot publish a short
+ *  manifest). Callers override only the names a test cares about. */
+const DEFAULT_BINARIES: Record<string, string> = {
+  "tokenleader-darwin-arm64": "darwin-arm64-bytes",
+  "tokenleader-darwin-x64": "darwin-x64-bytes",
+  "tokenleader-linux-x64": "linux-x64-bytes",
+  "tokenleader-linux-arm64": "linux-arm64-bytes",
+};
+
+function makeBinDir(names: Record<string, string>, exact = false): string {
   const dir = mkdtempSync(join(tmpdir(), "make-manifest-test-"));
-  for (const [name, content] of Object.entries(names)) {
+  const files = exact ? names : { ...DEFAULT_BINARIES, ...names };
+  for (const [name, content] of Object.entries(files)) {
     writeFileSync(join(dir, name), content);
   }
   return dir;
@@ -80,10 +91,15 @@ describe("makeManifest", () => {
   });
 
   test("legacy anara-leaderboard-* names resolve (emergency publish path)", () => {
-    const dir = makeBinDir({
-      "anara-leaderboard-arm64": "legacy-arm",
-      "anara-leaderboard-x64": "legacy-x64",
-    });
+    const dir = makeBinDir(
+      {
+        "anara-leaderboard-arm64": "legacy-arm",
+        "anara-leaderboard-x64": "legacy-x64",
+        "tokenleader-linux-x64": "linux-x64-bytes",
+        "tokenleader-linux-arm64": "linux-arm64-bytes",
+      },
+      true,
+    );
     const m = makeManifest({ version: "deadbee", binDir: dir });
     expect(m.platforms["darwin-arm64"]?.sha256).toBe(sha256("legacy-arm"));
     expect(m.platforms["darwin-x64"]?.sha256).toBe(sha256("legacy-x64"));
@@ -100,7 +116,7 @@ describe("makeManifest", () => {
   });
 
   test("missing binary throws and names the candidates", () => {
-    const dir = makeBinDir({ "tokenleader-darwin-arm64": "only-arm" });
+    const dir = makeBinDir({ "tokenleader-darwin-arm64": "only-arm" }, true);
     expect(() => makeManifest({ version: "v0.1.0", binDir: dir })).toThrow(/darwin-x64/);
   });
 
@@ -121,7 +137,7 @@ describe("makeManifest", () => {
   });
 
   test("candidate order is canonical-first for every published platform", () => {
-    expect(PUBLISHED_PLATFORMS).toEqual(["darwin-arm64", "darwin-x64"]);
+    expect(PUBLISHED_PLATFORMS).toEqual(["darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64"]);
     expect(binaryCandidates("darwin-arm64")).toEqual([
       "tokenleader-darwin-arm64",
       "anara-leaderboard-arm64",
@@ -130,5 +146,43 @@ describe("makeManifest", () => {
       "tokenleader-darwin-x64",
       "anara-leaderboard-x64",
     ]);
+    // Linux gets NO legacy alias: there is no fielded linux daemon to be
+    // compatible with, and an alias would give the same bytes two names.
+    expect(binaryCandidates("linux-x64")).toEqual(["tokenleader-linux-x64"]);
+    expect(binaryCandidates("linux-arm64")).toEqual(["tokenleader-linux-arm64"]);
+  });
+
+  test("linux entries are ADDITIVE: they exist, and the legacy keys stay darwin", () => {
+    const dir = makeBinDir({});
+    const m = makeManifest({ version: "v0.7.0", binDir: dir, buildSha: "abc1234" });
+
+    expect(m.platforms["linux-x64"]?.sha256).toBe(sha256("linux-x64-bytes"));
+    expect(m.platforms["linux-arm64"]?.sha256).toBe(sha256("linux-arm64-bytes"));
+
+    // release.yml guard (c): the legacy pair mirrors DARWIN, forever. If this
+    // ever drifted to a linux entry the whole macOS fleet would roll onto an
+    // ELF and refuse every update.
+    expect(m.arm64).toBe(m.platforms["darwin-arm64"]!);
+    expect(m.x64).toBe(m.platforms["darwin-x64"]!);
+    expect(m.arm64.sha256).not.toBe(m.platforms["linux-arm64"]?.sha256);
+    expect(m.x64.sha256).not.toBe(m.platforms["linux-x64"]?.sha256);
+
+    // release.yml guard (c2): four distinct artifacts, four distinct shas.
+    const shas = Object.values(m.platforms).map((e) => e.sha256);
+    expect(new Set(shas).size).toBe(4);
+  });
+
+  test("a missing linux binary throws rather than publishing a short manifest", () => {
+    const dir = makeBinDir(
+      {
+        "tokenleader-darwin-arm64": "a",
+        "tokenleader-darwin-x64": "b",
+        "tokenleader-linux-x64": "c",
+      },
+      true,
+    );
+    expect(() => makeManifest({ version: "v0.7.0", binDir: dir })).toThrow(
+      /no binary for linux-arm64/,
+    );
   });
 });

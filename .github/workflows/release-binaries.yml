@@ -22,6 +22,15 @@ name: Release binaries
 # never double-publish against the tag-driven pipeline in
 # .github/workflows/release.yml — which is THE release channel. This file
 # survives only as an emergency lever for the fielded fleet.
+#
+# It publishes ALL FOUR platforms and emits the manifest through the shared
+# generator (scripts/make-manifest.ts). It used to build darwin only and
+# hand-write a v1-shaped manifest with no `platforms` map at all: dispatching
+# it then re-asserted `latest` with linux DE-LISTED, so every fielded Linux
+# daemon resolved `platforms["linux-x64"] -> undefined` and reported
+# `update_no_entry_for_arch` forever, and every new Linux install died at
+# "couldn't parse sha256 for linux-x64 out of manifest.json" — during the one
+# operation (a fleet rollback) where you most need convergence.
 on:
   workflow_dispatch:
 
@@ -51,13 +60,19 @@ jobs:
         # Lockfile is verified under 1.3.14 — no `|| bun install` fallback.
         run: bun install --frozen-lockfile
 
-      - name: Build cross-arch daemons
+      - name: Build cross-arch daemons (darwin + linux)
         run: |
           # VERSION must equal the manifest `version` below (short SHA) — the
           # server string-compares the two to flag stale daemons.
           export VERSION="$(git rev-parse --short HEAD)"
           bun run build:daemon-arm64
           bun run build:daemon-x64
+          # Cross-compiled from the macOS runner and NOT executed here (no
+          # native linux runner on this legacy lever) — release.yml is the
+          # channel with the executed guards. Publishing them anyway is what
+          # keeps a dispatch of this workflow from de-listing Linux.
+          bun run build:daemon-linux-x64
+          bun run build:daemon-linux-arm64
           ls -lh bin/
 
       - name: Render install.sh + uninstall.sh
@@ -79,19 +94,17 @@ jobs:
           bash -n bin/uninstall.sh
           ls -lh bin/install.sh bin/uninstall.sh
 
-      - name: Build manifest.json
+      - name: Build manifest.json (dual shape, shared generator)
         run: |
-          # SHA-256 of each binary lets the daemon verify the bytes it
-          # downloaded match what CI published. The daemon hits its own
-          # server's /manifest.json + /bin/<arch> routes — `url` fields are
-          # omitted so a stale or hostile manifest can't redirect daemons.
-          ARM_SHA="$(shasum -a 256 bin/anara-leaderboard-arm64 | awk '{print $1}')"
-          X64_SHA="$(shasum -a 256 bin/anara-leaderboard-x64 | awk '{print $1}')"
+          # scripts/make-manifest.ts — the SAME generator release.yml and
+          # scripts/publish-release.sh use. It emits the frozen v1 legacy
+          # arm64/x64 keys AND the v2 `platforms` map (the only place a Linux
+          # daemon looks), with no `url` fields: daemons fetch from their own
+          # server's /bin route, so a stale or hostile manifest can't redirect
+          # them.
           SHORT_SHA="$(git rev-parse --short HEAD)"
-          PUBLISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          printf '{"version":"%s","publishedAt":"%s","arm64":{"sha256":"%s"},"x64":{"sha256":"%s"}}\n' \
-            "${SHORT_SHA}" "${PUBLISHED_AT}" "${ARM_SHA}" "${X64_SHA}" \
-            > bin/manifest.json
+          bun scripts/make-manifest.ts --version "${SHORT_SHA}" --bin-dir bin \
+            --out bin/manifest.json --build-sha "${SHORT_SHA}"
           cat bin/manifest.json
 
       - name: Publish to GH Release
@@ -99,11 +112,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Names the mirror looks up verbatim (GH_ASSET_NAME in
+          # src/server/binary-mirror.ts).
           ASSETS=(
             bin/install.sh
             bin/uninstall.sh
             bin/anara-leaderboard-arm64
             bin/anara-leaderboard-x64
+            bin/tokenleader-linux-x64
+            bin/tokenleader-linux-arm64
             bin/manifest.json
           )
 

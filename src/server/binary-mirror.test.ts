@@ -2,7 +2,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { promises as fsp } from "node:fs";
 import path from "node:path";
 import { makeTmpDir as mkTmpDir } from "../test-helpers.ts";
-import { BinaryMirror, __internal, normalizeArch } from "./binary-mirror.ts";
+import {
+  BinaryMirror,
+  __internal,
+  MIRRORED_ASSETS,
+  normalizeArch,
+  REQUIRED_ASSETS,
+} from "./binary-mirror.ts";
 
 let tmpCleanups: Array<() => Promise<void>> = [];
 
@@ -46,7 +52,11 @@ function releaseJson(
   return JSON.stringify({ tag_name: tag, assets });
 }
 
-function makeMirror(opts: { cacheDir: string; fetchImpl: typeof fetch }): BinaryMirror {
+function makeMirror(opts: {
+  cacheDir: string;
+  fetchImpl: typeof fetch;
+  errors?: string[];
+}): BinaryMirror {
   return new BinaryMirror({
     cacheDir: opts.cacheDir,
     ghRepo: GH_REPO,
@@ -54,7 +64,11 @@ function makeMirror(opts: { cacheDir: string; fetchImpl: typeof fetch }): Binary
     fetchImpl: opts.fetchImpl,
     initialDelayMs: 0,
     // Logger that swallows everything so test output stays clean.
-    log: { info: () => {}, warn: () => {}, error: () => {} },
+    log: {
+      info: () => {},
+      warn: () => {},
+      error: (m, ...rest) => opts.errors?.push([m, ...rest.map(String)].join(" ")),
+    },
   });
 }
 
@@ -69,7 +83,24 @@ describe("normalizeArch", () => {
     expect(normalizeArch("x86_64")).toBe("x64");
   });
   test("rejects unknown arches", () => {
+    expect(normalizeArch("linux-x64")).toBe("linux-x64");
+    expect(normalizeArch("linux-arm64")).toBe("linux-arm64");
+    // uname -m courtesy aliases for hand-rolled curl users, mirroring the
+    // existing x86_64 -> x64 courtesy.
+    expect(normalizeArch("linux-x86_64")).toBe("linux-x64");
+    expect(normalizeArch("linux-amd64")).toBe("linux-x64");
+    expect(normalizeArch("linux-aarch64")).toBe("linux-arm64");
+    // The three legacy spellings mean DARWIN forever — fielded daemons build
+    // that URL from process.arch.
+    expect(normalizeArch("arm64")).toBe("arm64");
+    expect(normalizeArch("x86_64")).toBe("x64");
+    // …and the platform-qualified darwin spellings resolve to the same two
+    // assets, so both platforms can be named the same way by hand. A BARE
+    // `x86_64` still means darwin, which is why the qualified form exists.
+    expect(normalizeArch("darwin-arm64")).toBe("arm64");
+    expect(normalizeArch("darwin-x64")).toBe("x64");
     expect(normalizeArch("riscv")).toBeNull();
+    expect(normalizeArch("darwin-x86_64")).toBeNull();
     expect(normalizeArch("")).toBeNull();
     expect(normalizeArch("..")).toBeNull();
     expect(normalizeArch("anara-leaderboard-arm64")).toBeNull();
@@ -263,6 +294,149 @@ describe("BinaryMirror.tick", () => {
     expect(new Uint8Array(cachedManifest)).toEqual(manifestBytes);
     expect(mirror.getBinary("arm64")).not.toBeNull();
     expect(mirror.getBinary("x64")).not.toBeNull();
+  });
+
+  test("linux assets are OPTIONAL: a pre-linux release still mirrors darwin", async () => {
+    // The mirror follows the `releases/latest` marker, which routinely points
+    // at a release older than the running server image (a rollback, or a
+    // server deployed ahead of the next tag). If linux were required, that
+    // release would stop mirroring ENTIRELY and take the darwin fleet's
+    // update channel down with it.
+    const cacheDir = await makeTmpDir();
+    const manifestBytes = new TextEncoder().encode('{"version":"v0.6.9"}');
+    const assets = [
+      { id: 1, name: "manifest.json", url: "https://api.github.com/f/1" },
+      { id: 2, name: "anara-leaderboard-arm64", url: "https://api.github.com/f/2" },
+      { id: 3, name: "anara-leaderboard-x64", url: "https://api.github.com/f/3" },
+    ];
+    const mirror = makeMirror({
+      cacheDir,
+      fetchImpl: fakeFetch({
+        [MARKER_URL]: () => new Response(releaseJson(assets, "v0.6.9"), { status: 200 }),
+        "https://api.github.com/f/1": () => new Response(manifestBytes, { status: 200 }),
+        "https://api.github.com/f/2": () => new Response("arm", { status: 200 }),
+        "https://api.github.com/f/3": () => new Response("x64", { status: 200 }),
+      }),
+    });
+    await mirror.tick();
+
+    expect(await fsp.readFile(__internal.manifestPath(cacheDir))).toEqual(
+      Buffer.from(manifestBytes),
+    );
+    expect(mirror.getBinary("arm64")).not.toBeNull();
+    expect(mirror.getBinary("x64")).not.toBeNull();
+    expect(mirror.getBinary("linux-x64")).toBeNull();
+    expect(mirror.getBinary("linux-arm64")).toBeNull();
+  });
+
+  test("a manifest advertising an asset the release dropped logs a loud, specific error", async () => {
+    // Deleting a bad `tokenleader-linux-x64` from the published release is
+    // the natural way to un-ship it — and it leaves the manifest advertising
+    // a sha the mirror cannot serve. The darwin channel must keep flowing
+    // (23 machines), so the cycle proceeds; the gap has to be LOUD instead,
+    // or linux daemons re-download ~34 MB hourly forever with no signal.
+    const cacheDir = await makeTmpDir();
+    const manifestBytes = new TextEncoder().encode(
+      JSON.stringify({
+        version: "v0.7.0",
+        publishedAt: new Date().toISOString(),
+        arm64: { sha256: "a".repeat(64) },
+        x64: { sha256: "b".repeat(64) },
+        platforms: {
+          "darwin-arm64": { sha256: "a".repeat(64) },
+          "darwin-x64": { sha256: "b".repeat(64) },
+          "linux-x64": { sha256: "c".repeat(64) },
+        },
+      }),
+    );
+    const assets = [
+      { id: 1, name: "manifest.json", url: "https://api.github.com/f/1" },
+      { id: 2, name: "anara-leaderboard-arm64", url: "https://api.github.com/f/2" },
+      { id: 3, name: "anara-leaderboard-x64", url: "https://api.github.com/f/3" },
+    ];
+    const errors: string[] = [];
+    const mirror = makeMirror({
+      cacheDir,
+      errors,
+      fetchImpl: fakeFetch({
+        [MARKER_URL]: () => new Response(releaseJson(assets, "v0.7.0"), { status: 200 }),
+        "https://api.github.com/f/1": () => new Response(manifestBytes, { status: 200 }),
+        "https://api.github.com/f/2": () => new Response("arm", { status: 200 }),
+        "https://api.github.com/f/3": () => new Response("x64", { status: 200 }),
+      }),
+    });
+    await mirror.tick();
+
+    // Darwin still swapped — the fleet keeps updating.
+    expect(mirror.getBinary("arm64")).not.toBeNull();
+    expect(await fsp.readFile(__internal.manifestPath(cacheDir))).toEqual(
+      Buffer.from(manifestBytes),
+    );
+    const gap = errors.find((e) => e.includes("does not carry"));
+    expect(gap).toBeDefined();
+    expect(gap).toContain("tokenleader-linux-x64");
+    expect(gap).toContain("absent");
+    // linux-arm64 is not advertised at all, so nothing is promised and
+    // nothing is logged about it.
+    expect(errors.some((e) => e.includes("tokenleader-linux-arm64"))).toBe(false);
+  });
+
+  test("a release WITH linux assets mirrors all four under platform-keyed names", async () => {
+    const cacheDir = await makeTmpDir();
+    const manifestBytes = new TextEncoder().encode('{"version":"v0.7.0"}');
+    const assets = [
+      { id: 1, name: "manifest.json", url: "https://api.github.com/f/1" },
+      { id: 2, name: "anara-leaderboard-arm64", url: "https://api.github.com/f/2" },
+      { id: 3, name: "anara-leaderboard-x64", url: "https://api.github.com/f/3" },
+      // Linux ships under its CANONICAL release name — no duplicate ~94 MB
+      // upload just to give the same bytes a legacy alias.
+      { id: 4, name: "tokenleader-linux-x64", url: "https://api.github.com/f/4" },
+      { id: 5, name: "tokenleader-linux-arm64", url: "https://api.github.com/f/5" },
+    ];
+    const mirror = makeMirror({
+      cacheDir,
+      fetchImpl: fakeFetch({
+        [MARKER_URL]: () => new Response(releaseJson(assets, "v0.7.0"), { status: 200 }),
+        "https://api.github.com/f/1": () => new Response(manifestBytes, { status: 200 }),
+        "https://api.github.com/f/2": () => new Response("darwin-arm", { status: 200 }),
+        "https://api.github.com/f/3": () => new Response("darwin-x64", { status: 200 }),
+        "https://api.github.com/f/4": () => new Response("linux-x64-bytes", { status: 200 }),
+        "https://api.github.com/f/5": () => new Response("linux-arm64-bytes", { status: 200 }),
+      }),
+    });
+    await mirror.tick();
+
+    for (const asset of MIRRORED_ASSETS) {
+      expect(mirror.getBinary(asset)).not.toBeNull();
+    }
+    // Cache filenames ARE the /bin suffixes: darwin keeps the frozen bare
+    // arch, linux is platform-keyed.
+    expect(await fsp.readFile(path.join(cacheDir, "anara-leaderboard-arm64"), "utf8")).toBe(
+      "darwin-arm",
+    );
+    expect(await fsp.readFile(path.join(cacheDir, "anara-leaderboard-linux-x64"), "utf8")).toBe(
+      "linux-x64-bytes",
+    );
+  });
+
+  test("a MISSING DARWIN asset still bails the whole cycle", async () => {
+    const cacheDir = await makeTmpDir();
+    await fsp.writeFile(__internal.manifestPath(cacheDir), "previous-manifest");
+    const assets = [
+      { id: 1, name: "manifest.json", url: "https://api.github.com/f/1" },
+      { id: 2, name: "anara-leaderboard-arm64", url: "https://api.github.com/f/2" },
+      { id: 4, name: "tokenleader-linux-x64", url: "https://api.github.com/f/4" },
+    ];
+    const mirror = makeMirror({
+      cacheDir,
+      fetchImpl: fakeFetch({
+        [MARKER_URL]: () => new Response(releaseJson(assets, "v0.7.0"), { status: 200 }),
+      }),
+    });
+    await mirror.tick();
+
+    expect(await fsp.readFile(__internal.manifestPath(cacheDir), "utf8")).toBe("previous-manifest");
+    expect(REQUIRED_ASSETS).toEqual(["arm64", "x64"]);
   });
 
   test("transient GH error: tick swallows error, cache stays untouched", async () => {
