@@ -1147,3 +1147,101 @@ describe("cumulative cache-write on the totals path", () => {
     expect(r.sessionTotals.cacheWriteInputTokens).toBe(30);
   });
 });
+
+/**
+ * Replayed token_count records. `total_token_usage` is monotonically
+ * cumulative, so a real API call always advances it — yet some Codex
+ * versions log the same request twice, seconds apart, with a byte-identical
+ * `last_token_usage` and an unmoved total. Since `last` is used directly as
+ * the per-turn delta, the replay billed its full input a second time:
+ * measured 6.64% of all Codex input on one machine.
+ */
+describe("replayed token_count records", () => {
+  async function writeSession(lines: unknown[]): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "codex-replay-"));
+    const path = join(dir, "rollout-2026-08-01T00-00-00-replay.jsonl");
+    await writeFile(path, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
+    return path;
+  }
+  const u = (i: number, o: number) => ({ input: i, cached: 0, output: o, reasoning: 0 });
+
+  it("bills a replayed record once, not twice", async () => {
+    const path = await writeSession([
+      turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent("2026-08-01T00:00:01.000Z", u(100, 10), u(100, 10)),
+      // same request logged again ~1s later: identical last, UNMOVED total
+      tokenCountEvent("2026-08-01T00:00:02.000Z", u(100, 10), u(100, 10)),
+      // a genuine next turn: the cumulative advances
+      tokenCountEvent("2026-08-01T00:00:30.000Z", u(50, 5), u(150, 15)),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(r.events.length).toBe(2);
+    expect(r.replayedSkipped).toBe(1);
+    expect(r.events.reduce((s, e) => s + e.inputTokens, 0)).toBe(150);
+  });
+
+  it("regression: without the guard the replay would double the input", async () => {
+    // Same fixture, but the replay carries an ADVANCED total — i.e. it is a
+    // real second call that happens to have identical per-turn usage. That
+    // must still be billed, or the guard would eat legitimate traffic.
+    const path = await writeSession([
+      turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent("2026-08-01T00:00:01.000Z", u(100, 10), u(100, 10)),
+      tokenCountEvent("2026-08-01T00:00:02.000Z", u(100, 10), u(200, 20)),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(r.events.length).toBe(2);
+    expect(r.replayedSkipped ?? 0).toBe(0);
+    expect(r.events.reduce((s, e) => s + e.inputTokens, 0)).toBe(200);
+  });
+
+  it("the first record of a session is never mistaken for a replay", async () => {
+    const path = await writeSession([
+      turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent("2026-08-01T00:00:01.000Z", u(100, 10), u(100, 10)),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(r.events.length).toBe(1);
+    expect(r.replayedSkipped ?? 0).toBe(0);
+  });
+
+  it("catches a replay split across an incremental read boundary", async () => {
+    const first = [
+      turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent("2026-08-01T00:00:01.000Z", u(100, 10), u(100, 10)),
+    ];
+    const path = await writeSession(first);
+    const a = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(a.events.length).toBe(1);
+
+    // The replay lands in the NEXT read. The cumulative baseline survives
+    // only because sessionTotals is threaded back in.
+    await writeFile(
+      path,
+      `${[...first, tokenCountEvent("2026-08-01T00:00:02.000Z", u(100, 10), u(100, 10))]
+        .map((l) => JSON.stringify(l))
+        .join("\n")}\n`,
+    );
+    const b = await parseCodexFile({
+      path,
+      byteOffset: a.newOffset,
+      user: "u",
+      prevSessionTotals: a.sessionTotals,
+      prevModel: a.lastModel,
+    });
+    expect(b.events.length).toBe(0);
+    expect(b.replayedSkipped).toBe(1);
+  });
+
+  it("a zero-token record with an unmoved total is dropped without loss", async () => {
+    const path = await writeSession([
+      turnContextLine("gpt-5.6-sol", "2026-08-01T00:00:00.000Z"),
+      tokenCountEvent("2026-08-01T00:00:01.000Z", u(100, 10), u(100, 10)),
+      // the 248 real-world cases: flat cumulative, different last, all zeros
+      tokenCountEvent("2026-08-01T00:00:02.000Z", u(0, 0), u(100, 10)),
+    ]);
+    const r = await parseCodexFile({ path, byteOffset: 0, user: "u" });
+    expect(r.events.length).toBe(1);
+    expect(r.replayedSkipped).toBe(1);
+  });
+});

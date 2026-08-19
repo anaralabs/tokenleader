@@ -58,6 +58,10 @@ export interface ParseCodexResult {
   /** Count of records dropped because they exceeded the read window (data
    *  loss — surfaced so the daemon can warn). Absent/0 in the common case. */
   oversizeSkipped?: number;
+  /** Replayed token_count records skipped — the same request logged twice
+   *  with an unmoved cumulative total. NOT data loss: billing them is the
+   *  bug. Surfaced so a noisy CLI version is visible rather than silent. */
+  replayedSkipped?: number;
 }
 
 interface CodexUsage {
@@ -341,6 +345,13 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
   let lastTs = "";
   let ixForTs = 0;
   let oversizeSkipped = 0;
+  // Replayed token_count records dropped this read (see the flat-cumulative
+  // guard below). Surfaced so the daemon can see how noisy a CLI version is.
+  let replayedSkipped = 0;
+  // Only compare against `totals` once this read (or a previous one) has
+  // established a cumulative baseline: a fresh session legitimately starts
+  // at zero, and the first record must never be mistaken for a replay.
+  let seenCumulative = prevSessionTotals?.sessionId === sessionId;
   // Fork-seed suppression (see SEED_GAP_MS doc). Armed by a session_meta
   // carrying forked_from_id; disarmed by the first inter-line timestamp gap.
   let seedActive = false;
@@ -431,6 +442,37 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     const last = info.last_token_usage;
     const cumTotal = info.total_token_usage ? usageNums(info.total_token_usage) : null;
     if (!last && !cumTotal) continue;
+
+    // REPLAYED RECORD. `total_token_usage` is monotonically cumulative, so a
+    // real API call ALWAYS advances it — it cannot bill zero input. Codex
+    // nonetheless logs the same request twice in some versions, seconds
+    // apart, with a byte-identical `last_token_usage` AND an unmoved total.
+    // Because `last` is used directly as the per-turn delta (see below), the
+    // replay bills its full input a second time.
+    //
+    // Measured over 1,149 local rollouts: 5,051 of 56,822 token_count events
+    // (8.89%) are replays carrying 439,435,954 input tokens — a 6.64%
+    // over-count. Strongly version-dependent: near-total on 0.63.0/0.98.0,
+    // ~74% on 0.110.0, under 4% on 0.145.0+.
+    //
+    // A flat cumulative is the reliable signal, and it is strictly safer
+    // than comparing `last`: the 248 flat records whose `last` DIFFERED all
+    // carried zero tokens, so nothing billable is ever dropped by this test.
+    // It also survives a read boundary for free, because `totals` is
+    // persisted across ticks in FileState.lastSessionTotals — a replay split
+    // across two reads is still caught.
+    if (
+      cumTotal !== null &&
+      seenCumulative &&
+      cumTotal.input === totals.inputTokens &&
+      cumTotal.output === totals.outputTokens &&
+      cumTotal.cached === totals.cachedInputTokens &&
+      cumTotal.reasoning === totals.reasoningTokens
+    ) {
+      replayedSkipped++;
+      continue;
+    }
+    if (cumTotal !== null) seenCumulative = true;
 
     // `last_token_usage` is the PER-TURN usage — exactly what this event
     // should emit, no delta bookkeeping needed. `total_token_usage` is the
@@ -552,5 +594,6 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
     sessionTotals: totals,
     ...(currentModel !== null ? { lastModel: currentModel } : {}),
     oversizeSkipped,
+    replayedSkipped,
   };
 }
