@@ -100,6 +100,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {
         restarted = true;
       },
@@ -136,6 +137,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "x64",
+      platform: "darwin",
       downloadBinary: mkDownload(newBytes, calledUrls),
       // The fixture "binary" is a text payload, not an executable — skip the
       // real smoke run (it has its own tests below).
@@ -197,6 +199,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: mkDownload(newBytes, calledUrls),
       verifyBinary: () => null,
       restart: () => {},
@@ -233,6 +236,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: mkDownload(actualBytes),
       restart: () => {
         restarted = true;
@@ -273,6 +277,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {
         restarted = true;
       },
@@ -297,6 +302,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response("svc down", { status: 503 })),
     });
@@ -316,6 +322,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response("not found", { status: 404 })),
     });
@@ -335,6 +342,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response(JSON.stringify({ version: "x" }), { status: 200 })),
     });
@@ -359,6 +367,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: async () => {
         attempts++;
         return "curl exit 22: The requested URL returned error: 404";
@@ -407,6 +416,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
     });
@@ -437,6 +447,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch(() => new Response(JSON.stringify(manifest), { status: 200 })),
     });
@@ -485,6 +496,8 @@ describe("checkForUpdate", () => {
         endpoint: ENDPOINT,
         execPath,
         arch: "arm64",
+        platform: "darwin",
+        platform: "darwin",
         restart: () => {},
         fetchImpl: mkFetch(() => new Response(JSON.stringify(m), { status: 200 })),
       });
@@ -519,6 +532,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64" as const,
+      platform: "darwin",
       restart: () => {},
       cache,
       fetchImpl,
@@ -570,6 +584,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64" as const,
+      platform: "darwin",
       downloadBinary: async (url: string, dest: string) => {
         expect(url).toBe(binaryUrl);
         binaryHits++;
@@ -613,6 +628,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {
@@ -651,6 +667,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {
@@ -687,6 +704,7 @@ describe("checkForUpdate", () => {
       endpoint: `  ${ENDPOINT}/  `,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {
@@ -724,6 +742,8 @@ describe("checkForUpdate", () => {
         endpoint: ENDPOINT,
         execPath,
         arch: "arm64",
+        platform: "darwin",
+        platform: "darwin",
         stateDir,
         cache: emptyManifestCache(),
         restart: () => {
@@ -769,6 +789,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       stateDir,
       cache: emptyManifestCache(),
       restart: () => {},
@@ -800,6 +821,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       cache: emptyManifestCache(),
       restart: () => {
         restarts++;
@@ -835,6 +857,7 @@ describe("checkForUpdate", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       restart: () => {},
       fetchImpl: mkFetch((url) => {
         calledUrls.push(url);
@@ -868,6 +891,7 @@ describe("binary verification", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       downloadBinary: mkDownload(newBytes),
       verifyBinary: () => "exit 3",
       restart: () => {
@@ -1064,6 +1088,7 @@ describe("checkForUpdate on linux", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       platform: "linux",
       downloadBinary: mkDownload(newBytes, urls),
       verifyBinary: () => null,
@@ -1093,6 +1118,7 @@ describe("checkForUpdate on linux", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       platform: "linux",
       downloadBinary: mkDownload("never", urls),
       restart: () => {},
@@ -1134,6 +1160,7 @@ describe("checkForUpdate on linux", () => {
       endpoint: ENDPOINT,
       execPath,
       arch: "arm64",
+      platform: "darwin",
       platform: "darwin",
       downloadBinary: mkDownload(darwinBytes, urls),
       verifyBinary: () => null,

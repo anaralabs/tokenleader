@@ -1545,11 +1545,15 @@ describe("secret", () => {
 // ---------------------------------------------------------------------------
 
 describe("--version flag", () => {
-  test("versionLine is '<version> <sha> darwin-<arch>'", () => {
+  test("versionLine is '<version> <sha> <platform>-<arch>'", () => {
     const arch = process.arch === "arm64" ? "arm64" : "x64";
-    expect(versionLine()).toBe(`${BUILD_VERSION} ${BUILD_SHA} darwin-${arch}`);
+    // The platform half is NOT hardcoded: the same binary is now built for
+    // darwin and linux, and this suite runs on a Linux CI runner. Pinning
+    // "darwin" here passed on a developer Mac and failed in CI only.
+    const platform = process.platform === "darwin" ? "darwin" : "linux";
+    expect(versionLine()).toBe(`${BUILD_VERSION} ${BUILD_SHA} ${platform}-${arch}`);
     // Machine-parseable: field 1 is the bare version tag (CI relies on it).
-    expect(versionLine()).toMatch(/^\S+ \S+ darwin-(arm64|x64)$/);
+    expect(versionLine()).toMatch(/^\S+ \S+ (darwin|linux)-(arm64|x64)$/);
   });
 
   test("main(['--version'] / ['-v']) prints the line and exits 0 with no env", async () => {
