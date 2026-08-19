@@ -511,6 +511,14 @@ function toCodexTotals(v: FileState["lastSessionTotals"]): CodexSessionTotals | 
     inputTokens: v.inputTokens,
     outputTokens: v.outputTokens,
     cachedInputTokens: v.cachedInputTokens,
+    // Pre-v0.6.5 state files predate the cache-write bucket. A missing key
+    // means we have no cache-write baseline for that session, so the first
+    // total-only delta after the upgrade is measured from 0. `cappedWrite`
+    // bounds it at that event's own input delta, so at most one event per
+    // affected session can misattribute plain input into the cache-write
+    // bucket — and only if the source starts reporting the field non-zero in
+    // the same window, which no build has yet done.
+    cacheWriteInputTokens: v.cacheWriteInputTokens ?? 0,
     reasoningTokens: v.reasoningTokens,
   };
 }

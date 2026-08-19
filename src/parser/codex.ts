@@ -11,6 +11,15 @@ export interface SessionTotals {
   inputTokens: number;
   outputTokens: number;
   cachedInputTokens: number;
+  /** Cumulative `cache_write_input_tokens`. Needed for the same reason as
+   *  cachedInputTokens: on the total-only fallback path the per-event
+   *  cache-write is a DELTA of this running sum, and without it the written
+   *  portion silently lands in plain input (billed at the full input rate).
+   *  Inert while the source reports the field as a literal 0, which every
+   *  rollout seen so far does — this exists so it stays correct the day it
+   *  isn't. Persisted in FileState, where a pre-v0.6.5 state file has no
+   *  such key; tick.ts reads a missing value as 0. */
+  cacheWriteInputTokens: number;
   reasoningTokens: number;
 }
 
@@ -30,6 +39,11 @@ export interface ParseCodexOptions {
    *  mislabelled Codex volume. Persisted across ticks in FileState.lastModel
    *  exactly like lastSessionTotals. */
   prevModel?: string;
+  /** Override for the byte-0 look-ahead cap (see LOOKAHEAD_MAX_BYTES).
+   *  A test seam: it lets the give-up path (and the pre-fix fallback
+   *  behaviour) be exercised without a 16 MiB fixture. Production never
+   *  sets it. */
+  lookAheadMaxBytes?: number;
 }
 
 export interface ParseCodexResult {
@@ -103,6 +117,110 @@ const LEGACY_FALLBACK_MODEL = "gpt-5";
  */
 const SEED_GAP_MS = 1500;
 
+/**
+ * Byte-0 model look-ahead.
+ *
+ * v0.6.4 carried the model across INCREMENTAL reads (see prevModel), but a
+ * byte-0 read deliberately starts blind: the file's own first `turn_context`
+ * is the truth for a brand-new file, and trusting a stale carried model there
+ * would mislabel a session that legitimately switched models.
+ *
+ * Some rollouts, though, write lines that need a model BEFORE their first
+ * turn_context, so those events had nothing to resolve and fell back to
+ * LEGACY_FALLBACK_MODEL — labelled with a model nobody ran, the same class of
+ * bug v0.6.4 fixed. The answer is sitting further down the same file, so on a
+ * byte-0 read we peek forward for its FIRST turn_context and seed from that.
+ *
+ * Measured over 1,149 real local rollouts:
+ *  - 15 files carry token_count lines (10,176 of them) ahead of their first
+ *    turn_context. On THIS machine all 15 are fork-seeded subagent rollouts,
+ *    so those lines are the parent's copied ledger and are already dropped by
+ *    fork-seed suppression — they were never billed, and the peek does not
+ *    resurrect them. Elsewhere the same shape is real usage, and it is that
+ *    case the peek is here for.
+ *  - 1,118 user-prompt rows across 1,085 of the 1,149 files were labelled
+ *    with the fallback and are now labelled correctly: Codex logs the prompt
+ *    (`response_item` role=user) BEFORE it opens the turn, so a brand-new
+ *    file's first prompt always preceded its first turn_context. Zero-token
+ *    rows, so this moves message counts, not dollars.
+ *  - No event ever changed from one real model to another, and no event's
+ *    id, offset or ledger moved — codex.test.ts re-asserts that invariant
+ *    against real local rollouts on every run.
+ *
+ * The peek is a separate cursor over the same file: it emits nothing,
+ * advances no byte offset, and touches neither the fork-seed state machine
+ * nor the totals ledger. It runs lazily — only when a billable line actually
+ * needs a model we don't have — so the overwhelming majority of rollouts
+ * (turn_context first) never pay for it, and it runs at most once per parse.
+ *
+ * It is also forward-only: it changes the `model` column and nothing else,
+ * and messageId is byte-identical before and after. Re-reading an already
+ * posted rollout therefore hits the server's dedup and the stored row keeps
+ * its old label — history is not repaired, only new/first reads are correct.
+ */
+const LOOKAHEAD_MAX_BYTES = 32 * 1024 * 1024;
+
+/**
+ * Window the peek reads in. A turn_context line is a few hundred bytes, so a
+ * record bigger than this window can never be one — the reader reports it as
+ * oversize and skips it, which is exactly right here. The main parse pass is
+ * unaffected: it reads the same file with the full MAX_READ_BYTES window.
+ */
+const LOOKAHEAD_WINDOW_BYTES = 1024 * 1024;
+
+/**
+ * Scan from byte 0 for the model on the file's first `turn_context`, giving up
+ * after LOOKAHEAD_MAX_BYTES. Returns null when there is none within the cap —
+ * including rollouts that predate the field entirely (pre-2025-11), which
+ * genuinely have no recoverable model and must keep the fallback. Guessing one
+ * for them would be fabrication.
+ *
+ * The cap is enforced by slicing the file, not by checking offsets as they go
+ * by: a single record longer than LOOKAHEAD_WINDOW_BYTES is skipped a window
+ * at a time and yields nothing while it is being skipped, so an after-the-fact
+ * offset check cannot fire until that record ends. Handing the reader a
+ * `file.slice(0, cap)` makes it physically unable to read past the cap; the
+ * `newOffset` check below is belt-and-braces.
+ *
+ * Deepest first `turn_context` across 1,149 real local rollouts is 11,741,324
+ * bytes in (rollout-2026-08-13T12-29-33-019ffa74…), so 32 MiB is ~2.9x
+ * headroom while staying under the reader's own 64 MiB record ceiling. The 30
+ * local rollouts with no turn_context at all are ≤1.04 MB each, so the give-up
+ * path costs a short read, not a capped one. Past the cap the parse keeps the
+ * fallback for the pre-turn_context prefix, exactly as it did before this
+ * change — the cap trades a rarer recovery for a bounded read.
+ */
+async function lookAheadFirstTurnModel(
+  file: ReturnType<typeof Bun.file>,
+  maxBytes: number = LOOKAHEAD_MAX_BYTES,
+): Promise<string | null> {
+  // Clamp to the real size: a slice longer than the file reports the *slice*
+  // length as its size, which would send the reader chasing empty windows past
+  // EOF.
+  const head = file.slice(0, Math.min(maxBytes, file.size));
+  for await (const part of readNewlineLines(head, 0, LOOKAHEAD_WINDOW_BYTES)) {
+    if (part.newOffset > maxBytes) return null;
+    if (part.kind !== "line") continue;
+    // Cheap prefilter: JSON.parse on every line of a multi-MB head is the
+    // expensive part of this scan, and only a turn_context can answer the
+    // question. A false positive (some other line quoting the string) is
+    // rejected by the type check below.
+    if (!part.text.includes('"turn_context"')) continue;
+    let raw: CodexLine;
+    try {
+      raw = JSON.parse(part.text) as CodexLine;
+    } catch {
+      continue;
+    }
+    if (raw.type !== "turn_context") continue;
+    // Stop at the FIRST turn_context whether or not it names a model: it is
+    // the nearest turn to the events we're labelling, and a later turn may
+    // have switched models. No model there means we don't know.
+    return extractModel(raw);
+  }
+  return null;
+}
+
 function isString(v: unknown): v is string {
   return typeof v === "string" && v.length > 0;
 }
@@ -159,13 +277,31 @@ function buildMessageId(sessionId: string, timestamp: string, ixForTimestamp: nu
 }
 
 export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCodexResult> {
-  const { path, byteOffset, user, prevSessionTotals, prevModel } = opts;
+  const { path, byteOffset, user, prevSessionTotals, prevModel, lookAheadMaxBytes } = opts;
 
   const sessionId = basename(path, ".jsonl");
   const totals: SessionTotals =
     prevSessionTotals && prevSessionTotals.sessionId === sessionId
-      ? { ...prevSessionTotals }
-      : { sessionId, inputTokens: 0, outputTokens: 0, cachedInputTokens: 0, reasoningTokens: 0 };
+      ? // A state file written before v0.6.5 has no cache-write key; a
+        // missing cumulative is 0, never undefined (which would poison every
+        // delta downstream with NaN). Measuring the first post-upgrade delta
+        // from 0 rather than adopting the first observed cumulative is the
+        // deliberate choice: the clamps below bound the error to one event's
+        // input, and carrying an "unknown yet" sentinel through a persisted
+        // state file is a worse trade for a field that is 0 in every rollout
+        // seen to date.
+        {
+          ...prevSessionTotals,
+          cacheWriteInputTokens: prevSessionTotals.cacheWriteInputTokens ?? 0,
+        }
+      : {
+          sessionId,
+          inputTokens: 0,
+          outputTokens: 0,
+          cachedInputTokens: 0,
+          cacheWriteInputTokens: 0,
+          reasoningTokens: 0,
+        };
 
   const file = Bun.file(path);
   const totalSize = file.size;
@@ -189,6 +325,18 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
   // turn_context inside it) still knows what is running. Only a byte-0 read
   // starts blind, and a byte-0 read sees the file's own first turn_context.
   let currentModel: string | null = byteOffset > 0 ? (prevModel ?? null) : null;
+  // Byte-0 look-ahead (see LOOKAHEAD_MAX_BYTES): resolved lazily and at most
+  // once, only when a billable line needs a model this read hasn't seen yet.
+  // An incremental read never peeks — it has prevModel, and its window
+  // legitimately starts mid-file.
+  let peeked = byteOffset > 0;
+  const resolveModel = async (): Promise<string> => {
+    if (currentModel === null && !peeked) {
+      peeked = true;
+      currentModel = await lookAheadFirstTurnModel(file, lookAheadMaxBytes);
+    }
+    return currentModel ?? LEGACY_FALLBACK_MODEL;
+  };
   // Track how many events share an identical timestamp so messageIds stay unique.
   let lastTs = "";
   let ixForTs = 0;
@@ -263,7 +411,7 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
         messageId: `${sessionId}:${tsStr}:user:${ixForTs}`,
         requestId: null,
         timestamp,
-        model: currentModel ?? LEGACY_FALLBACK_MODEL,
+        model: await resolveModel(),
         messageType: "user",
         inputTokens: 0,
         outputTokens: 0,
@@ -307,6 +455,7 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
       dInput = cumTotal!.input - totals.inputTokens;
       dOutput = cumTotal!.output - totals.outputTokens;
       dCached = cumTotal!.cached - totals.cachedInputTokens;
+      dCacheWrite = cumTotal!.cacheWrite - totals.cacheWriteInputTokens;
       dReasoning = cumTotal!.reasoning - totals.reasoningTokens;
 
       // Reset detection: if any cumulative bucket regressed, treat current
@@ -315,7 +464,16 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
         dInput = cumTotal!.input;
         dOutput = cumTotal!.output;
         dCached = cumTotal!.cached;
+        dCacheWrite = cumTotal!.cacheWrite;
         dReasoning = cumTotal!.reasoning;
+      } else if (dCacheWrite < 0) {
+        // Cache-write regressed on its own. It gets the same fresh-baseline
+        // treatment (a negative delta must never reach the clamps below), but
+        // deliberately does NOT rebase the other four: no build has ever been
+        // observed reporting this field non-zero, let alone monotonically, and
+        // letting an unproven bucket re-bill a whole session's input/output as
+        // one event is a much worse failure than under-attributing this one.
+        dCacheWrite = cumTotal!.cacheWrite;
       }
     }
 
@@ -325,11 +483,13 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
       totals.inputTokens = cumTotal.input;
       totals.outputTokens = cumTotal.output;
       totals.cachedInputTokens = cumTotal.cached;
+      totals.cacheWriteInputTokens = cumTotal.cacheWrite;
       totals.reasoningTokens = cumTotal.reasoning;
     } else {
       totals.inputTokens += dInput;
       totals.outputTokens += dOutput;
       totals.cachedInputTokens += dCached;
+      totals.cacheWriteInputTokens += dCacheWrite;
       totals.reasoningTokens += dReasoning;
     }
 
@@ -353,7 +513,7 @@ export async function parseCodexFile(opts: ParseCodexOptions): Promise<ParseCode
 
     const eventModel = extractModel(raw);
     if (eventModel) currentModel = eventModel;
-    const model = currentModel ?? LEGACY_FALLBACK_MODEL;
+    const model = await resolveModel();
 
     // Codex reports `input_tokens` INCLUSIVE of both `cached_input_tokens`
     // and `cache_write_input_tokens` (openai/codex parses_cache_write_token_usage:

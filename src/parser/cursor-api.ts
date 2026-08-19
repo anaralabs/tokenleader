@@ -4,6 +4,7 @@ import {
   clampCostMicros,
   clampToken,
   cursorMessageId,
+  cursorModel,
   cursorSessionId,
 } from "./cursor-dedup.ts";
 import { fetchSignal } from "./cursor-http.ts";
@@ -211,12 +212,11 @@ export function mapCursorDashboardEvent(
   const timestamp = parseTimestamp(ev.timestamp);
   if (timestamp === null) return null;
 
-  const model =
-    (typeof ev.modelName === "string" && ev.modelName.length > 0
-      ? ev.modelName
-      : typeof ev.model === "string" && ev.model.length > 0
-        ? ev.model
-        : "") || "cursor";
+  // Slug-first, shared with the team mirror: the model is hashed into the
+  // dedup key, so the two paths MUST spell it the same way (see cursorModel).
+  // This used to prefer `modelName`, which meant a user on both paths stored
+  // the same event twice under two ids — at full stored-cost weight.
+  const model = cursorModel(ev);
 
   const id = typeof ev.id === "string" && ev.id.length > 0 ? ev.id : null;
   const tokens = readTokenFields(ev);

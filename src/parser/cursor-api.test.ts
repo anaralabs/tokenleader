@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { cursorMessageId } from "./cursor-dedup.ts";
 import {
   CURSOR_DASHBOARD_API,
   CURSOR_ORIGIN,
@@ -43,7 +44,7 @@ function fakeDashboardApi(
 }
 
 describe("mapCursorDashboardEvent", () => {
-  test("maps modelName, id, and totalCents to TokenEvent fields", () => {
+  test("maps id and totalCents, falling back to modelName when no slug is present", () => {
     const ev = mapCursorDashboardEvent(
       {
         id: "evt-123",
@@ -87,6 +88,58 @@ describe("mapCursorDashboardEvent", () => {
     expect(ev!.cacheCreationTokens).toBe(2);
     expect(ev!.cacheReadTokens).toBe(3);
     expect(ev!.costUsdMicros).toBe(5_000);
+  });
+
+  test("canonicalises the model to the slug so both cursor paths hash one key", () => {
+    // The team mirror (server/cursor-mirror.ts) writes source="cursor" rows
+    // using the slug, and cursorMessageId hashes the model into the dedup
+    // key. Preferring `modelName` here therefore gave the SAME event two ids
+    // across the two paths — and Cursor rows carry stored cost, so it would
+    // have double-counted at full dollar weight.
+    const ev = mapCursorDashboardEvent(
+      {
+        timestamp: 1_700_000_000_000,
+        model: "gpt-5.3-codex",
+        modelName: "Premium (Codex 5.3)",
+        tokenUsage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheWriteTokens: 2,
+          cacheReadTokens: 3,
+          totalCents: 0.5,
+        },
+      },
+      "alice",
+    );
+    expect(ev!.model).toBe("gpt-5.3-codex");
+    const slugKey = cursorMessageId({
+      timestamp: 1_700_000_000_000,
+      model: "gpt-5.3-codex",
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheWriteTokens: 2,
+      cacheReadTokens: 3,
+    });
+    expect(ev!.messageId).toBe(slugKey);
+    // Pre-fix the display name produced a different key for the same event.
+    expect(
+      cursorMessageId({
+        timestamp: 1_700_000_000_000,
+        model: "Premium (Codex 5.3)",
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheWriteTokens: 2,
+        cacheReadTokens: 3,
+      }),
+    ).not.toBe(slugKey);
+  });
+
+  test("falls back to the display name when the dashboard omits the slug", () => {
+    const ev = mapCursorDashboardEvent(
+      { timestamp: 1_700_000_000_000, modelName: "Premium (Codex 5.3)" },
+      "alice",
+    );
+    expect(ev!.model).toBe("Premium (Codex 5.3)");
   });
 
   test("returns null for missing timestamp", () => {

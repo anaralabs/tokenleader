@@ -693,6 +693,7 @@ describe("tick", () => {
             inputTokens: 10,
             outputTokens: 20,
             cachedInputTokens: 0,
+            cacheWriteInputTokens: 0,
             reasoningTokens: 0,
           },
         }),
@@ -710,6 +711,7 @@ describe("tick", () => {
       inputTokens: 10,
       outputTokens: 20,
       cachedInputTokens: 0,
+      cacheWriteInputTokens: 0,
       reasoningTokens: 0,
     });
   });
